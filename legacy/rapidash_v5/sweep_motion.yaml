@@ -1,0 +1,156 @@
+method: grid
+metric:
+  goal: minimize
+  name: test_mse
+
+parameters:
+  config:
+    values:
+      - model_id: 1
+        equivariance: SEn
+        orientations: 0
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 2
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["velocity"]
+        vector_features: []
+      - model_id: 3
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 4
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["velocity", "coords"]
+        vector_features: []
+      - model_id: 5
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 6
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["pose"]
+      - model_id: 7
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["velocity"]
+      - model_id: 8
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["velocity", "pose"]
+      - model_id: 9
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords"]
+      - model_id: 10
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords", "pose"]
+      - model_id: 11
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords", "velocity"]
+      - model_id: 12
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords", "velocity", "pose"]
+      - model_id: 13
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["velocity"]
+        vector_features: []
+      - model_id: 14
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 15
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["coords", "velocity"]
+        vector_features: []
+      - model_id: 16
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: []
+        vector_features: []
+      - model_id: 17
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["velocity"]
+        vector_features: []
+      - model_id: 18
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 19
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["velocity", "coords"]
+        vector_features: []
+  # Three seeds
+  seed:
+    values: [1, 2, 3]
+  # Fixed training settings
+  epochs:
+    value: 1000
+  lr:
+    value: 5e-4
+  weight_decay:
+    value: 1e-12
+  warmup:
+    value: 20
+  batch_size:
+    value: 5
+  # Fixed model settings
+  hidden_dim:
+    value: 256
+  basis_dim:
+    value: 256
+  basis_hidden_dim:
+    value: 128
+  degree:
+    value: 2
+  layers:
+    value: 7
+  widening:
+    value: 4
+  edge_type:
+    value: ["fc"]
+  layer_scale:
+    value: None
+  skip_connections:
+    value: true
+program: main_motion.py

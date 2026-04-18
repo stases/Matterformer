@@ -1,0 +1,17 @@
+**/__pycache__/
+datasets/ShapeNet
+datasets/modelnet
+datasets/modelnet40_c
+datasets/modelnet40_original
+logs/
+wandb/
+slurm-*****.out
+run_geo.job
+run_all3090.job
+enviroment.yml
+.gitignore
+datasets/qm9
+datasets/ShapeNet
+datasets/shapenet
+logs/
+wandb/

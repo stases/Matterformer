@@ -1,0 +1,90 @@
+method: grid
+metric:
+  goal: maximize
+  name: valid_acc
+
+parameters:
+  config:
+    values:
+      - model_id: 2
+        equivariance: SEn
+        orientations: 0
+        train_augm: true
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 3
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 4
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords"]
+      - model_id: 5
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 6
+        equivariance: Tn
+        orientations: 0
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 7
+        equivariance: Tn
+        orientations: 0
+        train_augm: true
+        scalar_features: ["coords"]
+        vector_features: []
+  # Three seeds
+  seed:
+    values: [1, 2, 3]
+  # Fixed training settings
+  epochs:
+    value: 500
+  lr:
+    value: 5e-4
+  weight_decay:
+    value: 1e-10
+  warmup:
+    value: 10
+  batch_size:
+    value: 96
+  # Fixed model settings
+  hidden_dim:
+    value: 256
+  basis_dim:
+    value: 256
+  basis_hidden_dim:
+    value: 128
+  degree:
+    value: 2
+  layers:
+    value: 9
+  widening:
+    value: 4
+  edge_type:
+    value: ["fc"]
+  ratios:
+    value: []
+  layer_scale:
+    value: None
+  skip_connections:
+    value: false
+  S_churn:
+    value: 10
+  sigma_max:
+    value: 1
+  num_steps:
+    value: 50
+  sigma_data:
+    value: 1
+  use_charges:
+    value: true
+program: main_qm9_gen.py

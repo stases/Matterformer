@@ -1,0 +1,95 @@
+method: grid
+metric:
+  goal: minimize
+  name: 1-NNA-CD
+
+parameters:
+  config:
+    values:
+      - model_id: 3
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 6
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["pose"]
+      - model_id: 10
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords", "pose"]
+      - model_id: 14
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 16
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: []
+        vector_features: []
+      - model_id: 18
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+  # Three seeds
+  seed:
+    values: [1, 2, 3]
+  # Fixed training settings
+  epochs:
+    value: 500
+  lr:
+    value: 5e-4
+  weight_decay:
+    value: 0.000000000001
+  warmup:
+    value: 20
+  batch_size:
+    value: 10
+  # Fixed model settings
+  hidden_dim:
+    value: 256
+  basis_dim:
+    value: 256
+  basis_hidden_dim:
+    value: 128
+  degree:
+    value: 2
+  layers:
+    value: [0, 1, 1, 1, 1]
+  ratios:
+    value: [0.25,0.25,0.25,0.25]
+  widening:
+    value: 4
+  edge_type:
+    value: ["knn-8","knn-8", "knn-8", "knn-8", "fc"]
+  layer_scale:
+    value: None
+  skip_connection:
+    value: True
+  # Shapenet settings
+  S_churn:
+    value: 0
+  sigma_data:
+    value: 1
+  sigma_max:
+    value: 20
+  num_steps:
+    value: 50
+  dataset_fraction:
+    value: 1
+  categories:
+    value: ['airplane', 'chair', 'car', 'lamp', 'table', 'sofa', 'cabinet', 'bench', 'telephone', 'speaker', 'monitor', 'vessel', 'rifle']
+  force_zero_mean:
+    value: true
+program: main_shapenet_gen.py

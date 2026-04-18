@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matterformer"
+version = "0.1.0"
+description = "Minimal shared transformer stack for periodic and non-periodic atomistic modeling."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Matterformer"}
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "requests>=2.31",
+  "torch>=2.3",
+  "tqdm>=4.66",
+  "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+chem = [
+  "rdkit>=2023.9.5",
+]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src",
+]
+testpaths = [
+  "tests",
+]

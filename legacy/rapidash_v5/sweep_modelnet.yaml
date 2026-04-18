@@ -1,0 +1,156 @@
+method: grid
+metric:
+  goal: maximize
+  name: valid_acc
+
+parameters:
+  config:
+    values:
+      - model_id: 1
+        equivariance: SEn
+        orientations: 0
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 2
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["normals"]
+        vector_features: []
+      - model_id: 3
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 4
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["normals", "coords"]
+        vector_features: []
+      - model_id: 5
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: []
+      - model_id: 6
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["pose"]
+      - model_id: 7
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["normals"]
+      - model_id: 8
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["normals", "pose"]
+      - model_id: 9
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords"]
+      - model_id: 10
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["coords", "pose"]
+      - model_id: 11
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["normals", "coords"]
+      - model_id: 12
+        equivariance: SEn
+        orientations: 8
+        train_augm: true
+        scalar_features: []
+        vector_features: ["normals", "coords", "pose"]
+      - model_id: 13
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["normals"]
+        vector_features: []
+      - model_id: 14
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 15
+        equivariance: SEn
+        orientations: 8
+        train_augm: false
+        scalar_features: ["normals", "coords"]
+        vector_features: []
+      - model_id: 16
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: []
+        vector_features: []
+      - model_id: 17
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["normals"]
+        vector_features: []
+      - model_id: 18
+        equivariance: Tn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["coords"]
+        vector_features: []
+      - model_id: 19
+        equivariance: SEn
+        orientations: 0
+        train_augm: false
+        scalar_features: ["normals", "coords"]
+        vector_features: []
+  # Three seeds
+  seed:
+    values: [1, 2, 3]
+  # Fixed training settings
+  epochs:
+    value: 100
+  lr:
+    value: 0.001
+  weight_decay:
+    value: 0.000000000001
+  warmup:
+    value: 15
+  batch_size:
+    value: 10
+  # Fixed model settings
+  hidden_dim:
+    value: 128
+  basis_dim:
+    value: 256
+  basis_hidden_dim:
+    value: 128
+  degree:
+    value: 2
+  layers:
+    value: [1, 1, 1, 1, 1]
+  widening:
+    value: 4
+  edge_type:
+    value: ["knn-8","knn-8", "knn-8", "knn-8", "fc"]
+  layer_scale:
+    value: None
+  skip_connections:
+    value: true
+program: main_modelnet40.py
