@@ -9,6 +9,7 @@ from matterformer.models.embeddings import FourierCoordEmbedder, TimeEmbedder
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     LearnedNullConditioning,
+    MhaFactorizedGeometryBias,
     SimplicialGeometryBias,
     TransformerTrunk,
 )
@@ -45,17 +46,25 @@ class QM9RegressionModel(nn.Module):
         attn_dropout: float = 0.0,
         attn_type: str = "simplicial",
         simplicial_geom_mode: str = "factorized",
+        simplicial_impl: str = "auto",
+        simplicial_precision: str = "bf16_tc",
         readout_mode: str = "cls",
+        mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
     ) -> None:
         super().__init__()
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
+        mha_geom_bias_mode = mha_geom_bias_mode.lower()
         readout_mode = readout_mode.lower()
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual'}"
+            )
+        if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
+            raise ValueError(
+                "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
             )
         if readout_mode not in {"cls", "sum", "mean"}:
             raise ValueError("readout_mode must be one of {'cls', 'sum', 'mean'}")
@@ -71,13 +80,20 @@ class QM9RegressionModel(nn.Module):
                         use_noise_gate=False,
                     )
             else:
-                geometry_bias = GeometryBiasBuilder(
-                    n_heads=n_heads,
-                    use_distance_bias=True,
-                    use_edge_bias=True,
-                    use_periodic_features=geometry_adapter.geometry_kind == "periodic",
-                    use_noise_gate=False,
-                )
+                if mha_geom_bias_mode == "factorized_marginal":
+                    geometry_bias = MhaFactorizedGeometryBias(
+                        n_heads=n_heads,
+                        use_periodic_features=geometry_adapter.geometry_kind == "periodic",
+                        use_noise_gate=False,
+                    )
+                else:
+                    geometry_bias = GeometryBiasBuilder(
+                        n_heads=n_heads,
+                        use_distance_bias=True,
+                        use_edge_bias=True,
+                        use_periodic_features=geometry_adapter.geometry_kind == "periodic",
+                        use_noise_gate=False,
+                    )
 
         self.pad_token = QM9_ATOM_PAD_TOKEN
         self.readout_mode = readout_mode
@@ -97,6 +113,8 @@ class QM9RegressionModel(nn.Module):
             dropout=dropout,
             attn_dropout=attn_dropout,
             attn_type=attn_type,
+            simplicial_impl=simplicial_impl,
+            simplicial_precision=simplicial_precision,
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
@@ -170,6 +188,9 @@ class QM9EDMModel(nn.Module):
         attn_dropout: float = 0.0,
         attn_type: str = "simplicial",
         simplicial_geom_mode: str = "factorized",
+        simplicial_impl: str = "auto",
+        simplicial_precision: str = "bf16_tc",
+        mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
         pair_hidden_dim: int = 128,
@@ -179,9 +200,14 @@ class QM9EDMModel(nn.Module):
         super().__init__()
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
+        mha_geom_bias_mode = mha_geom_bias_mode.lower()
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual'}"
+            )
+        if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
+            raise ValueError(
+                "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
             )
         geometry_bias = None
         simplicial_geometry_bias = None
@@ -195,13 +221,20 @@ class QM9EDMModel(nn.Module):
                         use_noise_gate=True,
                     )
             else:
-                geometry_bias = GeometryBiasBuilder(
-                    n_heads=n_heads,
-                    use_distance_bias=True,
-                    use_edge_bias=True,
-                    use_periodic_features=geometry_adapter.geometry_kind == "periodic",
-                    use_noise_gate=True,
-                )
+                if mha_geom_bias_mode == "factorized_marginal":
+                    geometry_bias = MhaFactorizedGeometryBias(
+                        n_heads=n_heads,
+                        use_periodic_features=geometry_adapter.geometry_kind == "periodic",
+                        use_noise_gate=True,
+                    )
+                else:
+                    geometry_bias = GeometryBiasBuilder(
+                        n_heads=n_heads,
+                        use_distance_bias=True,
+                        use_edge_bias=True,
+                        use_periodic_features=geometry_adapter.geometry_kind == "periodic",
+                        use_noise_gate=True,
+                    )
 
         self.atom_channels = int(atom_channels)
         self.geometry_adapter = geometry_adapter
@@ -215,6 +248,8 @@ class QM9EDMModel(nn.Module):
             dropout=dropout,
             attn_dropout=attn_dropout,
             attn_type=attn_type,
+            simplicial_impl=simplicial_impl,
+            simplicial_precision=simplicial_precision,
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,

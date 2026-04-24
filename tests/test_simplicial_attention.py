@@ -1,0 +1,559 @@
+import pytest
+import torch
+
+from matterformer.geometry import NonPeriodicGeometryAdapter
+from matterformer.models import QM9EDMModel, SimplicialGeometryBias, TwoSimplicialAttention
+from matterformer.models.attention import (
+    SimplicialAttentionMask,
+    SimplicialFactorizedBias,
+    _TritonTwoSimplicialAttentionFunction,
+    simplicial_attention_torch_from_projected,
+)
+from matterformer.models.attention_triton import TRITON_AVAILABLE
+
+
+def _reference_from_projected(
+    q: torch.Tensor,
+    k1: torch.Tensor,
+    v1: torch.Tensor,
+    k2: torch.Tensor,
+    v2: torch.Tensor,
+    *,
+    attention_mask: SimplicialAttentionMask,
+    factorized_bias: SimplicialFactorizedBias | None = None,
+    logit_bias_fn=None,
+    dropout_p: float = 0.0,
+    training: bool = False,
+    chunk_size: int = 128,
+):
+    batch_size, num_heads, num_tokens, head_dim = q.shape
+    query_valid = attention_mask.query_valid.bool()
+    pair_valid = attention_mask.pair_mask()
+
+    out = torch.empty((batch_size, num_heads, num_tokens, head_dim), device=q.device, dtype=v1.dtype)
+    pair_mask = pair_valid[:, None, None, :, :]
+    flat_mask = pair_mask.flatten(-2)
+    for start in range(0, num_tokens, chunk_size):
+        end = min(num_tokens, start + chunk_size)
+        q_chunk = q[:, :, start:end, :]
+        qk2 = q_chunk.unsqueeze(-2) * k2.unsqueeze(-3)
+        logits = torch.matmul(k1.unsqueeze(-3), qk2.transpose(-1, -2)).float()
+        if factorized_bias is not None:
+            logits = logits + factorized_bias.chunk(start, end, dtype=logits.dtype, device=logits.device)
+        if logit_bias_fn is not None:
+            logits = logits + logit_bias_fn(start, end, logits.dtype, logits.device)
+
+        flat_logits = logits.flatten(-2).masked_fill(
+            ~flat_mask,
+            torch.finfo(logits.dtype).min,
+        )
+        attn = torch.softmax(flat_logits, dim=-1)
+        attn = torch.where(flat_mask, attn, torch.zeros_like(attn)).view_as(logits)
+        if dropout_p > 0.0:
+            attn = torch.nn.functional.dropout(attn, p=dropout_p, training=training)
+
+        attn = attn.to(v1.dtype)
+        tmp = torch.matmul(attn.transpose(-2, -1), v1.unsqueeze(-3))
+        out_chunk = (tmp * v2.unsqueeze(-3)).sum(dim=-2)
+        out_chunk = out_chunk * query_valid[:, start:end].to(dtype=out_chunk.dtype)[:, None, :, None]
+        out[:, :, start:end, :] = out_chunk
+    return out
+
+
+def _make_factorized_bias(
+    batch_size: int,
+    num_heads: int,
+    num_tokens: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    requires_grad: bool = False,
+) -> SimplicialFactorizedBias:
+    factory = lambda: torch.randn(
+        batch_size,
+        num_heads,
+        num_tokens,
+        num_tokens,
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    gate = torch.randn(
+        batch_size,
+        num_heads,
+        num_tokens,
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    return SimplicialFactorizedBias(u=factory(), v=factory(), w=factory(), gate=gate)
+
+
+def _mask_from_padding(
+    key_padding_mask: torch.Tensor | None,
+    *,
+    batch_size: int,
+    num_tokens: int,
+    device: torch.device,
+) -> SimplicialAttentionMask:
+    return SimplicialAttentionMask.from_key_padding_mask(
+        key_padding_mask,
+        batch_size=batch_size,
+        num_tokens=num_tokens,
+        device=device,
+    )
+
+
+def test_torch_backend_matches_reference_without_bias():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="torch", chunk_size=2)
+    x = torch.randn(2, 5, 32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, True, True, True],
+        ]
+    )
+    q, k1, v1, k2, v2 = attn._project_inputs(x)
+    attention_mask = _mask_from_padding(
+        key_padding_mask,
+        batch_size=x.shape[0],
+        num_tokens=x.shape[1],
+        device=x.device,
+    )
+    expected = _reference_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        chunk_size=attn.chunk_size,
+    )
+    actual = simplicial_attention_torch_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        chunk_size=attn.chunk_size,
+    )
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_torch_backend_matches_reference_with_factorized_bias():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="torch", chunk_size=3)
+    x = torch.randn(2, 5, 32)
+    factorized_bias = _make_factorized_bias(
+        2,
+        4,
+        5,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    attention_mask = _mask_from_padding(
+        None,
+        batch_size=x.shape[0],
+        num_tokens=x.shape[1],
+        device=x.device,
+    )
+    q, k1, v1, k2, v2 = attn._project_inputs(x)
+    expected = _reference_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        factorized_bias=factorized_bias,
+        chunk_size=attn.chunk_size,
+    )
+    actual = simplicial_attention_torch_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        factorized_bias=factorized_bias,
+        chunk_size=attn.chunk_size,
+    )
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_pair_key_mask_excludes_non_atom_pair_members():
+    torch.manual_seed(0)
+    q = torch.randn(1, 1, 3, 4)
+    k1 = torch.randn(1, 1, 3, 4)
+    v1 = torch.randn(1, 1, 3, 4)
+    k2 = torch.randn(1, 1, 3, 4)
+    v2 = torch.randn(1, 1, 3, 4)
+    attention_mask = SimplicialAttentionMask(
+        query_valid=torch.tensor([[True, True, True]]),
+        pair_key_valid=torch.tensor([[True, True, False]]),
+    )
+    out = simplicial_attention_torch_from_projected(q, k1, v1, k2, v2, attention_mask=attention_mask, chunk_size=3)
+
+    k1_alt = k1.clone()
+    v1_alt = v1.clone()
+    k2_alt = k2.clone()
+    v2_alt = v2.clone()
+    k1_alt[:, :, 2, :] = 1_000.0
+    v1_alt[:, :, 2, :] = -1_000.0
+    k2_alt[:, :, 2, :] = 2_000.0
+    v2_alt[:, :, 2, :] = 3_000.0
+    out_alt = simplicial_attention_torch_from_projected(
+        q,
+        k1_alt,
+        v1_alt,
+        k2_alt,
+        v2_alt,
+        attention_mask=attention_mask,
+        chunk_size=3,
+    )
+    assert torch.allclose(out, out_alt, atol=1e-6, rtol=1e-5)
+
+
+def test_pair_mask_excludes_invalid_pairs_with_negative_infinity():
+    q = torch.zeros(1, 1, 3, 2)
+    k1 = torch.zeros(1, 1, 3, 2)
+    v1 = torch.tensor([[[[1.0, 2.0], [5.0, 7.0], [11.0, 13.0]]]])
+    k2 = torch.zeros(1, 1, 3, 2)
+    v2 = torch.tensor([[[[3.0, 5.0], [17.0, 19.0], [23.0, 29.0]]]])
+    pair_valid = torch.zeros(1, 3, 3, dtype=torch.bool)
+    pair_valid[:, 0, 0] = True
+    attention_mask = SimplicialAttentionMask(
+        query_valid=torch.tensor([[True, True, True]]),
+        pair_key_valid=torch.tensor([[True, True, True]]),
+        pair_valid=pair_valid,
+    )
+    out = simplicial_attention_torch_from_projected(q, k1, v1, k2, v2, attention_mask=attention_mask, chunk_size=3)
+    expected = torch.tensor([3.0, 10.0]).view(1, 1, 1, 2).expand_as(out)
+    assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_auto_dispatch_falls_back_to_torch_for_cpu_and_unsupported_modes():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, True],
+            [False, False, True, True],
+        ]
+    )
+
+    auto_attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="auto")
+    _ = auto_attn(x, key_padding_mask=key_padding_mask)
+    assert auto_attn._last_impl_used == "torch"
+
+    auto_attn_dropout = TwoSimplicialAttention(dim=32, num_heads=4, impl="auto", dropout=0.1)
+    auto_attn_dropout.train()
+    _ = auto_attn_dropout(x, key_padding_mask=key_padding_mask)
+    assert auto_attn_dropout._last_impl_used == "torch"
+
+    auto_attn_with_residual = TwoSimplicialAttention(dim=32, num_heads=4, impl="auto")
+    residual = lambda start, end, dtype, device: torch.zeros(
+        x.shape[0],
+        auto_attn_with_residual.num_heads,
+        end - start,
+        x.shape[1],
+        x.shape[1],
+        dtype=dtype,
+        device=device,
+    )
+    _ = auto_attn_with_residual(x, key_padding_mask=key_padding_mask, logit_bias_fn=residual)
+    assert auto_attn_with_residual._last_impl_used == "torch"
+
+    _, _ = auto_attn(x, key_padding_mask=key_padding_mask, return_attn=True)
+    assert auto_attn._last_impl_used == "torch"
+
+    explicit_triton = TwoSimplicialAttention(dim=32, num_heads=4, impl="triton")
+    with pytest.raises(RuntimeError):
+        explicit_triton(x, key_padding_mask=key_padding_mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton dtype tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_explicit_triton_rejects_unsupported_dtype():
+    device = torch.device("cuda")
+    attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="triton").to(device=device, dtype=torch.float32)
+    x = torch.randn(2, 4, 32, device=device, dtype=torch.float64)
+    with pytest.raises(RuntimeError, match="only supports float16/bfloat16/float32"):
+        attn(x)
+
+
+def test_factorized_bias_builder_zeros_cls_queries_and_builds_mask():
+    torch.manual_seed(0)
+    adapter = NonPeriodicGeometryAdapter()
+    coords = torch.randn(2, 4, 3)
+    pad_mask = torch.tensor(
+        [
+            [False, False, False, True, False],
+            [False, False, True, True, False],
+        ]
+    )
+    geom_features = adapter(coords, pad_mask=pad_mask[:, : coords.shape[1]])
+    simplicial_bias = SimplicialGeometryBias(n_heads=4, mode="factorized", use_noise_gate=False)
+    factorized_bias, residual_fn, attention_mask = simplicial_bias.build_bias_inputs(
+        geom_features=geom_features,
+        coords_len=coords.shape[1],
+        pad_mask=pad_mask,
+        seq_len=pad_mask.shape[1],
+        sigma=None,
+    )
+    assert residual_fn is None
+    assert factorized_bias.gate.shape == (2, 4, pad_mask.shape[1])
+    assert torch.count_nonzero(factorized_bias.gate[:, :, coords.shape[1] :]) == 0
+    assert attention_mask.query_valid.shape == pad_mask.shape
+    assert attention_mask.pair_key_valid.shape == pad_mask.shape
+    assert attention_mask.pair_valid is not None
+    assert torch.count_nonzero(attention_mask.pair_key_valid[:, coords.shape[1] :]) == 0
+
+
+def test_checkpoint_roundtrip_preserves_simplicial_impl_and_precision():
+    torch.manual_seed(0)
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        attn_type="simplicial",
+        simplicial_geom_mode="factorized",
+        simplicial_impl="torch",
+        simplicial_precision="tf32",
+    )
+    checkpoint = {
+        "args": {
+            "d_model": 32,
+            "n_heads": 4,
+            "n_layers": 2,
+            "mlp_ratio": 4.0,
+            "dropout": 0.0,
+            "attn_dropout": 0.0,
+            "attn_type": "simplicial",
+            "simplicial_geom_mode": "factorized",
+            "simplicial_impl": "torch",
+            "simplicial_precision": "tf32",
+            "disable_geometry_bias": False,
+        },
+        "model_state": model.state_dict(),
+    }
+    reloaded = QM9EDMModel(
+        d_model=int(checkpoint["args"]["d_model"]),
+        n_heads=int(checkpoint["args"]["n_heads"]),
+        n_layers=int(checkpoint["args"]["n_layers"]),
+        mlp_ratio=float(checkpoint["args"]["mlp_ratio"]),
+        dropout=float(checkpoint["args"]["dropout"]),
+        attn_dropout=float(checkpoint["args"]["attn_dropout"]),
+        attn_type=str(checkpoint["args"]["attn_type"]),
+        simplicial_geom_mode=str(checkpoint["args"]["simplicial_geom_mode"]),
+        simplicial_impl=str(checkpoint["args"]["simplicial_impl"]),
+        simplicial_precision=str(checkpoint["args"]["simplicial_precision"]),
+        use_geometry_bias=not bool(checkpoint["args"]["disable_geometry_bias"]),
+    )
+    reloaded.load_state_dict(checkpoint["model_state"])
+    attn = reloaded.trunk.blocks[0].attn
+    assert attn.impl == "torch"
+    assert attn.precision == "tf32"
+
+
+def test_legacy_checkpoint_defaults_to_ieee_fp32():
+    checkpoint = {
+        "args": {
+            "d_model": 32,
+            "n_heads": 4,
+            "n_layers": 2,
+            "mlp_ratio": 4.0,
+            "dropout": 0.0,
+            "attn_dropout": 0.0,
+            "attn_type": "simplicial",
+            "simplicial_geom_mode": "factorized",
+            "simplicial_impl": "auto",
+            "disable_geometry_bias": False,
+        }
+    }
+    reloaded = QM9EDMModel(
+        d_model=int(checkpoint["args"]["d_model"]),
+        n_heads=int(checkpoint["args"]["n_heads"]),
+        n_layers=int(checkpoint["args"]["n_layers"]),
+        mlp_ratio=float(checkpoint["args"]["mlp_ratio"]),
+        dropout=float(checkpoint["args"]["dropout"]),
+        attn_dropout=float(checkpoint["args"]["attn_dropout"]),
+        attn_type=str(checkpoint["args"]["attn_type"]),
+        simplicial_geom_mode=str(checkpoint["args"]["simplicial_geom_mode"]),
+        simplicial_impl=str(checkpoint["args"]["simplicial_impl"]),
+        simplicial_precision=str(checkpoint["args"].get("simplicial_precision", "ieee_fp32")),
+        use_geometry_bias=not bool(checkpoint["args"]["disable_geometry_bias"]),
+    )
+    assert reloaded.trunk.blocks[0].attn.precision == "ieee_fp32"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_eval_mode_dropout_allows_triton():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="auto", dropout=0.1, precision="ieee_fp32").to(device)
+    attn.eval()
+    x = torch.randn(2, 5, 32, device=device, dtype=torch.float32)
+    _ = attn(x)
+    assert attn._last_impl_used == "triton"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_triton_forward_backward_ieee_matches_torch_cuda():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    q_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_triton = q_torch.detach().clone().requires_grad_(True)
+    k1_triton = k1_torch.detach().clone().requires_grad_(True)
+    v1_triton = v1_torch.detach().clone().requires_grad_(True)
+    k2_triton = k2_torch.detach().clone().requires_grad_(True)
+    v2_triton = v2_torch.detach().clone().requires_grad_(True)
+    factorized_bias_torch = _make_factorized_bias(2, 4, 5, device=device, dtype=torch.float32, requires_grad=True)
+    factorized_bias_triton = SimplicialFactorizedBias(
+        u=factorized_bias_torch.u.detach().clone().requires_grad_(True),
+        v=factorized_bias_torch.v.detach().clone().requires_grad_(True),
+        w=factorized_bias_torch.w.detach().clone().requires_grad_(True),
+        gate=factorized_bias_torch.gate.detach().clone().requires_grad_(True),
+    )
+    attention_mask = SimplicialAttentionMask.from_key_padding_mask(
+        torch.tensor(
+            [
+                [False, False, False, False, True],
+                [False, False, True, True, True],
+            ],
+            device=device,
+        ),
+        batch_size=2,
+        num_tokens=5,
+        device=device,
+    )
+    torch_out = simplicial_attention_torch_from_projected(
+        q_torch,
+        k1_torch,
+        v1_torch,
+        k2_torch,
+        v2_torch,
+        attention_mask=attention_mask,
+        factorized_bias=factorized_bias_torch,
+        chunk_size=2,
+        fp32_core=True,
+    )
+    triton_out = _TritonTwoSimplicialAttentionFunction.apply(
+        q_triton,
+        k1_triton,
+        v1_triton,
+        k2_triton,
+        v2_triton,
+        attention_mask.query_valid,
+        attention_mask.pair_key_valid,
+        torch.empty(0, device=device, dtype=torch.bool),
+        factorized_bias_triton.u,
+        factorized_bias_triton.v,
+        factorized_bias_triton.w,
+        factorized_bias_triton.gate,
+        "ieee_fp32",
+        2,
+        True,
+    )
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+    torch_loss = torch_out.square().mean()
+    triton_loss = triton_out.square().mean()
+    torch_loss.backward()
+    triton_loss.backward()
+    for actual, expected in (
+        (q_triton.grad, q_torch.grad),
+        (k1_triton.grad, k1_torch.grad),
+        (v1_triton.grad, v1_torch.grad),
+        (k2_triton.grad, k2_torch.grad),
+        (v2_triton.grad, v2_torch.grad),
+        (factorized_bias_triton.u.grad, factorized_bias_torch.u.grad),
+        (factorized_bias_triton.v.grad, factorized_bias_torch.v.grad),
+        (factorized_bias_triton.w.grad, factorized_bias_torch.w.grad),
+        (factorized_bias_triton.gate.grad, factorized_bias_torch.gate.grad),
+    ):
+        assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_triton_bf16_forward_backward_within_tolerance():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    q_torch = torch.randn(2, 4, 8, 16, device=device, dtype=dtype, requires_grad=True)
+    k1_torch = torch.randn(2, 4, 8, 16, device=device, dtype=dtype, requires_grad=True)
+    v1_torch = torch.randn(2, 4, 8, 16, device=device, dtype=dtype, requires_grad=True)
+    k2_torch = torch.randn(2, 4, 8, 16, device=device, dtype=dtype, requires_grad=True)
+    v2_torch = torch.randn(2, 4, 8, 16, device=device, dtype=dtype, requires_grad=True)
+    q_triton = q_torch.detach().clone().requires_grad_(True)
+    k1_triton = k1_torch.detach().clone().requires_grad_(True)
+    v1_triton = v1_torch.detach().clone().requires_grad_(True)
+    k2_triton = k2_torch.detach().clone().requires_grad_(True)
+    v2_triton = v2_torch.detach().clone().requires_grad_(True)
+    attention_mask = SimplicialAttentionMask.from_key_padding_mask(
+        torch.tensor(
+            [
+                [False, False, False, False, False, True, True, True],
+                [False, False, False, False, True, True, True, True],
+            ],
+            device=device,
+        ),
+        batch_size=2,
+        num_tokens=8,
+        device=device,
+    )
+    factorized_bias_torch = _make_factorized_bias(2, 4, 8, device=device, dtype=dtype, requires_grad=True)
+    factorized_bias_triton = SimplicialFactorizedBias(
+        u=factorized_bias_torch.u.detach().clone().requires_grad_(True),
+        v=factorized_bias_torch.v.detach().clone().requires_grad_(True),
+        w=factorized_bias_torch.w.detach().clone().requires_grad_(True),
+        gate=factorized_bias_torch.gate.detach().clone().requires_grad_(True),
+    )
+    torch_out = simplicial_attention_torch_from_projected(
+        q_torch,
+        k1_torch,
+        v1_torch,
+        k2_torch,
+        v2_torch,
+        attention_mask=attention_mask,
+        factorized_bias=factorized_bias_torch,
+        chunk_size=4,
+    )
+    triton_out = _TritonTwoSimplicialAttentionFunction.apply(
+        q_triton.to(torch.bfloat16),
+        k1_triton.to(torch.bfloat16),
+        v1_triton.to(torch.bfloat16),
+        k2_triton.to(torch.bfloat16),
+        v2_triton.to(torch.bfloat16),
+        attention_mask.query_valid,
+        attention_mask.pair_key_valid,
+        torch.empty(0, device=device, dtype=torch.bool),
+        factorized_bias_triton.u.to(torch.bfloat16),
+        factorized_bias_triton.v.to(torch.bfloat16),
+        factorized_bias_triton.w.to(torch.bfloat16),
+        factorized_bias_triton.gate.to(torch.bfloat16),
+        "bf16_tc",
+        4,
+        False,
+    )
+    assert torch.allclose(triton_out.float(), torch_out.float(), atol=5e-2, rtol=5e-2)
+    torch_loss = torch_out.float().square().mean()
+    triton_loss = triton_out.float().square().mean()
+    torch_loss.backward()
+    triton_loss.backward()
+    for actual, expected in (
+        (q_triton.grad.float(), q_torch.grad.float()),
+        (k1_triton.grad.float(), k1_torch.grad.float()),
+        (v1_triton.grad.float(), v1_torch.grad.float()),
+        (k2_triton.grad.float(), k2_torch.grad.float()),
+        (v2_triton.grad.float(), v2_torch.grad.float()),
+    ):
+        assert torch.allclose(actual, expected, atol=8e-2, rtol=8e-2)

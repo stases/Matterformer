@@ -15,10 +15,10 @@ if str(SRC_ROOT) not in sys.path:
 import torch
 from torch.utils.data import DataLoader
 
-from matterformer.data import QM9Dataset, collate_qm9
-from matterformer.metrics import build_rdkit_metrics, sample_and_evaluate_qm9
-from matterformer.models import QM9EDMModel
-from matterformer.tasks import EDMLoss, EDMPreconditioner
+from matterformer.data import GeomDrugsDataset, collate_geom_drugs
+from matterformer.evaluators.geom_drugs import sample_and_evaluate_geom_drugs
+from matterformer.models import GeomDrugsEDMModel
+from matterformer.tasks import GeomDrugsEDMLoss, EDMPreconditioner
 from matterformer.utils import (
     CosineWarmupScheduler,
     EMA,
@@ -36,7 +36,7 @@ def make_autocast_context(device: torch.device, enabled: bool):
 
 def evaluate_loss(
     net: EDMPreconditioner,
-    criterion: EDMLoss,
+    criterion: GeomDrugsEDMLoss,
     loader: DataLoader,
     device: torch.device,
     *,
@@ -45,7 +45,7 @@ def evaluate_loss(
 ) -> tuple[float, float, float]:
     net.eval()
     total_loss = 0.0
-    total_atom_loss = 0.0
+    total_node_loss = 0.0
     total_coord_loss = 0.0
     count = 0
     with torch.no_grad():
@@ -55,13 +55,13 @@ def evaluate_loss(
                 loss, diagnostics = criterion(net, batch)
             batch_size = int(batch.num_atoms.shape[0])
             total_loss += loss.item() * batch_size
-            total_atom_loss += diagnostics["atom_loss"].mean().item() * batch_size
+            total_node_loss += diagnostics["node_loss"].mean().item() * batch_size
             total_coord_loss += diagnostics["coord_loss"].mean().item() * batch_size
             count += batch_size
             if max_batches is not None and (batch_idx + 1) >= max_batches:
                 break
     denom = max(count, 1)
-    return total_loss / denom, total_atom_loss / denom, total_coord_loss / denom
+    return total_loss / denom, total_node_loss / denom, total_coord_loss / denom
 
 
 def maybe_init_wandb(args: argparse.Namespace):
@@ -101,10 +101,10 @@ def maybe_configure_wandb(
     run,
     args: argparse.Namespace,
     *,
-    train_dataset: QM9Dataset,
-    val_dataset: QM9Dataset,
-    test_dataset: QM9Dataset,
-    model: QM9EDMModel,
+    train_dataset: GeomDrugsDataset,
+    val_dataset: GeomDrugsDataset,
+    test_dataset: GeomDrugsDataset,
+    model: GeomDrugsEDMModel,
 ) -> None:
     if run is None:
         return
@@ -115,7 +115,7 @@ def maybe_configure_wandb(
     run.config.update(
         {
             "dataset": {
-                "name": "QM9",
+                "name": "GEOM-Drugs",
                 "train_samples": len(train_dataset),
                 "val_samples": len(val_dataset),
                 "test_samples": len(test_dataset),
@@ -123,7 +123,6 @@ def maybe_configure_wandb(
             "model": {
                 "attn_type": args.attn_type,
                 "simplicial_geom_mode": args.simplicial_geom_mode,
-                "mha_geom_bias_mode": args.mha_geom_bias_mode,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
                 "num_parameters": num_parameters,
@@ -180,25 +179,22 @@ def apply_rotation_augmentation(batch, enabled: bool):
 
 def initialize_model_parameters(
     net: EDMPreconditioner,
-    criterion: EDMLoss,
-    dataset: QM9Dataset,
+    criterion: GeomDrugsEDMLoss,
+    dataset: GeomDrugsDataset,
     device: torch.device,
     *,
     bf16_enabled: bool = False,
 ) -> None:
     if len(dataset) == 0:
         raise ValueError("Cannot initialize model parameters from an empty dataset")
-    init_batch = collate_qm9([dataset[0]]).to(device)
+    init_batch = collate_geom_drugs([dataset[0]]).to(device)
     with torch.no_grad():
         with make_autocast_context(device, bf16_enabled):
             _ = criterion(net, init_batch)
 
 
-def clone_model_state_to_cpu(model: QM9EDMModel) -> dict[str, torch.Tensor]:
-    return {
-        key: value.detach().cpu().clone()
-        for key, value in model.state_dict().items()
-    }
+def clone_model_state_to_cpu(model: GeomDrugsEDMModel) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
 def maybe_clone_ema_state(ema: EMA | None) -> dict[str, torch.Tensor] | None:
@@ -207,16 +203,16 @@ def maybe_clone_ema_state(ema: EMA | None) -> dict[str, torch.Tensor] | None:
     return ema.state_dict()
 
 
-def compute_qm9_composite_score(
-    metrics: dict[str, float],
+def compute_corrected_composite_score(
+    corrected_metrics: dict[str, float],
     *,
     molecule_stability_weight: float,
     validity_weight: float,
     uniqueness_weight: float,
 ) -> float:
-    molecule_stability = float(metrics.get("molecule_stability", math.nan))
-    validity = float(metrics.get("validity", math.nan))
-    uniqueness = float(metrics.get("uniqueness", math.nan))
+    molecule_stability = float(corrected_metrics.get("molecule_stability", math.nan))
+    validity = float(corrected_metrics.get("validity", math.nan))
+    uniqueness = float(corrected_metrics.get("uniqueness", math.nan))
     values = (molecule_stability, validity, uniqueness)
     if not all(math.isfinite(value) for value in values):
         return math.nan
@@ -229,13 +225,13 @@ def compute_qm9_composite_score(
 
 def build_checkpoint_payload(
     *,
-    model: QM9EDMModel,
+    model: GeomDrugsEDMModel,
     ema: EMA | None,
     optimizer: torch.optim.Optimizer,
     scheduler: CosineWarmupScheduler,
     args: argparse.Namespace,
     best_val: float,
-    best_precise_composite_score: float,
+    best_precise_corrected_composite_score: float,
     best_checkpoint_score: float,
     global_step: int,
     epoch: int,
@@ -248,7 +244,7 @@ def build_checkpoint_payload(
         "scheduler_state": scheduler.state_dict(),
         "args": vars(args),
         "best_val_loss": float(best_val),
-        "best_precise_composite_score": float(best_precise_composite_score),
+        "best_precise_corrected_composite_score": float(best_precise_corrected_composite_score),
         "best_checkpoint_score": float(best_checkpoint_score),
         "best_checkpoint_selector": args.best_checkpoint_selector,
         "global_step": int(global_step),
@@ -263,89 +259,144 @@ def build_checkpoint_payload(
     return payload
 
 
+def _flatten_metric_report(split_name: str, report: dict[str, object]) -> dict[str, float]:
+    payload: dict[str, float] = {}
+    for prefix in ("raw_metrics", "corrected_metrics"):
+        metric_block = report.get(prefix, {})
+        if not isinstance(metric_block, dict):
+            continue
+        for key, value in metric_block.items():
+            payload[f"{split_name}/{prefix}/{key}"] = float(value)
+    payload[f"{split_name}/molecule_count"] = float(report.get("molecule_count", 0))
+    return payload
+
+
 def log_sampling_metrics(
     run,
-    model: QM9EDMModel,
+    model: GeomDrugsEDMModel,
     ema: EMA | None,
     net: EDMPreconditioner,
     num_atoms_sampler,
     device: torch.device,
     *,
+    data_root: str,
+    train_reference_smiles: set[str],
     global_step: int,
     epoch_float: float,
     split_name: str,
     num_molecules: int,
     sample_batch_size: int,
     sampler_kwargs: dict[str, float | int],
-    rdkit_metrics,
     use_ema: bool,
     composite_weights: tuple[float, float, float] | None = None,
     bf16_enabled: bool = False,
-) -> dict[str, float]:
+) -> dict[str, object]:
     ema_backup = None
     if use_ema and ema is not None:
         ema_backup = ema.apply(model)
     try:
         with make_autocast_context(device, bf16_enabled):
-            metrics = sample_and_evaluate_qm9(
+            report = sample_and_evaluate_geom_drugs(
                 net,
                 num_atoms_sampler,
                 device=device,
                 num_molecules=num_molecules,
                 sample_batch_size=sample_batch_size,
                 sampler_kwargs=sampler_kwargs,
-                rdkit_metrics=rdkit_metrics,
+                train_reference_smiles=train_reference_smiles,
+                data_root=data_root,
             )
     finally:
         if ema_backup is not None:
             ema.restore(model, ema_backup)
+
+    corrected_metrics = report["corrected_metrics"]
     if composite_weights is not None:
-        metrics["composite_score"] = compute_qm9_composite_score(
-            metrics,
+        report["corrected_composite_score"] = compute_corrected_composite_score(
+            corrected_metrics,
             molecule_stability_weight=composite_weights[0],
             validity_weight=composite_weights[1],
             uniqueness_weight=composite_weights[2],
         )
+
     log_payload = {
         "trainer/global_step": global_step,
         "trainer/epoch": epoch_float,
     }
-    for key, value in metrics.items():
-        log_payload[f"{split_name}/{key}"] = value
+    log_payload.update(_flatten_metric_report(split_name, report))
+    if "corrected_composite_score" in report:
+        log_payload[f"{split_name}/corrected_composite_score"] = float(report["corrected_composite_score"])
+
     if run is not None:
         run.log(log_payload, step=global_step)
     else:
-        metrics_str = " ".join(f"{key}={value:.4f}" for key, value in metrics.items())
-        print(f"step={global_step:07d} {split_name} {metrics_str}")
-    return metrics
+        metric_parts = []
+        for prefix in ("raw_metrics", "corrected_metrics"):
+            metrics = report[prefix]
+            metric_parts.append(
+                f"{prefix} "
+                + " ".join(f"{key}={float(value):.4f}" for key, value in metrics.items())
+            )
+        if "corrected_composite_score" in report:
+            metric_parts.append(f"corrected_composite_score={float(report['corrected_composite_score']):.4f}")
+        print(f"step={global_step:07d} {split_name} " + " | ".join(metric_parts))
+    return report
 
 
 def main(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = default_device()
 
-    train_dataset = QM9Dataset(args.data_dir, split="train")
-    val_dataset = QM9Dataset(args.data_dir, split="val")
-    test_dataset = QM9Dataset(args.data_dir, split="test")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_qm9,
-        num_workers=args.num_workers,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_qm9,
-        num_workers=args.num_workers,
-    )
+    train_dataset = GeomDrugsDataset(args.data_dir, split="train")
+    val_dataset = GeomDrugsDataset(args.data_dir, split="val")
+    test_dataset = GeomDrugsDataset(args.data_dir, split="test")
+    if args.max_padded_atoms_per_batch is not None or args.max_attention_cost_per_batch is not None:
+        train_batch_sampler = train_dataset.make_padded_batch_sampler(
+            max_examples_per_batch=args.batch_size,
+            max_padded_atoms_per_batch=args.max_padded_atoms_per_batch,
+            max_attention_cost_per_batch=args.max_attention_cost_per_batch,
+            shuffle=True,
+            bucket_size_multiplier=args.batch_bucket_size_multiplier,
+        )
+        val_batch_sampler = val_dataset.make_padded_batch_sampler(
+            max_examples_per_batch=args.batch_size,
+            max_padded_atoms_per_batch=args.max_padded_atoms_per_batch,
+            max_attention_cost_per_batch=args.max_attention_cost_per_batch,
+            shuffle=False,
+            bucket_size_multiplier=args.batch_bucket_size_multiplier,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collate_geom_drugs,
+            num_workers=args.num_workers,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=val_batch_sampler,
+            collate_fn=collate_geom_drugs,
+            num_workers=args.num_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_geom_drugs,
+            num_workers=args.num_workers,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_geom_drugs,
+            num_workers=args.num_workers,
+        )
     num_atoms_sampler = train_dataset.make_num_atoms_sampler()
-    rdkit_metrics = build_rdkit_metrics(train_dataset.smiles_list)
+    train_reference_smiles = set(train_dataset.smiles_list)
     run = maybe_init_wandb(args)
 
-    model = QM9EDMModel(
+    model = GeomDrugsEDMModel(
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -356,13 +407,12 @@ def main(args: argparse.Namespace) -> None:
         simplicial_geom_mode=args.simplicial_geom_mode,
         simplicial_impl=args.simplicial_impl,
         simplicial_precision=args.simplicial_precision,
-        mha_geom_bias_mode=args.mha_geom_bias_mode,
         use_geometry_bias=not args.disable_geometry_bias,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
-    criterion = EDMLoss(
+    criterion = GeomDrugsEDMLoss(
         sigma_data=args.sigma_data,
-        atom_feature_scale=args.atom_feature_scale,
+        node_feature_scale=args.node_feature_scale,
         p_mean=args.p_mean,
         p_std=args.p_std,
     )
@@ -381,18 +431,12 @@ def main(args: argparse.Namespace) -> None:
     num_trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
-    print(
-        "dataset: "
-        f"train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}"
-    )
+    print(f"dataset: train={len(train_dataset)} val={len(val_dataset)} test={len(test_dataset)}")
     print(
         "model: "
         f"num_parameters={num_parameters} num_trainable_parameters={num_trainable_parameters}"
     )
-    print(
-        "schedule: "
-        f"warmup_steps={args.warmup_steps} max_steps={args.max_steps}"
-    )
+    print(f"schedule: warmup_steps={args.warmup_steps} max_steps={args.max_steps}")
     print(
         "sampler: "
         f"num_steps={args.sample_num_steps} sigma_min={args.sample_sigma_min} "
@@ -404,12 +448,17 @@ def main(args: argparse.Namespace) -> None:
         "metrics: "
         f"approx_every={args.approx_metrics_every_steps} approx_num_molecules={args.approx_metrics_num_molecules} "
         f"precise_every={args.precise_metrics_every_steps} precise_num_molecules={args.precise_metrics_num_molecules} "
-        f"sample_batch_size={args.sample_batch_size} rdkit_available={rdkit_metrics is not None}"
+        f"sample_batch_size={args.sample_batch_size}"
     )
-    print(
-        "ema: "
-        f"decay={args.ema_decay} use_for_sampling={args.ema_use_for_sampling}"
-    )
+    if args.max_padded_atoms_per_batch is not None or args.max_attention_cost_per_batch is not None:
+        print(
+            "batching: "
+            f"max_examples_per_batch={args.batch_size} "
+            f"max_padded_atoms_per_batch={args.max_padded_atoms_per_batch} "
+            f"max_attention_cost_per_batch={args.max_attention_cost_per_batch} "
+            f"bucket_size_multiplier={args.batch_bucket_size_multiplier}"
+        )
+    print(f"ema: decay={args.ema_decay} use_for_sampling={args.ema_use_for_sampling}")
     print(f"precision: bf16={args.bf16}")
     print(
         "checkpointing: "
@@ -428,7 +477,7 @@ def main(args: argparse.Namespace) -> None:
     if args.save_checkpoint:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
-    best_precise_composite_score = float("-inf")
+    best_precise_corrected_composite_score = float("-inf")
     best_state_in_memory: dict[str, torch.Tensor] | None = None
     best_ema_state_in_memory: dict[str, torch.Tensor] | None = None
     global_step = 0
@@ -464,13 +513,13 @@ def main(args: argparse.Namespace) -> None:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         best_val = float(checkpoint.get("best_val_loss", float("inf")))
-        best_precise_composite_score = float(
-            checkpoint.get("best_precise_composite_score", float("-inf"))
+        best_precise_corrected_composite_score = float(
+            checkpoint.get("best_precise_corrected_composite_score", float("-inf"))
         )
         best_checkpoint_score = float(
             checkpoint.get(
                 "best_checkpoint_score",
-                best_val if args.best_checkpoint_selector == "val_loss" else best_precise_composite_score,
+                best_val if args.best_checkpoint_selector == "val_loss" else best_precise_corrected_composite_score,
             )
         )
         global_step = int(checkpoint["global_step"])
@@ -485,7 +534,7 @@ def main(args: argparse.Namespace) -> None:
             "resume_checkpoint: "
             f"path={resume_path} global_step={global_step} epoch={epoch} "
             f"best_val_loss={best_val:.6f} "
-            f"best_precise_composite_score={best_precise_composite_score:.6f}"
+            f"best_precise_corrected_composite_score={best_precise_corrected_composite_score:.6f}"
         )
         if (
             args.save_checkpoint
@@ -507,7 +556,7 @@ def main(args: argparse.Namespace) -> None:
         epoch += 1
         net.train()
         total_loss = 0.0
-        total_atom_loss = 0.0
+        total_node_loss = 0.0
         total_coord_loss = 0.0
         total_samples = 0
         for batch_idx, batch in enumerate(train_loader, start=1):
@@ -528,7 +577,7 @@ def main(args: argparse.Namespace) -> None:
 
             batch_size = int(batch.num_atoms.shape[0])
             total_loss += loss.item() * batch_size
-            total_atom_loss += diagnostics["atom_loss"].mean().item() * batch_size
+            total_node_loss += diagnostics["node_loss"].mean().item() * batch_size
             total_coord_loss += diagnostics["coord_loss"].mean().item() * batch_size
             total_samples += batch_size
 
@@ -541,7 +590,7 @@ def main(args: argparse.Namespace) -> None:
                         "trainer/global_step": global_step,
                         "trainer/epoch": epoch_float,
                         "train/loss": loss.item(),
-                        "train/atom_loss": diagnostics["atom_loss"].mean().item(),
+                        "train/node_loss": diagnostics["node_loss"].mean().item(),
                         "train/coord_loss": diagnostics["coord_loss"].mean().item(),
                         "noise/sigma_mean": diagnostics["sigma"].mean().item(),
                         "noise/sigma_std": diagnostics["sigma"].std(unbiased=False).item(),
@@ -558,7 +607,7 @@ def main(args: argparse.Namespace) -> None:
                 and args.val_estimate_every_steps > 0
                 and global_step % args.val_estimate_every_steps == 0
             ):
-                val_est_loss, val_est_atom_loss, val_est_coord_loss = evaluate_loss(
+                val_est_loss, val_est_node_loss, val_est_coord_loss = evaluate_loss(
                     net,
                     criterion,
                     val_loader,
@@ -571,21 +620,21 @@ def main(args: argparse.Namespace) -> None:
                         "trainer/global_step": global_step,
                         "trainer/epoch": epoch_float,
                         "val_estimate/loss": val_est_loss,
-                        "val_estimate/atom_loss": val_est_atom_loss,
+                        "val_estimate/node_loss": val_est_node_loss,
                         "val_estimate/coord_loss": val_est_coord_loss,
                     },
                     step=global_step,
                 )
 
             if args.full_val_every_steps > 0 and global_step % args.full_val_every_steps == 0:
-                val_loss, val_atom_loss, val_coord_loss = evaluate_loss(
+                val_loss, val_node_loss, val_coord_loss = evaluate_loss(
                     net,
                     criterion,
                     val_loader,
                     device,
                     bf16_enabled=args.bf16,
                 )
-                last_full_val = (val_loss, val_atom_loss, val_coord_loss)
+                last_full_val = (val_loss, val_node_loss, val_coord_loss)
                 last_full_val_step = global_step
                 if run is not None:
                     run.log(
@@ -593,7 +642,7 @@ def main(args: argparse.Namespace) -> None:
                             "trainer/global_step": global_step,
                             "trainer/epoch": epoch_float,
                             "val/loss": val_loss,
-                            "val/atom_loss": val_atom_loss,
+                            "val/node_loss": val_node_loss,
                             "val/coord_loss": val_coord_loss,
                             "val/best_loss": min(best_val, val_loss),
                             "checkpoint/best_score": (
@@ -615,7 +664,7 @@ def main(args: argparse.Namespace) -> None:
                         scheduler=scheduler,
                         args=args,
                         best_val=best_val,
-                        best_precise_composite_score=best_precise_composite_score,
+                        best_precise_corrected_composite_score=best_precise_corrected_composite_score,
                         best_checkpoint_score=best_checkpoint_score,
                         global_step=global_step,
                         epoch=epoch,
@@ -638,13 +687,14 @@ def main(args: argparse.Namespace) -> None:
                     net,
                     num_atoms_sampler,
                     device,
+                    data_root=args.data_dir,
+                    train_reference_smiles=train_reference_smiles,
                     global_step=global_step,
                     epoch_float=epoch_float,
                     split_name="approx_metrics",
                     num_molecules=args.approx_metrics_num_molecules,
                     sample_batch_size=args.sample_batch_size,
                     sampler_kwargs=sampler_kwargs,
-                    rdkit_metrics=rdkit_metrics,
                     use_ema=args.ema_use_for_sampling,
                     composite_weights=composite_weights,
                     bf16_enabled=args.bf16,
@@ -654,49 +704,52 @@ def main(args: argparse.Namespace) -> None:
                 args.precise_metrics_every_steps > 0
                 and global_step % args.precise_metrics_every_steps == 0
             ):
-                precise_metrics = log_sampling_metrics(
+                precise_report = log_sampling_metrics(
                     run,
                     model,
                     ema,
                     net,
                     num_atoms_sampler,
                     device,
+                    data_root=args.data_dir,
+                    train_reference_smiles=train_reference_smiles,
                     global_step=global_step,
                     epoch_float=epoch_float,
                     split_name="precise_metrics",
                     num_molecules=args.precise_metrics_num_molecules,
                     sample_batch_size=args.sample_batch_size,
                     sampler_kwargs=sampler_kwargs,
-                    rdkit_metrics=rdkit_metrics,
                     use_ema=args.ema_use_for_sampling,
                     composite_weights=composite_weights,
                     bf16_enabled=args.bf16,
                 )
-                precise_composite_score = float(precise_metrics.get("composite_score", math.nan))
-                if math.isfinite(precise_composite_score):
-                    best_precise_composite_score = max(
-                        best_precise_composite_score,
-                        precise_composite_score,
+                precise_corrected_composite_score = float(
+                    precise_report.get("corrected_composite_score", math.nan)
+                )
+                if math.isfinite(precise_corrected_composite_score):
+                    best_precise_corrected_composite_score = max(
+                        best_precise_corrected_composite_score,
+                        precise_corrected_composite_score,
                     )
                     if run is not None:
                         run.log(
                             {
                                 "trainer/global_step": global_step,
                                 "trainer/epoch": epoch_float,
-                                "precise_metrics/best_composite_score": best_precise_composite_score,
+                                "precise_metrics/best_corrected_composite_score": best_precise_corrected_composite_score,
                                 "checkpoint/best_score": (
-                                    best_precise_composite_score
-                                    if args.best_checkpoint_selector == "precise_composite"
+                                    best_precise_corrected_composite_score
+                                    if args.best_checkpoint_selector == "precise_corrected_composite"
                                     else best_checkpoint_score
                                 ),
                             },
                             step=global_step,
                         )
                     if (
-                        args.best_checkpoint_selector == "precise_composite"
-                        and precise_composite_score > best_checkpoint_score
+                        args.best_checkpoint_selector == "precise_corrected_composite"
+                        and precise_corrected_composite_score > best_checkpoint_score
                     ):
-                        best_checkpoint_score = precise_composite_score
+                        best_checkpoint_score = precise_corrected_composite_score
                         best_payload = build_checkpoint_payload(
                             model=model,
                             ema=ema,
@@ -704,7 +757,7 @@ def main(args: argparse.Namespace) -> None:
                             scheduler=scheduler,
                             args=args,
                             best_val=best_val,
-                            best_precise_composite_score=best_precise_composite_score,
+                            best_precise_corrected_composite_score=best_precise_corrected_composite_score,
                             best_checkpoint_score=best_checkpoint_score,
                             global_step=global_step,
                             epoch=epoch,
@@ -717,14 +770,14 @@ def main(args: argparse.Namespace) -> None:
                             torch.save(best_payload, checkpoint_path)
 
         train_loss = total_loss / max(total_samples, 1)
-        train_atom_loss = total_atom_loss / max(total_samples, 1)
+        train_node_loss = total_node_loss / max(total_samples, 1)
         train_coord_loss = total_coord_loss / max(total_samples, 1)
         lr = optimizer.param_groups[0]["lr"]
         print(
             f"epoch={epoch:03d} "
             f"step={global_step:07d} "
             f"train_epoch_loss={train_loss:.6f} "
-            f"train_epoch_atom_loss={train_atom_loss:.6f} "
+            f"train_epoch_node_loss={train_node_loss:.6f} "
             f"train_epoch_coord_loss={train_coord_loss:.6f} "
             f"lr={lr:.6e}"
         )
@@ -734,7 +787,7 @@ def main(args: argparse.Namespace) -> None:
                     "trainer/global_step": global_step,
                     "trainer/epoch": float(epoch),
                     "train_epoch/loss": train_loss,
-                    "train_epoch/atom_loss": train_atom_loss,
+                    "train_epoch/node_loss": train_node_loss,
                     "train_epoch/coord_loss": train_coord_loss,
                     "optim/lr": lr,
                 },
@@ -742,14 +795,14 @@ def main(args: argparse.Namespace) -> None:
             )
 
     if last_full_val_step != global_step:
-        val_loss, val_atom_loss, val_coord_loss = evaluate_loss(
+        val_loss, val_node_loss, val_coord_loss = evaluate_loss(
             net,
             criterion,
             val_loader,
             device,
             bf16_enabled=args.bf16,
         )
-        last_full_val = (val_loss, val_atom_loss, val_coord_loss)
+        last_full_val = (val_loss, val_node_loss, val_coord_loss)
         last_full_val_step = global_step
         if run is not None:
             run.log(
@@ -757,7 +810,7 @@ def main(args: argparse.Namespace) -> None:
                     "trainer/global_step": global_step,
                     "trainer/epoch": float(epoch),
                     "val/loss": val_loss,
-                    "val/atom_loss": val_atom_loss,
+                    "val/node_loss": val_node_loss,
                     "val/coord_loss": val_coord_loss,
                     "val/best_loss": min(best_val, val_loss),
                     "checkpoint/best_score": (
@@ -779,7 +832,7 @@ def main(args: argparse.Namespace) -> None:
                 scheduler=scheduler,
                 args=args,
                 best_val=best_val,
-                best_precise_composite_score=best_precise_composite_score,
+                best_precise_corrected_composite_score=best_precise_corrected_composite_score,
                 best_checkpoint_score=best_checkpoint_score,
                 global_step=global_step,
                 epoch=epoch,
@@ -791,15 +844,15 @@ def main(args: argparse.Namespace) -> None:
             if args.save_checkpoint:
                 torch.save(best_payload, checkpoint_path)
     else:
-        val_loss, val_atom_loss, val_coord_loss = last_full_val
+        val_loss, val_node_loss, val_coord_loss = last_full_val
 
     print(
         f"final_val step={global_step:07d} "
         f"val_loss={val_loss:.6f} "
-        f"val_atom_loss={val_atom_loss:.6f} "
+        f"val_node_loss={val_node_loss:.6f} "
         f"val_coord_loss={val_coord_loss:.6f} "
         f"best_val_loss={best_val:.6f} "
-        f"best_precise_composite_score={best_precise_composite_score:.6f} "
+        f"best_precise_corrected_composite_score={best_precise_corrected_composite_score:.6f} "
         f"best_checkpoint_score={best_checkpoint_score:.6f} "
         f"selector={args.best_checkpoint_selector}"
     )
@@ -815,23 +868,26 @@ def main(args: argparse.Namespace) -> None:
             ema.load_state_dict(checkpoint["ema_state_dict"])
     if run is not None:
         run.summary["val/best_loss"] = best_val
-        run.summary["precise_metrics/best_composite_score"] = best_precise_composite_score
+        run.summary["precise_metrics/best_corrected_composite_score"] = best_precise_corrected_composite_score
         run.summary["checkpoint/best_selector"] = args.best_checkpoint_selector
         run.summary["checkpoint/best_score"] = best_checkpoint_score
         run.finish()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Matterformer QM9 EDM")
-    parser.add_argument("--data-dir", type=str, default="./data/qm9")
+    parser = argparse.ArgumentParser(description="Train Matterformer GEOM-Drugs EDM")
+    parser.add_argument("--data-dir", type=str, default="./data/geom_drugs")
     parser.add_argument(
         "--output",
         type=str,
-        default="./outputs/Matterformer_QM9_edm/checkpoints/qm9_edm.pt",
+        default="./outputs/Matterformer_GEOM_Drugs_edm/checkpoints/geom_drugs_edm.pt",
     )
     parser.add_argument("--resume-checkpoint", type=str, default=None)
     parser.add_argument("--warm-start-checkpoint", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--max-padded-atoms-per-batch", type=int, default=None)
+    parser.add_argument("--max-attention-cost-per-batch", type=int, default=None)
+    parser.add_argument("--batch-bucket-size-multiplier", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-12)
@@ -863,17 +919,11 @@ if __name__ == "__main__":
         default="bf16_tc",
         choices=["bf16_tc", "tf32", "ieee_fp32"],
     )
-    parser.add_argument(
-        "--mha-geom-bias-mode",
-        type=str,
-        default="standard",
-        choices=["standard", "factorized_marginal"],
-    )
     parser.add_argument("--train-augm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sigma-data", type=float, default=1.0)
     parser.add_argument("--p-mean", type=float, default=-1.2)
     parser.add_argument("--p-std", type=float, default=1.2)
-    parser.add_argument("--atom-feature-scale", type=float, default=4.0)
+    parser.add_argument("--node-feature-scale", type=float, default=4.0)
     parser.add_argument("--disable-geometry-bias", action="store_true")
     parser.add_argument("--sample-num-steps", type=int, default=100)
     parser.add_argument("--sample-sigma-min", type=float, default=0.002)
@@ -891,13 +941,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--best-checkpoint-selector",
         type=str,
-        default="val_loss",
-        choices=["val_loss", "precise_composite"],
+        default="precise_corrected_composite",
+        choices=["val_loss", "precise_corrected_composite"],
     )
     parser.add_argument("--checkpoint-molecule-stability-weight", type=float, default=0.60)
     parser.add_argument("--checkpoint-validity-weight", type=float, default=0.30)
     parser.add_argument("--checkpoint-uniqueness-weight", type=float, default=0.10)
-    parser.add_argument("--wandb-project", type=str, default="Matterformer_QM9_edm")
+    parser.add_argument("--wandb-project", type=str, default="Matterformer_GEOM_Drugs_edm")
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default="online")
@@ -905,7 +955,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wandb-dir",
         type=str,
-        default="./outputs/Matterformer_QM9_edm/wandb",
+        default="./outputs/Matterformer_GEOM_Drugs_edm/wandb",
     )
     parser.add_argument("--log-every-steps", type=int, default=50)
     parser.add_argument("--val-estimate-every-steps", type=int, default=500)

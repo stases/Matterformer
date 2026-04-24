@@ -41,3 +41,7 @@ env/
 *.tgz
 *.zip
 *.7z
+
+# Temporary local dataset builder workspace
+geomdrugs_builder/
+tmp_MOF/

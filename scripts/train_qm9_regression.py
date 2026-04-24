@@ -112,6 +112,8 @@ def maybe_configure_wandb(
             "model": {
                 "attn_type": args.attn_type,
                 "simplicial_geom_mode": args.simplicial_geom_mode,
+                "simplicial_impl": args.simplicial_impl,
+                "simplicial_precision": args.simplicial_precision,
                 "readout_mode": args.readout_mode,
                 "num_parameters": num_parameters,
                 "num_trainable_parameters": num_trainable_parameters,
@@ -178,6 +180,38 @@ def clone_model_state_to_cpu(model: QM9RegressionModel) -> dict[str, torch.Tenso
     }
 
 
+def build_checkpoint_payload(
+    *,
+    model: QM9RegressionModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineWarmupScheduler,
+    args: argparse.Namespace,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+    best_val: float,
+    global_step: int,
+    epoch: int,
+    last_full_val_step: int,
+    last_full_val: tuple[float, float] | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "args": vars(args),
+        "target_mean": target_mean.cpu(),
+        "target_std": target_std.cpu(),
+        "target": args.target,
+        "best_val_mae": float(best_val),
+        "global_step": int(global_step),
+        "epoch": int(epoch),
+        "last_full_val_step": int(last_full_val_step),
+    }
+    if last_full_val is not None:
+        payload["last_full_val"] = tuple(float(value) for value in last_full_val)
+    return payload
+
+
 def main(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = default_device()
@@ -221,6 +255,8 @@ def main(args: argparse.Namespace) -> None:
         attn_dropout=args.attn_dropout,
         attn_type=args.attn_type,
         simplicial_geom_mode=args.simplicial_geom_mode,
+        simplicial_impl=args.simplicial_impl,
+        simplicial_precision=args.simplicial_precision,
         readout_mode=args.readout_mode,
         use_geometry_bias=not args.disable_geometry_bias,
     ).to(device)
@@ -272,6 +308,47 @@ def main(args: argparse.Namespace) -> None:
     last_full_val: tuple[float, float] | None = None
     batches_per_epoch = len(train_loader)
     epoch = 0
+
+    if args.resume_checkpoint is not None and args.warm_start_checkpoint is not None:
+        raise ValueError("Only one of --resume-checkpoint or --warm-start-checkpoint may be set")
+
+    if args.resume_checkpoint is not None:
+        resume_path = Path(args.resume_checkpoint)
+        checkpoint = torch.load(resume_path, map_location=device)
+        required_keys = ("model_state", "optimizer_state", "scheduler_state", "global_step")
+        missing_keys = [key for key in required_keys if key not in checkpoint]
+        if missing_keys:
+            raise KeyError(
+                f"Checkpoint {resume_path} is missing resume fields: {', '.join(missing_keys)}"
+            )
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        best_val = float(checkpoint.get("best_val_mae", float("inf")))
+        global_step = int(checkpoint["global_step"])
+        epoch = int(checkpoint.get("epoch", 0))
+        last_full_val_step = int(checkpoint.get("last_full_val_step", -1))
+        checkpoint_last_full_val = checkpoint.get("last_full_val")
+        if checkpoint_last_full_val is not None:
+            last_full_val = tuple(float(value) for value in checkpoint_last_full_val)
+        best_state_in_memory = clone_model_state_to_cpu(model)
+        print(
+            "resume_checkpoint: "
+            f"path={resume_path} global_step={global_step} epoch={epoch} best_val_mae={best_val:.6f}"
+        )
+        if (
+            args.save_checkpoint
+            and checkpoint_path.expanduser().resolve() != resume_path.expanduser().resolve()
+        ):
+            torch.save(checkpoint, checkpoint_path)
+    elif args.warm_start_checkpoint is not None:
+        warm_start_path = Path(args.warm_start_checkpoint)
+        checkpoint = torch.load(warm_start_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        print(
+            "warm_start_checkpoint: "
+            f"path={warm_start_path} source_best_val_mae={float(checkpoint.get('best_val_mae', float('nan'))):.6f}"
+        )
 
     while global_step < args.max_steps:
         epoch += 1
@@ -367,18 +444,22 @@ def main(args: argparse.Namespace) -> None:
                     )
                 if val_mae < best_val:
                     best_val = val_mae
-                    best_payload = {
-                        "model_state": model.state_dict(),
-                        "args": vars(args),
-                        "target_mean": target_mean.cpu(),
-                        "target_std": target_std.cpu(),
-                        "target": args.target,
-                        "best_val_mae": best_val,
-                    }
+                    best_payload = build_checkpoint_payload(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        target_mean=target_mean,
+                        target_std=target_std,
+                        best_val=best_val,
+                        global_step=global_step,
+                        epoch=epoch,
+                        last_full_val_step=last_full_val_step,
+                        last_full_val=last_full_val,
+                    )
+                    best_state_in_memory = clone_model_state_to_cpu(model)
                     if args.save_checkpoint:
                         torch.save(best_payload, checkpoint_path)
-                    else:
-                        best_state_in_memory = clone_model_state_to_cpu(model)
 
         train_loss = total_loss / max(total_samples, 1)
         train_mae = total_mae / max(total_samples, 1)
@@ -425,18 +506,22 @@ def main(args: argparse.Namespace) -> None:
             )
         if val_mae < best_val:
             best_val = val_mae
-            best_payload = {
-                "model_state": model.state_dict(),
-                "args": vars(args),
-                "target_mean": target_mean.cpu(),
-                "target_std": target_std.cpu(),
-                "target": args.target,
-                "best_val_mae": best_val,
-            }
+            best_payload = build_checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=args,
+                target_mean=target_mean,
+                target_std=target_std,
+                best_val=best_val,
+                global_step=global_step,
+                epoch=epoch,
+                last_full_val_step=last_full_val_step,
+                last_full_val=last_full_val,
+            )
+            best_state_in_memory = clone_model_state_to_cpu(model)
             if args.save_checkpoint:
                 torch.save(best_payload, checkpoint_path)
-            else:
-                best_state_in_memory = clone_model_state_to_cpu(model)
     else:
         val_loss, val_mae = last_full_val
 
@@ -446,11 +531,11 @@ def main(args: argparse.Namespace) -> None:
         f"best_val_mae={best_val:.6f}"
     )
 
-    if args.save_checkpoint:
+    if best_state_in_memory is not None:
+        model.load_state_dict(best_state_in_memory)
+    elif args.save_checkpoint:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state"])
-    elif best_state_in_memory is not None:
-        model.load_state_dict(best_state_in_memory)
     test_loss, test_mae = evaluate(
         model,
         test_loader,
@@ -486,6 +571,8 @@ if __name__ == "__main__":
         type=str,
         default="./outputs/Matterformer_QM9_regr/checkpoints/qm9_regression.pt",
     )
+    parser.add_argument("--resume-checkpoint", type=str, default=None)
+    parser.add_argument("--warm-start-checkpoint", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -505,6 +592,18 @@ if __name__ == "__main__":
         type=str,
         default="factorized",
         choices=["none", "factorized", "angle_residual"],
+    )
+    parser.add_argument(
+        "--simplicial-impl",
+        type=str,
+        default="auto",
+        choices=["auto", "torch", "triton"],
+    )
+    parser.add_argument(
+        "--simplicial-precision",
+        type=str,
+        default="bf16_tc",
+        choices=["bf16_tc", "tf32", "ieee_fp32"],
     )
     parser.add_argument(
         "--readout-mode",

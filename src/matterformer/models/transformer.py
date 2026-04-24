@@ -8,7 +8,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
-from matterformer.models.attention import TwoSimplicialAttention
+from matterformer.models.attention import (
+    SimplicialAttentionMask,
+    SimplicialFactorizedBias,
+    TwoSimplicialAttention,
+)
 
 
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -18,6 +22,46 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 def _softplus_inverse(value: torch.Tensor) -> torch.Tensor:
     value = value.clamp_min(1e-8)
     return value + torch.log(-torch.expm1(-value))
+
+
+def _build_simplicial_attention_mask(
+    *,
+    coords_len: int,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device,
+    pad_mask: torch.Tensor | None = None,
+    geom_pair_mask: torch.Tensor | None = None,
+    include_global_tokens_as_pair_keys: bool = False,
+) -> SimplicialAttentionMask:
+    if seq_len < coords_len:
+        raise ValueError(f"seq_len={seq_len} is smaller than coords_len={coords_len}")
+    if pad_mask is None:
+        query_valid = torch.ones(batch_size, seq_len, device=device, dtype=torch.bool)
+    else:
+        query_valid = ~pad_mask.bool().to(device=device)
+    if include_global_tokens_as_pair_keys:
+        pair_key_valid = query_valid
+        return SimplicialAttentionMask(
+            query_valid=query_valid,
+            pair_key_valid=pair_key_valid,
+            pair_valid=None,
+        )
+
+    atom_positions = (torch.arange(seq_len, device=device) < coords_len).view(1, seq_len)
+    pair_key_valid = query_valid & atom_positions
+    pair_valid = None
+    if geom_pair_mask is not None or seq_len != coords_len:
+        pair_valid = torch.zeros(batch_size, seq_len, seq_len, device=device, dtype=torch.bool)
+        if geom_pair_mask is None:
+            pair_valid[:, :coords_len, :coords_len] = True
+        else:
+            pair_valid[:, :coords_len, :coords_len] = geom_pair_mask.bool().to(device=device)
+    return SimplicialAttentionMask(
+        query_valid=query_valid,
+        pair_key_valid=pair_key_valid,
+        pair_valid=pair_valid,
+    )
 
 
 def _sinusoidal_embedding(
@@ -110,6 +154,8 @@ class AdaLNBlock(nn.Module):
         attn_type: str = "mha",
         simplicial_chunk_size: int = 128,
         simplicial_head_dim: int | None = None,
+        simplicial_impl: str = "auto",
+        simplicial_precision: str = "bf16_tc",
     ) -> None:
         super().__init__()
         attn_type = attn_type.lower()
@@ -140,6 +186,8 @@ class AdaLNBlock(nn.Module):
                 chunk_size=simplicial_chunk_size,
                 bias=True,
                 out_proj=True,
+                impl=simplicial_impl,
+                precision=simplicial_precision,
             )
         self.mlp = Mlp(d_model=d_model, mlp_ratio=mlp_ratio, dropout=dropout)
 
@@ -149,6 +197,8 @@ class AdaLNBlock(nn.Module):
         cond_emb: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
         attn_head_bias: torch.Tensor | None = None,
+        simplicial_attention_mask: SimplicialAttentionMask | None = None,
+        simplicial_factorized_bias: SimplicialFactorizedBias | None = None,
         simplicial_logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if cond_emb.ndim != 2 or cond_emb.shape[-1] != x.shape[-1]:
@@ -175,6 +225,8 @@ class AdaLNBlock(nn.Module):
                     )
             if simplicial_logit_bias_fn is not None:
                 raise ValueError("simplicial_logit_bias_fn must be None for MultiheadAttention")
+            if simplicial_factorized_bias is not None:
+                raise ValueError("simplicial_factorized_bias is only supported for simplicial attention")
             attn_out, _ = self.attn(
                 h,
                 h,
@@ -189,6 +241,8 @@ class AdaLNBlock(nn.Module):
             attn_out = self.attn(
                 h,
                 key_padding_mask=pad_mask,
+                attention_mask=simplicial_attention_mask,
+                factorized_bias=simplicial_factorized_bias,
                 logit_bias_fn=simplicial_logit_bias_fn,
             )
         x = x + gate_msa[:, None, :] * attn_out
@@ -539,14 +593,18 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         tri_bias = self.angle_residual_mlp(tri_feat).permute(0, 4, 1, 2, 3).contiguous()
         return tri_bias * valid[:, None, :, :, :].to(dtype=tri_bias.dtype)
 
-    def build_logit_bias_fn(
+    def build_bias_inputs(
         self,
         geom_features: GeometryFeatures,
         coords_len: int,
         pad_mask: torch.Tensor | None = None,
         seq_len: int | None = None,
         sigma: torch.Tensor | None = None,
-    ) -> Callable[[int, int, torch.dtype, torch.device], torch.Tensor]:
+    ) -> tuple[
+        SimplicialFactorizedBias,
+        Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None,
+        SimplicialAttentionMask,
+    ]:
         u_atoms, v_atoms, w_atoms = self._compute_factorized_terms(geom_features)
         atom_pad_mask = pad_mask[:, :coords_len].bool() if pad_mask is not None else None
         u_atoms = self._mask_atom_pairwise_bias(u_atoms, atom_pad_mask)
@@ -562,7 +620,75 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             batch_size=u_full.shape[0],
             dtype=u_full.dtype,
             device=u_full.device,
-        ).unsqueeze(2)
+        )
+        gate = gate.expand(-1, -1, target_seq_len, -1).squeeze(-1)
+        if target_seq_len > coords_len:
+            q_is_atom = (
+                torch.arange(target_seq_len, device=u_full.device) < coords_len
+            ).to(dtype=gate.dtype)
+            gate = gate * q_is_atom.view(1, 1, target_seq_len)
+
+        factorized_bias = SimplicialFactorizedBias(
+            u=u_full,
+            v=v_full,
+            w=w_full,
+            gate=gate,
+        )
+        attention_mask = _build_simplicial_attention_mask(
+            coords_len=coords_len,
+            seq_len=target_seq_len,
+            batch_size=u_full.shape[0],
+            device=u_full.device,
+            pad_mask=pad_mask,
+            geom_pair_mask=geom_features.pair_mask,
+        )
+
+        if self.mode != "angle_residual":
+            return factorized_bias, None, attention_mask
+
+        def _residual_fn(
+            start: int,
+            end: int,
+            dtype: torch.dtype,
+            device: torch.device,
+        ) -> torch.Tensor:
+            residual = torch.zeros(
+                u_full.shape[0],
+                self.n_heads,
+                end - start,
+                target_seq_len,
+                target_seq_len,
+                device=u_full.device,
+                dtype=u_full.dtype,
+            )
+            atom_q_end = min(end, coords_len)
+            if start < atom_q_end:
+                angle_chunk = self._compute_angle_residual_chunk(
+                    geom_features=geom_features,
+                    q_start=start,
+                    q_end=atom_q_end,
+                )
+                residual[:, :, : atom_q_end - start, :coords_len, :coords_len] = angle_chunk
+            gate_chunk = gate[:, :, start:end].unsqueeze(-1).unsqueeze(-1)
+            return (gate_chunk * residual).to(device=device, dtype=dtype)
+
+        return factorized_bias, _residual_fn, attention_mask
+
+    def build_logit_bias_fn(
+        self,
+        geom_features: GeometryFeatures,
+        coords_len: int,
+        pad_mask: torch.Tensor | None = None,
+        seq_len: int | None = None,
+        sigma: torch.Tensor | None = None,
+    ) -> Callable[[int, int, torch.dtype, torch.device], torch.Tensor]:
+        factorized_bias, residual_fn, _ = self.build_bias_inputs(
+            geom_features=geom_features,
+            coords_len=coords_len,
+            pad_mask=pad_mask,
+            seq_len=seq_len,
+            sigma=sigma,
+        )
 
         def _bias_fn(
             start: int,
@@ -570,38 +696,117 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             dtype: torch.dtype,
             device: torch.device,
         ) -> torch.Tensor:
-            bias = (
-                u_full[:, :, start:end, :, None]
-                + v_full[:, :, start:end, None, :]
-                + w_full[:, :, None, :, :]
-            )
-            if self.mode == "angle_residual":
-                residual = torch.zeros(
-                    u_full.shape[0],
-                    self.n_heads,
-                    end - start,
-                    target_seq_len,
-                    target_seq_len,
-                    device=u_full.device,
-                    dtype=u_full.dtype,
-                )
-                atom_q_end = min(end, coords_len)
-                if start < atom_q_end:
-                    angle_chunk = self._compute_angle_residual_chunk(
-                        geom_features=geom_features,
-                        q_start=start,
-                        q_end=atom_q_end,
-                    )
-                    residual[:, :, : atom_q_end - start, :coords_len, :coords_len] = angle_chunk
-                bias = bias + residual
-            if target_seq_len > coords_len:
-                q_is_atom = (
-                    torch.arange(start, end, device=u_full.device) < coords_len
-                ).to(dtype=bias.dtype)
-                bias = bias * q_is_atom.view(1, 1, end - start, 1, 1)
-            return (gate * bias).to(device=device, dtype=dtype)
+            bias = factorized_bias.chunk(start, end, dtype=dtype, device=device)
+            if residual_fn is None:
+                return bias
+            return bias + residual_fn(start, end, dtype, device)
 
         return _bias_fn
+
+
+class MhaFactorizedGeometryBias(SimplicialGeometryBias):
+    """MHA attention-logit bias from the same factorized geometry terms as simplicial attention."""
+
+    def __init__(
+        self,
+        n_heads: int,
+        edge_bias_hidden_dim: int = 128,
+        edge_bias_n_rbf: int = 16,
+        edge_bias_rbf_max: float = 2.0,
+        edge_bias_n_freqs: int = 8,
+        use_periodic_features: bool = False,
+        use_noise_gate: bool = True,
+        marginal_chunk_size: int = 8,
+    ) -> None:
+        super().__init__(
+            n_heads=n_heads,
+            mode="factorized",
+            edge_bias_hidden_dim=edge_bias_hidden_dim,
+            edge_bias_n_rbf=edge_bias_n_rbf,
+            edge_bias_rbf_max=edge_bias_rbf_max,
+            edge_bias_n_freqs=edge_bias_n_freqs,
+            use_periodic_features=use_periodic_features,
+            use_noise_gate=use_noise_gate,
+        )
+        if marginal_chunk_size <= 0:
+            raise ValueError("marginal_chunk_size must be positive")
+        self.marginal_chunk_size = int(marginal_chunk_size)
+
+    def _collapse_factorized_terms(
+        self,
+        u_atoms: torch.Tensor,
+        v_atoms: torch.Tensor,
+        w_atoms: torch.Tensor,
+        pair_mask: torch.Tensor,
+        gate_atoms: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, n_heads, num_atoms, _ = u_atoms.shape
+        pair_bias = torch.zeros(
+            batch_size,
+            n_heads,
+            num_atoms,
+            num_atoms,
+            device=u_atoms.device,
+            dtype=torch.float32,
+        )
+        valid_pair_keys = pair_mask[:, None, None, :, :]
+        valid_counts = pair_mask.sum(dim=-1).clamp_min(1).to(device=u_atoms.device)
+        log_valid_counts = valid_counts.to(dtype=torch.float32).log()[:, None, None, :]
+        has_valid_keys = pair_mask.any(dim=-1)[:, None, None, :]
+
+        for start in range(0, num_atoms, self.marginal_chunk_size):
+            end = min(num_atoms, start + self.marginal_chunk_size)
+            gate_chunk = gate_atoms[:, :, start:end].float()
+            vk = v_atoms[:, :, start:end, None, :].float()
+            wjk = w_atoms[:, :, None, :, :].float()
+            logits = gate_chunk[:, :, :, None, None] * (vk + wjk)
+            logits = logits.masked_fill(~valid_pair_keys, torch.finfo(logits.dtype).min)
+            marginal = torch.logsumexp(logits, dim=-1) - log_valid_counts
+            marginal = torch.where(has_valid_keys, marginal, torch.zeros_like(marginal))
+            pair_bias[:, :, start:end, :] = (
+                gate_chunk[:, :, :, None] * u_atoms[:, :, start:end, :].float() + marginal
+            )
+
+        return pair_bias
+
+    def forward_from_features(
+        self,
+        geom_features: GeometryFeatures,
+        coords_len: int,
+        pad_mask: torch.Tensor | None = None,
+        seq_len: int | None = None,
+        sigma: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        u_atoms, v_atoms, w_atoms = self._compute_factorized_terms(geom_features)
+        atom_pad_mask = pad_mask[:, :coords_len].bool() if pad_mask is not None else None
+        u_atoms = self._mask_atom_pairwise_bias(u_atoms, atom_pad_mask)
+        v_atoms = self._mask_atom_pairwise_bias(v_atoms, atom_pad_mask)
+        w_atoms = self._mask_atom_pairwise_bias(w_atoms, atom_pad_mask)
+
+        gate = self._sigma_gate(
+            sigma=sigma,
+            batch_size=u_atoms.shape[0],
+            dtype=u_atoms.dtype,
+            device=u_atoms.device,
+        )
+        gate_atoms = gate.expand(-1, -1, coords_len, -1).squeeze(-1)
+        pair_bias = self._collapse_factorized_terms(
+            u_atoms=u_atoms,
+            v_atoms=v_atoms,
+            w_atoms=w_atoms,
+            pair_mask=geom_features.pair_mask,
+            gate_atoms=gate_atoms,
+        )
+        pair_bias = self._mask_atom_pairwise_bias(pair_bias, atom_pad_mask)
+        pair_bias = pair_bias * geom_features.pair_mask[:, None, :, :].to(dtype=pair_bias.dtype)
+        pair_bias = self._expand_atom_head_bias(
+            pair_bias,
+            seq_len=seq_len or coords_len,
+        )
+        if out_dtype is not None:
+            pair_bias = pair_bias.to(dtype=out_dtype)
+        return pair_bias
 
 
 class TransformerTrunk(nn.Module):
@@ -618,6 +823,8 @@ class TransformerTrunk(nn.Module):
         attn_type: str = "mha",
         simplicial_chunk_size: int = 128,
         simplicial_head_dim: int | None = None,
+        simplicial_impl: str = "auto",
+        simplicial_precision: str = "bf16_tc",
         geometry_adapter: BaseGeometryAdapter | None = None,
         geometry_bias: GeometryBiasBuilder | None = None,
         simplicial_geometry_bias: SimplicialGeometryBias | None = None,
@@ -645,6 +852,8 @@ class TransformerTrunk(nn.Module):
                     attn_type=attn_type,
                     simplicial_chunk_size=simplicial_chunk_size,
                     simplicial_head_dim=simplicial_head_dim,
+                    simplicial_impl=simplicial_impl,
+                    simplicial_precision=simplicial_precision,
                 )
                 for _ in range(n_layers)
             ]
@@ -681,6 +890,8 @@ class TransformerTrunk(nn.Module):
 
         geom_features = None
         attn_head_bias = None
+        simplicial_attention_mask = None
+        simplicial_factorized_bias = None
         simplicial_logit_bias_fn = None
         if self.geometry_adapter is not None:
             if coords is None:
@@ -697,13 +908,35 @@ class TransformerTrunk(nn.Module):
                 out_dtype=x.dtype,
             )
         if self.simplicial_geometry_bias is not None and geom_features is not None:
-            simplicial_logit_bias_fn = self.simplicial_geometry_bias.build_logit_bias_fn(
+            simplicial_factorized_bias, simplicial_logit_bias_fn, simplicial_attention_mask = self.simplicial_geometry_bias.build_bias_inputs(
                 geom_features=geom_features,
                 coords_len=coords.shape[1],
                 pad_mask=pad_mask,
                 seq_len=x.shape[1],
                 sigma=sigma,
             )
+        elif self.attn_type == "simplicial":
+            if coords is not None:
+                simplicial_attention_mask = _build_simplicial_attention_mask(
+                    coords_len=coords.shape[1],
+                    seq_len=x.shape[1],
+                    batch_size=x.shape[0],
+                    device=x.device,
+                    pad_mask=pad_mask,
+                    geom_pair_mask=geom_features.pair_mask if geom_features is not None else None,
+                    include_global_tokens_as_pair_keys=(
+                        x.shape[1] > coords.shape[1]
+                        and geom_features is not None
+                        and geom_features.kind == "periodic"
+                    ),
+                )
+            else:
+                simplicial_attention_mask = SimplicialAttentionMask.from_key_padding_mask(
+                    pad_mask,
+                    batch_size=x.shape[0],
+                    num_tokens=x.shape[1],
+                    device=x.device,
+                )
 
         for block in self.blocks:
             if pad_mask is not None:
@@ -713,6 +946,8 @@ class TransformerTrunk(nn.Module):
                 cond_emb,
                 pad_mask=pad_mask,
                 attn_head_bias=attn_head_bias,
+                simplicial_attention_mask=simplicial_attention_mask,
+                simplicial_factorized_bias=simplicial_factorized_bias,
                 simplicial_logit_bias_fn=simplicial_logit_bias_fn,
             )
         x = self.norm_out(x)

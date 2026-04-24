@@ -13,6 +13,7 @@ authors = [
   {name = "Matterformer"}
 ]
 dependencies = [
+  "lmdb>=1.4",
   "numpy>=1.24",
   "pandas>=2.0",
   "requests>=2.31",

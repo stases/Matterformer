@@ -87,6 +87,25 @@ def test_qm9_edm_loss_and_sampling_smoke():
     assert stable_atoms <= total_atoms
 
 
+def test_qm9_edm_mha_factorized_marginal_loss_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        attn_type="mha",
+        simplicial_geom_mode="factorized",
+        mha_geom_bias_mode="factorized_marginal",
+    )
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
 def test_qm9_generation_metrics_without_rdkit_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()

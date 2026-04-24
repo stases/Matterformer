@@ -37,6 +37,10 @@ def main(args: argparse.Namespace) -> None:
         attn_dropout=float(model_args.get("attn_dropout", 0.0)),
         attn_type=str(model_args.get("attn_type", "mha")),
         simplicial_geom_mode=str(model_args.get("simplicial_geom_mode", "factorized")),
+        simplicial_impl=args.simplicial_impl or str(model_args.get("simplicial_impl", "auto")),
+        simplicial_precision=args.simplicial_precision
+        or str(model_args.get("simplicial_precision", "ieee_fp32")),
+        mha_geom_bias_mode=str(model_args.get("mha_geom_bias_mode", "standard")),
         use_geometry_bias=not bool(model_args.get("disable_geometry_bias", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
@@ -94,4 +98,11 @@ if __name__ == "__main__":
     parser.add_argument("--s-max", type=float, default=float("inf"))
     parser.add_argument("--s-noise", type=float, default=1.003)
     parser.add_argument("--sample-mode", type=str, default="ema", choices=["ema", "regular"])
+    parser.add_argument("--simplicial-impl", type=str, default=None, choices=["auto", "torch", "triton"])
+    parser.add_argument(
+        "--simplicial-precision",
+        type=str,
+        default=None,
+        choices=["bf16_tc", "tf32", "ieee_fp32"],
+    )
     main(parser.parse_args())

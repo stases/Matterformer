@@ -62,6 +62,35 @@ def lattice_latent_to_lower_triangular(
     raise ValueError(f"Unsupported lattice_repr: {lattice_repr}")
 
 
+def clamp_lattice_latent(
+    lattice_latent: torch.Tensor,
+    lattice_repr: str = "y1",
+) -> torch.Tensor:
+    lattice_latent = _as_float_tensor(lattice_latent)
+    if lattice_latent.ndim != 2 or lattice_latent.shape[-1] != 6:
+        raise ValueError(
+            f"lattice_latent must have shape (B, 6), got {tuple(lattice_latent.shape)}"
+        )
+
+    lattice_repr = lattice_repr.lower()
+    if lattice_repr == "y1":
+        return torch.cat(
+            [
+                lattice_latent[:, :3].clamp(min=-5.0, max=5.0),
+                lattice_latent[:, 3:].clamp(min=-0.9999, max=0.9999),
+            ],
+            dim=-1,
+        )
+    if lattice_repr == "ltri":
+        diag = lattice_latent[:, [0, 2, 5]].clamp(min=-5.0, max=5.0)
+        off_diag = lattice_latent[:, [1, 3, 4]].clamp(min=-10.0, max=10.0)
+        return torch.stack(
+            [diag[:, 0], off_diag[:, 0], diag[:, 1], off_diag[:, 1], off_diag[:, 2], diag[:, 2]],
+            dim=-1,
+        )
+    raise ValueError(f"Unsupported lattice_repr: {lattice_repr}")
+
+
 def lattice_latent_to_gram(
     lattice_latent: torch.Tensor,
     lattice_repr: str = "y1",
@@ -95,12 +124,27 @@ def lattice_latent_to_y1(
 ) -> torch.Tensor:
     lattice_repr = lattice_repr.lower()
     if lattice_repr == "y1":
-        lattice_latent = _as_float_tensor(lattice_latent)
-        lattice_y1 = lattice_latent.clone()
-        lattice_y1[:, :3] = lattice_y1[:, :3].clamp(min=-5.0, max=5.0)
-        lattice_y1[:, 3:] = lattice_y1[:, 3:].clamp(min=-0.9999, max=0.9999)
-        return lattice_y1
+        return clamp_lattice_latent(lattice_latent, lattice_repr=lattice_repr)
     if lattice_repr == "ltri":
         gram = lattice_latent_to_gram(lattice_latent, lattice_repr=lattice_repr)
         return gram_to_y1(gram)
+    raise ValueError(f"Unsupported lattice_repr: {lattice_repr}")
+
+
+def y1_to_lattice_latent(
+    lattice_y1: torch.Tensor,
+    lattice_repr: str = "y1",
+) -> torch.Tensor:
+    lattice_y1 = clamp_lattice_latent(lattice_y1, lattice_repr="y1")
+    lattice_repr = lattice_repr.lower()
+    if lattice_repr == "y1":
+        return lattice_y1
+    if lattice_repr == "ltri":
+        cell = lattice_latent_to_lower_triangular(lattice_y1, lattice_repr="y1")
+        diag = torch.log(torch.diagonal(cell, dim1=-2, dim2=-1).clamp_min(1e-8))
+        off_diag = cell[:, [1, 2, 2], [0, 0, 1]]
+        return torch.stack(
+            [diag[:, 0], off_diag[:, 0], diag[:, 1], off_diag[:, 1], off_diag[:, 2], diag[:, 2]],
+            dim=-1,
+        )
     raise ValueError(f"Unsupported lattice_repr: {lattice_repr}")
