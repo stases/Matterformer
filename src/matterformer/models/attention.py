@@ -51,13 +51,16 @@ class SimplicialFactorizedBias:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        u = self.u[:, :, start:end, :].float()
+        v = self.v[:, :, start:end, :].float()
+        w = self.w.float()
+        gate = self.gate[:, :, start:end].float()
         bias = (
-            self.u[:, :, start:end, :, None]
-            + self.v[:, :, start:end, None, :]
-            + self.w[:, :, None, :, :]
+            u[:, :, :, :, None]
+            + v[:, :, :, None, :]
+            + w[:, :, None, :, :]
         )
-        gate = self.gate[:, :, start:end].unsqueeze(-1).unsqueeze(-1)
-        return (gate * bias).to(device=device, dtype=dtype)
+        return (gate[:, :, :, None, None] * bias).to(device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,36 @@ class SimplicialLowRankAngleResidual:
         residual = torch.einsum("bhqjr,bhqkr->bhqjk", left, right) * (self.rank**-0.5)
         gate = self.gate[:, :, start:end].float().unsqueeze(-1).unsqueeze(-1)
         return (gate * residual).to(device=device, dtype=dtype)
+
+
+@dataclass(frozen=True)
+class SimplicialLowRankMessageResidual:
+    """Structured low-rank triplet residual for simplicial values/messages.
+
+    Shapes:
+    - ``left`` / ``right``: ``(B, H, T, T, R)``
+    """
+
+    left: torch.Tensor
+    right: torch.Tensor
+
+    @property
+    def rank(self) -> int:
+        return int(self.left.shape[-1])
+
+    def validate(self, *, batch_size: int, num_heads: int, num_tokens: int) -> None:
+        if self.left.ndim != 5:
+            raise ValueError(f"left must have shape (B, H, T, T, R), got {tuple(self.left.shape)}")
+        expected_factor_prefix = (batch_size, num_heads, num_tokens, num_tokens)
+        if self.left.shape[:4] != expected_factor_prefix:
+            raise ValueError(
+                f"left must have shape {expected_factor_prefix + (self.left.shape[-1],)}, "
+                f"got {tuple(self.left.shape)}"
+            )
+        if self.right.shape != self.left.shape:
+            raise ValueError(f"right must have shape {tuple(self.left.shape)}, got {tuple(self.right.shape)}")
+        if self.rank <= 0:
+            raise ValueError("low-rank message residual rank must be positive")
 
 
 @dataclass(frozen=True)
@@ -223,6 +256,8 @@ def simplicial_attention_torch_from_projected(
     attention_mask: SimplicialAttentionMask | None = None,
     factorized_bias: SimplicialFactorizedBias | None = None,
     angle_residual: SimplicialLowRankAngleResidual | None = None,
+    message_residual: SimplicialLowRankMessageResidual | None = None,
+    message_basis: torch.Tensor | None = None,
     logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
@@ -235,6 +270,17 @@ def simplicial_attention_torch_from_projected(
         factorized_bias.validate(batch_size=batch_size, num_heads=num_heads, num_tokens=num_tokens)
     if angle_residual is not None:
         angle_residual.validate(batch_size=batch_size, num_heads=num_heads, num_tokens=num_tokens)
+    if message_residual is not None:
+        message_residual.validate(batch_size=batch_size, num_heads=num_heads, num_tokens=num_tokens)
+        if message_basis is None:
+            raise ValueError("message_basis must be provided when message_residual is provided")
+        expected_basis_shape = (num_heads, message_residual.rank, head_dim)
+        if message_basis.shape != expected_basis_shape:
+            raise ValueError(
+                f"message_basis must have shape {expected_basis_shape}, got {tuple(message_basis.shape)}"
+            )
+    elif message_basis is not None:
+        raise ValueError("message_basis must be None when message_residual is None")
 
     attention_mask = _coerce_attention_mask(
         attention_mask,
@@ -272,6 +318,15 @@ def simplicial_attention_torch_from_projected(
             if angle_residual is not None
             else None
         )
+        message_residual_work = (
+            SimplicialLowRankMessageResidual(
+                left=message_residual.left.float(),
+                right=message_residual.right.float(),
+            )
+            if message_residual is not None
+            else None
+        )
+        message_basis_work = message_basis.float() if message_basis is not None else None
         out_dtype = torch.float32
     else:
         q_work = q
@@ -281,6 +336,8 @@ def simplicial_attention_torch_from_projected(
         v2_work = v2
         factorized_bias_work = factorized_bias
         angle_residual_work = angle_residual
+        message_residual_work = message_residual
+        message_basis_work = message_basis
         out_dtype = v1.dtype
 
     out = torch.empty((batch_size, num_heads, num_tokens, head_dim), device=q.device, dtype=out_dtype)
@@ -315,9 +372,21 @@ def simplicial_attention_torch_from_projected(
         if return_attn and attn_chunks is not None:
             attn_chunks.append(attn.detach())
 
-        attn = attn.to(v1_work.dtype)
-        tmp = torch.matmul(attn.transpose(-2, -1), v1_work.unsqueeze(-3))
+        attn_float = attn.float()
+        attn_value = attn.to(v1_work.dtype)
+        tmp = torch.matmul(attn_value.transpose(-2, -1), v1_work.unsqueeze(-3))
         out_chunk = (tmp * v2_work.unsqueeze(-3)).sum(dim=-2)
+        if message_residual_work is not None and message_basis_work is not None:
+            message_left = message_residual_work.left[:, :, start:end, :, :].float()
+            message_right = message_residual_work.right[:, :, start:end, :, :].float()
+            message_coeff = torch.einsum(
+                "bhqjk,bhqjr,bhqkr->bhqr",
+                attn_float,
+                message_left,
+                message_right,
+            ) * (message_residual_work.rank**-0.5)
+            message_out = torch.einsum("bhqr,hrd->bhqd", message_coeff, message_basis_work.float())
+            out_chunk = out_chunk + message_out.to(dtype=out_chunk.dtype)
         q_valid = query_valid[:, start:end].to(dtype=out_chunk.dtype)
         out_chunk = out_chunk * q_valid[:, None, :, None]
         out[:, :, start:end, :] = out_chunk
@@ -346,6 +415,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
         angle_left: torch.Tensor,
         angle_right: torch.Tensor,
         angle_gate: torch.Tensor,
+        message_left: torch.Tensor,
+        message_right: torch.Tensor,
+        message_basis: torch.Tensor,
         precision_mode: str,
         chunk_size: int,
         debug_torch_backward: bool,
@@ -353,6 +425,7 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
         has_pair_valid = pair_valid.numel() > 0
         has_factorized_bias = u.numel() > 0
         has_low_rank_angle = angle_left.numel() > 0
+        has_low_rank_message = message_left.numel() > 0
         out, lse, out_for_backward = triton_simplicial_attention_forward(
             q,
             k1,
@@ -369,6 +442,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             angle_left=angle_left if has_low_rank_angle else None,
             angle_right=angle_right if has_low_rank_angle else None,
             angle_gate=angle_gate if has_low_rank_angle else None,
+            message_left=message_left if has_low_rank_message else None,
+            message_right=message_right if has_low_rank_message else None,
+            message_basis=message_basis if has_low_rank_message else None,
             precision=precision_mode,
         )
         ctx.precision_mode = str(precision_mode)
@@ -377,6 +453,7 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
         ctx.has_pair_valid = has_pair_valid
         ctx.has_factorized_bias = has_factorized_bias
         ctx.has_low_rank_angle = has_low_rank_angle
+        ctx.has_low_rank_message = has_low_rank_message
         ctx.save_for_backward(
             q,
             k1,
@@ -393,6 +470,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             angle_left,
             angle_right,
             angle_gate,
+            message_left,
+            message_right,
+            message_basis,
             out_for_backward,
             lse,
         )
@@ -402,26 +482,7 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
     def backward(
         ctx,
         grad_out: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        None,
-        None,
-        None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        None,
-        None,
-        None,
-    ]:
+    ) -> tuple[torch.Tensor | None, ...]:
         (
             q,
             k1,
@@ -438,6 +499,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             angle_left,
             angle_right,
             angle_gate,
+            message_left,
+            message_right,
+            message_basis,
             out,
             lse,
         ) = ctx.saved_tensors
@@ -467,6 +531,14 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
                         angle_gate.detach().requires_grad_(True),
                     ]
                 )
+            if ctx.has_low_rank_message:
+                differentiable_inputs.extend(
+                    [
+                        message_left.detach().requires_grad_(True),
+                        message_right.detach().requires_grad_(True),
+                        message_basis.detach().requires_grad_(True),
+                    ]
+                )
 
             with torch.enable_grad():
                 q_re, k1_re, v1_re, k2_re, v2_re = differentiable_inputs[:5]
@@ -484,10 +556,19 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
                 angle_residual = None
                 if ctx.has_low_rank_angle:
                     angle_left_re, angle_right_re, angle_gate_re = differentiable_inputs[cursor : cursor + 3]
+                    cursor += 3
                     angle_residual = SimplicialLowRankAngleResidual(
                         left=angle_left_re,
                         right=angle_right_re,
                         gate=angle_gate_re,
+                    )
+                message_residual = None
+                message_basis_re = None
+                if ctx.has_low_rank_message:
+                    message_left_re, message_right_re, message_basis_re = differentiable_inputs[cursor : cursor + 3]
+                    message_residual = SimplicialLowRankMessageResidual(
+                        left=message_left_re,
+                        right=message_right_re,
                     )
                 attention_mask = SimplicialAttentionMask(
                     query_valid=query_valid,
@@ -503,6 +584,8 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
                     attention_mask=attention_mask,
                     factorized_bias=factorized_bias,
                     angle_residual=angle_residual,
+                    message_residual=message_residual,
+                    message_basis=message_basis_re,
                     logit_bias_fn=None,
                     dropout_p=0.0,
                     training=False,
@@ -520,12 +603,16 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             dq, dk1, dv1, dk2, dv2 = grads[:5]
             du = dv = dw = dgate = None
             dangle_left = dangle_right = dangle_gate = None
+            dmessage_left = dmessage_right = dmessage_basis = None
             cursor = 5
             if ctx.has_factorized_bias:
                 du, dv, dw, dgate = grads[cursor : cursor + 4]
                 cursor += 4
             if ctx.has_low_rank_angle:
                 dangle_left, dangle_right, dangle_gate = grads[cursor : cursor + 3]
+                cursor += 3
+            if ctx.has_low_rank_message:
+                dmessage_left, dmessage_right, dmessage_basis = grads[cursor : cursor + 3]
             return (
                 dq,
                 dk1,
@@ -542,6 +629,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
                 dangle_left,
                 dangle_right,
                 dangle_gate,
+                dmessage_left,
+                dmessage_right,
+                dmessage_basis,
                 None,
                 None,
                 None,
@@ -560,6 +650,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             dangle_left,
             dangle_right,
             dangle_gate,
+            dmessage_left,
+            dmessage_right,
+            dmessage_basis,
         ) = triton_simplicial_attention_backward(
             grad_out,
             q,
@@ -579,6 +672,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             angle_left=angle_left if ctx.has_low_rank_angle else None,
             angle_right=angle_right if ctx.has_low_rank_angle else None,
             angle_gate=angle_gate if ctx.has_low_rank_angle else None,
+            message_left=message_left if ctx.has_low_rank_message else None,
+            message_right=message_right if ctx.has_low_rank_message else None,
+            message_basis=message_basis if ctx.has_low_rank_message else None,
             precision=ctx.precision_mode,
         )
         return (
@@ -597,6 +693,9 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             dangle_left,
             dangle_right,
             dangle_gate,
+            dmessage_left,
+            dmessage_right,
+            dmessage_basis,
             None,
             None,
             None,
@@ -618,6 +717,8 @@ class TwoSimplicialAttention(nn.Module):
         out_proj: bool = True,
         impl: str = "auto",
         precision: str = "bf16_tc",
+        message_mode: str = "none",
+        message_rank: int = 16,
         debug_torch_backward: bool = False,
     ) -> None:
         super().__init__()
@@ -635,6 +736,12 @@ class TwoSimplicialAttention(nn.Module):
         impl = impl.lower()
         if impl not in {"auto", "torch", "triton"}:
             raise ValueError(f"Unsupported simplicial_impl: {impl}")
+        message_mode = message_mode.lower()
+        if message_mode not in {"none", "low_rank"}:
+            raise ValueError(f"Unsupported simplicial_message_mode: {message_mode}")
+        message_rank = int(message_rank)
+        if message_mode == "low_rank" and message_rank <= 0:
+            raise ValueError("simplicial_message_rank must be positive when message_mode='low_rank'")
 
         self.dim = int(dim)
         self.num_heads = int(num_heads)
@@ -644,6 +751,8 @@ class TwoSimplicialAttention(nn.Module):
         self.chunk_size = int(chunk_size)
         self.impl = impl
         self.precision = normalize_simplicial_precision(precision)
+        self.message_mode = message_mode
+        self.message_rank = message_rank
         self.debug_torch_backward = bool(debug_torch_backward)
         self.scale = self.head_dim**-0.5
         self._last_impl_used = "torch"
@@ -652,6 +761,13 @@ class TwoSimplicialAttention(nn.Module):
         self.out_proj = (
             nn.Linear(self.inner_dim, self.dim, bias=bias) if out_proj else nn.Identity()
         )
+        if self.message_mode == "low_rank":
+            self.message_basis = nn.Parameter(
+                torch.empty(self.num_heads, self.message_rank, self.head_dim)
+            )
+            nn.init.normal_(self.message_basis, mean=0.0, std=self.head_dim**-0.5)
+        else:
+            self.message_basis = None
 
     @staticmethod
     def _split_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
@@ -681,6 +797,7 @@ class TwoSimplicialAttention(nn.Module):
         x: torch.Tensor,
         factorized_bias: SimplicialFactorizedBias | None,
         angle_residual: SimplicialLowRankAngleResidual | None,
+        message_residual: SimplicialLowRankMessageResidual | None,
         logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None,
         return_attn: bool,
     ) -> str | None:
@@ -698,8 +815,15 @@ class TwoSimplicialAttention(nn.Module):
             return "the Triton backend does not support arbitrary Python logit_bias_fn callbacks"
         if self.head_dim > 128:
             return f"the Triton backend only supports head_dim <= 128 in v1, got {self.head_dim}"
-        if factorized_bias is not None and factorized_bias.u.device != x.device:
-            return "factorized bias tensors must be on the same CUDA device as the attention input"
+        if factorized_bias is not None:
+            for name, tensor in (
+                ("u", factorized_bias.u),
+                ("v", factorized_bias.v),
+                ("w", factorized_bias.w),
+                ("gate", factorized_bias.gate),
+            ):
+                if tensor.device != x.device:
+                    return f"factorized bias tensor {name} must be on the same CUDA device as the attention input"
         if angle_residual is not None:
             if (
                 angle_residual.left.device != x.device
@@ -709,6 +833,15 @@ class TwoSimplicialAttention(nn.Module):
                 return "angle residual tensors must be on the same CUDA device as the attention input"
             if angle_residual.rank > 64:
                 return f"the Triton backend only supports low-rank angle residual rank <= 64, got {angle_residual.rank}"
+        if message_residual is not None:
+            if self.message_basis is None:
+                return "message residual tensors require simplicial_message_mode='low_rank'"
+            if message_residual.left.device != x.device or message_residual.right.device != x.device:
+                return "message residual tensors must be on the same CUDA device as the attention input"
+            if self.message_basis.device != x.device:
+                return "message basis tensor must be on the same CUDA device as the attention input"
+            if message_residual.rank > 64:
+                return f"the Triton backend only supports low-rank message residual rank <= 64, got {message_residual.rank}"
         return None
 
     def _triton_compute_dtype(self) -> torch.dtype:
@@ -745,6 +878,19 @@ class TwoSimplicialAttention(nn.Module):
             gate=angle_residual.gate.to(dtype=dtype),
         )
 
+    def _cast_message_residual_for_triton(
+        self,
+        message_residual: SimplicialLowRankMessageResidual | None,
+        *,
+        dtype: torch.dtype,
+    ) -> SimplicialLowRankMessageResidual | None:
+        if message_residual is None:
+            return None
+        return SimplicialLowRankMessageResidual(
+            left=message_residual.left.to(dtype=dtype),
+            right=message_residual.right.to(dtype=dtype),
+        )
+
     def _forward_triton(
         self,
         q: torch.Tensor,
@@ -756,6 +902,7 @@ class TwoSimplicialAttention(nn.Module):
         attention_mask: SimplicialAttentionMask,
         factorized_bias: SimplicialFactorizedBias | None,
         angle_residual: SimplicialLowRankAngleResidual | None,
+        message_residual: SimplicialLowRankMessageResidual | None,
     ) -> torch.Tensor:
         attention_mask = _coerce_attention_mask(
             attention_mask,
@@ -773,6 +920,7 @@ class TwoSimplicialAttention(nn.Module):
         v2 = v2.to(dtype=compute_dtype)
         factorized_bias = self._cast_factorized_bias_for_triton(factorized_bias, dtype=torch.float32)
         angle_residual = self._cast_angle_residual_for_triton(angle_residual, dtype=torch.float32)
+        message_residual = self._cast_message_residual_for_triton(message_residual, dtype=torch.float32)
 
         empty_float = q.new_empty(0)
         empty_bool = torch.empty(0, device=q.device, dtype=torch.bool)
@@ -796,6 +944,23 @@ class TwoSimplicialAttention(nn.Module):
             angle_left = angle_residual.left
             angle_right = angle_residual.right
             angle_gate = angle_residual.gate
+        if message_residual is None:
+            message_left = message_right = message_basis = empty_float
+        else:
+            if self.message_basis is None:
+                raise RuntimeError("message_residual requires message_basis")
+            message_residual.validate(
+                batch_size=q.shape[0],
+                num_heads=q.shape[1],
+                num_tokens=q.shape[2],
+            )
+            if message_residual.rank != self.message_rank:
+                raise ValueError(
+                    f"message_residual rank {message_residual.rank} does not match attention message_rank {self.message_rank}"
+                )
+            message_left = message_residual.left
+            message_right = message_residual.right
+            message_basis = self.message_basis.to(device=q.device, dtype=torch.float32)
 
         return _TritonTwoSimplicialAttentionFunction.apply(
             q.contiguous(),
@@ -813,6 +978,9 @@ class TwoSimplicialAttention(nn.Module):
             angle_left.contiguous(),
             angle_right.contiguous(),
             angle_gate.contiguous(),
+            message_left.contiguous(),
+            message_right.contiguous(),
+            message_basis.contiguous(),
             self.precision,
             self.chunk_size,
             self.debug_torch_backward,
@@ -826,6 +994,7 @@ class TwoSimplicialAttention(nn.Module):
         attention_mask: SimplicialAttentionMask | None = None,
         factorized_bias: SimplicialFactorizedBias | None = None,
         angle_residual: SimplicialLowRankAngleResidual | None = None,
+        message_residual: SimplicialLowRankMessageResidual | None = None,
         logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
         return_attn: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -852,11 +1021,24 @@ class TwoSimplicialAttention(nn.Module):
                 num_heads=self.num_heads,
                 num_tokens=num_tokens,
             )
+        if message_residual is not None:
+            if self.message_basis is None:
+                raise ValueError("message_residual requires simplicial_message_mode='low_rank'")
+            message_residual.validate(
+                batch_size=batch_size,
+                num_heads=self.num_heads,
+                num_tokens=num_tokens,
+            )
+            if message_residual.rank != self.message_rank:
+                raise ValueError(
+                    f"message_residual rank {message_residual.rank} does not match attention message_rank {self.message_rank}"
+                )
 
         reason = self._triton_unavailable_reason(
             x=x,
             factorized_bias=factorized_bias,
             angle_residual=angle_residual,
+            message_residual=message_residual,
             logit_bias_fn=logit_bias_fn,
             return_attn=return_attn,
         )
@@ -882,6 +1064,7 @@ class TwoSimplicialAttention(nn.Module):
                 attention_mask=attention_mask,
                 factorized_bias=factorized_bias,
                 angle_residual=angle_residual,
+                message_residual=message_residual,
             )
             y = self._merge_heads(out)
             return self.out_proj(y)
@@ -895,6 +1078,8 @@ class TwoSimplicialAttention(nn.Module):
             attention_mask=attention_mask,
             factorized_bias=factorized_bias,
             angle_residual=angle_residual,
+            message_residual=message_residual,
+            message_basis=self.message_basis if message_residual is not None else None,
             logit_bias_fn=logit_bias_fn,
             dropout_p=self.dropout,
             training=self.training,

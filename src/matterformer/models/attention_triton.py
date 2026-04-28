@@ -47,16 +47,16 @@ def _num_warps_for_block_d(block_d: int) -> int:
     return 8
 
 
-def _block_r_for_angle_rank(angle_rank: int) -> int:
-    if angle_rank <= 0:
-        raise ValueError("angle_rank must be positive")
-    if angle_rank <= 16:
+def _block_r_for_rank(rank: int) -> int:
+    if rank <= 0:
+        raise ValueError("rank must be positive")
+    if rank <= 16:
         return 16
-    if angle_rank <= 32:
+    if rank <= 32:
         return 32
-    if angle_rank <= 64:
+    if rank <= 64:
         return 64
-    raise ValueError(f"Triton simplicial attention only supports angle_rank <= 64, got {angle_rank}")
+    raise ValueError(f"Triton simplicial attention only supports low-rank features <= 64, got {rank}")
 
 
 def _precision_kernel_config(precision: str) -> tuple[bool, str]:
@@ -87,18 +87,24 @@ if TRITON_AVAILABLE:
         angle_left_ptr,
         angle_right_ptr,
         angle_gate_ptr,
+        message_left_ptr,
+        message_right_ptr,
+        message_basis_ptr,
         out_ptr,
         lse_ptr,
         num_tokens,
         head_dim,
         angle_rank,
         angle_scale,
+        message_rank,
+        message_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         HAS_LOW_RANK_ANGLE: tl.constexpr,
+        HAS_LOW_RANK_MESSAGE: tl.constexpr,
         USE_FP32_INPUT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         BLOCK_J: tl.constexpr,
@@ -134,6 +140,8 @@ if TRITON_AVAILABLE:
         m = -float("inf")
         l = 0.0
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        if HAS_LOW_RANK_MESSAGE:
+            message_acc = tl.zeros((BLOCK_R,), dtype=tl.float32)
 
         for tile_j in range(0, num_tiles_j):
             offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
@@ -178,6 +186,13 @@ if TRITON_AVAILABLE:
                     angle_left_score = angle_left_32
                 else:
                     angle_left_score = angle_left_raw
+            if HAS_LOW_RANK_MESSAGE:
+                message_left_32 = tl.load(
+                    message_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * message_rank + offs_r[None, :]),
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                    other=0.0,
+                ).to(tl.float32)
 
             for tile_k in range(0, num_tiles_k):
                 offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -263,6 +278,16 @@ if TRITON_AVAILABLE:
                         )
                         angle_gate = tl.load(angle_gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
                         scores = scores + angle_gate * angle * angle_scale
+                    if HAS_LOW_RANK_MESSAGE:
+                        message_right_32 = tl.load(
+                            message_right_ptr
+                            + (
+                                ((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * message_rank
+                                + offs_r[None, :]
+                            ),
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                            other=0.0,
+                        ).to(tl.float32)
 
                     scores = tl.where(valid, scores, -float("inf"))
                     tile_rowmax = tl.max(scores, axis=1)
@@ -279,9 +304,28 @@ if TRITON_AVAILABLE:
                     )
                     tile_out = tl.sum(tmp_weighted * v2_raw, axis=0)
                     acc = acc * alpha + tile_out
+                    if HAS_LOW_RANK_MESSAGE:
+                        tmp_message = tl.dot(
+                            tl.trans(weights),
+                            message_left_32,
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
+                        tile_message = tl.sum(tmp_message * message_right_32, axis=0)
+                        message_acc = message_acc * alpha + tile_message
                     m = m_new
 
         out = tl.where(l > 0.0, acc / l, 0.0)
+        if HAS_LOW_RANK_MESSAGE:
+            head_idx = bh_idx - batch_idx * num_heads
+            message_basis = tl.load(
+                message_basis_ptr + (head_idx * message_rank + offs_r[:, None]) * head_dim + offs_d[None, :],
+                mask=(offs_r[:, None] < message_rank) & (offs_d[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.float32)
+            message_coeff = tl.where(l > 0.0, message_acc * message_scale / l, 0.0)
+            message_out = tl.sum(message_coeff[:, None] * message_basis, axis=0)
+            out = out + message_out
         lse = tl.where(l > 0.0, m + tl.log(l), 0.0)
         tl.store(out_row_ptr, out, mask=offs_d < head_dim)
         tl.store(lse_ptr_row, lse)
@@ -307,6 +351,9 @@ if TRITON_AVAILABLE:
         angle_left_ptr,
         angle_right_ptr,
         angle_gate_ptr,
+        message_left_ptr,
+        message_right_ptr,
+        message_basis_ptr,
         dq_ptr,
         dk1_ptr,
         dv1_ptr,
@@ -319,16 +366,22 @@ if TRITON_AVAILABLE:
         dangle_left_ptr,
         dangle_right_ptr,
         dangle_gate_ptr,
+        dmessage_left_ptr,
+        dmessage_right_ptr,
+        dmessage_basis_ptr,
         num_tokens,
         head_dim,
         angle_rank,
         angle_scale,
+        message_rank,
+        message_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         HAS_LOW_RANK_ANGLE: tl.constexpr,
+        HAS_LOW_RANK_MESSAGE: tl.constexpr,
         USE_FP32_INPUT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         BLOCK_J: tl.constexpr,
@@ -376,6 +429,14 @@ if TRITON_AVAILABLE:
         ).to(tl.float32)
         lse = tl.load(lse_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
         go_dot_out = tl.sum(go * out_vec, axis=0)
+        if HAS_LOW_RANK_MESSAGE:
+            head_idx = bh_idx - batch_idx * num_heads
+            message_basis = tl.load(
+                message_basis_ptr + (head_idx * message_rank + offs_r[:, None]) * head_dim + offs_d[None, :],
+                mask=(offs_r[:, None] < message_rank) & (offs_d[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.float32)
+            message_basis_go = tl.sum(message_basis * go[None, :], axis=1)
 
         dq_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
         dgate_acc = 0.0
@@ -429,6 +490,14 @@ if TRITON_AVAILABLE:
                     angle_left_score = angle_left_raw
                 dangle_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
                 angle_gate = tl.load(angle_gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
+            if HAS_LOW_RANK_MESSAGE:
+                message_left_32 = tl.load(
+                    message_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * message_rank + offs_r[None, :]),
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                    other=0.0,
+                ).to(tl.float32)
+                dmessage_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
 
             for tile_k in range(0, num_tiles_k):
                 offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -517,6 +586,16 @@ if TRITON_AVAILABLE:
                             input_precision=INPUT_PRECISION,
                         )
                         scores = scores + angle_gate * angle * angle_scale
+                    if HAS_LOW_RANK_MESSAGE:
+                        message_right_32 = tl.load(
+                            message_right_ptr
+                            + (
+                                ((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * message_rank
+                                + offs_r[None, :]
+                            ),
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                            other=0.0,
+                        ).to(tl.float32)
 
                     scores = tl.where(valid, scores, -float("inf"))
                     probs = tl.where(valid, tl.exp(scores - lse), 0.0)
@@ -527,6 +606,13 @@ if TRITON_AVAILABLE:
                         out_dtype=tl.float32,
                         input_precision="ieee",
                     )
+                    if HAS_LOW_RANK_MESSAGE:
+                        value_dot += message_scale * tl.dot(
+                            message_left_32 * message_basis_go[None, :],
+                            tl.trans(message_right_32),
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
                     dscores = probs * (value_dot - go_dot_out)
 
                     tmp_k2 = tl.dot(dscores, k2_32, out_dtype=tl.float32, input_precision="ieee")
@@ -613,6 +699,44 @@ if TRITON_AVAILABLE:
                         )
                         dangle_gate_acc += tl.sum(tl.sum(dscores * angle * angle_scale, axis=1), axis=0)
 
+                    if HAS_LOW_RANK_MESSAGE:
+                        message_tmp_right = tl.dot(
+                            probs,
+                            message_right_32,
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
+                        message_tmp_left = tl.dot(
+                            tl.trans(probs),
+                            message_left_32,
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
+                        dmessage_left_running += message_scale * message_tmp_right * message_basis_go[None, :]
+                        dmessage_right_tile = message_scale * message_tmp_left * message_basis_go[None, :]
+                        dmessage_right_tile_ptr = (
+                            dmessage_right_ptr
+                            + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * message_rank + offs_r[None, :])
+                        )
+                        dmessage_right_prev = tl.load(
+                            dmessage_right_tile_ptr,
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                            other=0.0,
+                        )
+                        tl.store(
+                            dmessage_right_tile_ptr,
+                            dmessage_right_prev + dmessage_right_tile,
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                        )
+                        message_coeff = tl.sum(message_tmp_left * message_right_32, axis=0)
+                        tl.atomic_add(
+                            dmessage_basis_ptr
+                            + (head_idx * message_rank + offs_r[:, None]) * head_dim
+                            + offs_d[None, :],
+                            message_scale * message_coeff[:, None] * go[None, :],
+                            mask=(offs_r[:, None] < message_rank) & (offs_d[None, :] < head_dim),
+                        )
+
             if HAS_BIAS:
                 tl.store(
                     du_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_j,
@@ -625,6 +749,13 @@ if TRITON_AVAILABLE:
                     + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * angle_rank + offs_r[None, :]),
                     dangle_left_running,
                     mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                )
+            if HAS_LOW_RANK_MESSAGE:
+                tl.store(
+                    dmessage_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * message_rank + offs_r[None, :]),
+                    dmessage_left_running,
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
                 )
 
         tl.store(dq_row_ptr, dq_acc, mask=offs_d < head_dim)
@@ -656,6 +787,9 @@ def triton_simplicial_attention_forward(
     angle_left: torch.Tensor | None,
     angle_right: torch.Tensor | None,
     angle_gate: torch.Tensor | None,
+    message_left: torch.Tensor | None,
+    message_right: torch.Tensor | None,
+    message_basis: torch.Tensor | None,
     precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not TRITON_AVAILABLE:  # pragma: no cover - guarded by dispatch logic.
@@ -691,15 +825,35 @@ def triton_simplicial_attention_forward(
             raise ValueError(f"angle_left and angle_right must have the same shape, got {angle_left.shape} and {angle_right.shape}")
         angle_rank = int(angle_left.shape[-1])
         angle_scale = angle_rank**-0.5
-        block_r = _block_r_for_angle_rank(angle_rank)
         angle_left_bh = _reshape_batch_heads(angle_left)
         angle_right_bh = _reshape_batch_heads(angle_right)
         angle_gate_bh = angle_gate.contiguous().view(batch_size * num_heads, num_tokens)
     else:
         angle_rank = 1
         angle_scale = 1.0
-        block_r = 16
         angle_left_bh = angle_right_bh = angle_gate_bh = empty
+
+    has_low_rank_message = message_left is not None and message_right is not None and message_basis is not None
+    if has_low_rank_message:
+        if message_left.shape != message_right.shape:
+            raise ValueError(
+                f"message_left and message_right must have the same shape, got {message_left.shape} and {message_right.shape}"
+            )
+        message_rank = int(message_left.shape[-1])
+        if message_basis.shape != (num_heads, message_rank, head_dim):
+            raise ValueError(
+                f"message_basis must have shape {(num_heads, message_rank, head_dim)}, got {tuple(message_basis.shape)}"
+            )
+        message_scale = message_rank**-0.5
+        message_left_bh = _reshape_batch_heads(message_left)
+        message_right_bh = _reshape_batch_heads(message_right)
+        message_basis_h = message_basis.contiguous()
+    else:
+        message_rank = 1
+        message_scale = 1.0
+        message_left_bh = message_right_bh = message_basis_h = empty
+
+    block_r = _block_r_for_rank(max(angle_rank if has_low_rank_angle else 1, message_rank if has_low_rank_message else 1))
 
     batch_heads = batch_size * num_heads
     out = torch.empty((batch_heads, num_tokens, head_dim), device=q.device, dtype=torch.float32)
@@ -723,18 +877,24 @@ def triton_simplicial_attention_forward(
         angle_left_bh,
         angle_right_bh,
         angle_gate_bh,
+        message_left_bh,
+        message_right_bh,
+        message_basis_h,
         out,
         lse,
         num_tokens,
         head_dim,
         angle_rank,
         angle_scale,
+        message_rank,
+        message_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID=has_pair_valid,
         HAS_BIAS=has_bias,
         HAS_LOW_RANK_ANGLE=has_low_rank_angle,
+        HAS_LOW_RANK_MESSAGE=has_low_rank_message,
         USE_FP32_INPUT=use_fp32_input,
         INPUT_PRECISION=input_precision,
         BLOCK_J=_BLOCK_J,
@@ -769,6 +929,9 @@ def triton_simplicial_attention_backward(
     angle_left: torch.Tensor | None,
     angle_right: torch.Tensor | None,
     angle_gate: torch.Tensor | None,
+    message_left: torch.Tensor | None,
+    message_right: torch.Tensor | None,
+    message_basis: torch.Tensor | None,
     precision: str,
 ) -> tuple[
     torch.Tensor,
@@ -776,6 +939,9 @@ def triton_simplicial_attention_backward(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -831,7 +997,6 @@ def triton_simplicial_attention_backward(
             raise ValueError(f"angle_left and angle_right must have the same shape, got {angle_left.shape} and {angle_right.shape}")
         angle_rank = int(angle_left.shape[-1])
         angle_scale = angle_rank**-0.5
-        block_r = _block_r_for_angle_rank(angle_rank)
         angle_left_bh = _reshape_batch_heads(angle_left)
         angle_right_bh = _reshape_batch_heads(angle_right)
         angle_gate_bh = angle_gate.contiguous().view(batch_size * num_heads, num_tokens)
@@ -841,9 +1006,34 @@ def triton_simplicial_attention_backward(
     else:
         angle_rank = 1
         angle_scale = 1.0
-        block_r = 16
         angle_left_bh = angle_right_bh = angle_gate_bh = empty
         dangle_left = dangle_right = dangle_gate = None
+
+    has_low_rank_message = message_left is not None and message_right is not None and message_basis is not None
+    if has_low_rank_message:
+        if message_left.shape != message_right.shape:
+            raise ValueError(
+                f"message_left and message_right must have the same shape, got {message_left.shape} and {message_right.shape}"
+            )
+        message_rank = int(message_left.shape[-1])
+        if message_basis.shape != (num_heads, message_rank, head_dim):
+            raise ValueError(
+                f"message_basis must have shape {(num_heads, message_rank, head_dim)}, got {tuple(message_basis.shape)}"
+            )
+        message_scale = message_rank**-0.5
+        message_left_bh = _reshape_batch_heads(message_left)
+        message_right_bh = _reshape_batch_heads(message_right)
+        message_basis_h = message_basis.contiguous()
+        dmessage_left = torch.zeros_like(message_left_bh, dtype=torch.float32)
+        dmessage_right = torch.zeros_like(message_right_bh, dtype=torch.float32)
+        dmessage_basis = torch.zeros_like(message_basis_h, dtype=torch.float32)
+    else:
+        message_rank = 1
+        message_scale = 1.0
+        message_left_bh = message_right_bh = message_basis_h = empty
+        dmessage_left = dmessage_right = dmessage_basis = None
+
+    block_r = _block_r_for_rank(max(angle_rank if has_low_rank_angle else 1, message_rank if has_low_rank_message else 1))
 
     batch_heads = batch_size * num_heads
     num_tiles_j = triton.cdiv(num_tokens, _BLOCK_J)
@@ -868,6 +1058,9 @@ def triton_simplicial_attention_backward(
         angle_left_bh,
         angle_right_bh,
         angle_gate_bh,
+        message_left_bh,
+        message_right_bh,
+        message_basis_h,
         dq,
         dk1,
         dv1,
@@ -880,16 +1073,22 @@ def triton_simplicial_attention_backward(
         dangle_left if dangle_left is not None else empty,
         dangle_right if dangle_right is not None else empty,
         dangle_gate if dangle_gate is not None else empty,
+        dmessage_left if dmessage_left is not None else empty,
+        dmessage_right if dmessage_right is not None else empty,
+        dmessage_basis if dmessage_basis is not None else empty,
         num_tokens,
         head_dim,
         angle_rank,
         angle_scale,
+        message_rank,
+        message_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID=has_pair_valid,
         HAS_BIAS=has_bias,
         HAS_LOW_RANK_ANGLE=has_low_rank_angle,
+        HAS_LOW_RANK_MESSAGE=has_low_rank_message,
         USE_FP32_INPUT=use_fp32_input,
         INPUT_PRECISION=input_precision,
         BLOCK_J=_BLOCK_J,
@@ -923,6 +1122,14 @@ def triton_simplicial_attention_backward(
     else:
         dangle_left_out = dangle_right_out = dangle_gate_out = None
 
+    if has_low_rank_message:
+        message_shape = (batch_size, num_heads, num_tokens, num_tokens, message_rank)
+        dmessage_left_out = dmessage_left.view(message_shape).to(message_left.dtype)
+        dmessage_right_out = dmessage_right.view(message_shape).to(message_right.dtype)
+        dmessage_basis_out = dmessage_basis.to(message_basis.dtype)
+    else:
+        dmessage_left_out = dmessage_right_out = dmessage_basis_out = None
+
     return (
         dq_out,
         dk1_out,
@@ -936,4 +1143,7 @@ def triton_simplicial_attention_backward(
         dangle_left_out,
         dangle_right_out,
         dangle_gate_out,
+        dmessage_left_out,
+        dmessage_right_out,
+        dmessage_basis_out,
     )

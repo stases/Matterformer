@@ -38,6 +38,8 @@ def main(args: argparse.Namespace) -> None:
         attn_type=str(model_args.get("attn_type", "mha")),
         simplicial_geom_mode=str(model_args.get("simplicial_geom_mode", "factorized")),
         simplicial_angle_rank=int(model_args.get("simplicial_angle_rank", 16)),
+        simplicial_message_mode=str(model_args.get("simplicial_message_mode", "none")),
+        simplicial_message_rank=int(model_args.get("simplicial_message_rank", 16)),
         simplicial_impl=args.simplicial_impl or str(model_args.get("simplicial_impl", "auto")),
         simplicial_precision=args.simplicial_precision
         or str(model_args.get("simplicial_precision", "ieee_fp32")),

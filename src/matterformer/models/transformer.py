@@ -12,6 +12,7 @@ from matterformer.models.attention import (
     SimplicialAttentionMask,
     SimplicialFactorizedBias,
     SimplicialLowRankAngleResidual,
+    SimplicialLowRankMessageResidual,
     TwoSimplicialAttention,
 )
 
@@ -157,6 +158,8 @@ class AdaLNBlock(nn.Module):
         simplicial_head_dim: int | None = None,
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
+        simplicial_message_mode: str = "none",
+        simplicial_message_rank: int = 16,
     ) -> None:
         super().__init__()
         attn_type = attn_type.lower()
@@ -189,6 +192,8 @@ class AdaLNBlock(nn.Module):
                 out_proj=True,
                 impl=simplicial_impl,
                 precision=simplicial_precision,
+                message_mode=simplicial_message_mode,
+                message_rank=simplicial_message_rank,
             )
         self.mlp = Mlp(d_model=d_model, mlp_ratio=mlp_ratio, dropout=dropout)
 
@@ -201,6 +206,7 @@ class AdaLNBlock(nn.Module):
         simplicial_attention_mask: SimplicialAttentionMask | None = None,
         simplicial_factorized_bias: SimplicialFactorizedBias | None = None,
         simplicial_angle_residual: SimplicialLowRankAngleResidual | None = None,
+        simplicial_message_residual: SimplicialLowRankMessageResidual | None = None,
         simplicial_logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if cond_emb.ndim != 2 or cond_emb.shape[-1] != x.shape[-1]:
@@ -231,6 +237,8 @@ class AdaLNBlock(nn.Module):
                 raise ValueError("simplicial_factorized_bias is only supported for simplicial attention")
             if simplicial_angle_residual is not None:
                 raise ValueError("simplicial_angle_residual is only supported for simplicial attention")
+            if simplicial_message_residual is not None:
+                raise ValueError("simplicial_message_residual is only supported for simplicial attention")
             attn_out, _ = self.attn(
                 h,
                 h,
@@ -248,6 +256,7 @@ class AdaLNBlock(nn.Module):
                 attention_mask=simplicial_attention_mask,
                 factorized_bias=simplicial_factorized_bias,
                 angle_residual=simplicial_angle_residual,
+                message_residual=simplicial_message_residual,
                 logit_bias_fn=simplicial_logit_bias_fn,
             )
         x = x + gate_msa[:, None, :] * attn_out
@@ -463,19 +472,28 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         edge_bias_rbf_max: float = 2.0,
         edge_bias_n_freqs: int = 8,
         angle_residual_rank: int = 16,
+        message_mode: str = "none",
+        message_rank: int = 16,
         use_periodic_features: bool = False,
         use_noise_gate: bool = True,
     ) -> None:
         super().__init__(n_heads=n_heads, use_noise_gate=use_noise_gate)
         mode = mode.lower()
-        if mode not in {"factorized", "angle_residual", "angle_low_rank"}:
+        if mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(f"Unsupported simplicial geometry mode: {mode}")
+        message_mode = message_mode.lower()
+        if message_mode not in {"none", "low_rank"}:
+            raise ValueError(f"Unsupported simplicial message mode: {message_mode}")
         self.mode = mode
+        self.message_mode = message_mode
         self.use_periodic_features = bool(use_periodic_features)
         self.edge_bias_n_rbf = int(edge_bias_n_rbf)
         self.angle_residual_rank = int(angle_residual_rank)
+        self.message_rank = int(message_rank)
         if self.angle_residual_rank <= 0:
             raise ValueError("angle_residual_rank must be positive")
+        if self.message_mode == "low_rank" and self.message_rank <= 0:
+            raise ValueError("message_rank must be positive when message_mode='low_rank'")
 
         self.register_buffer(
             "_edge_rbf_centers",
@@ -494,24 +512,29 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             persistent=False,
         )
 
-        self.spoke_bias_u_mlp = nn.Sequential(
-            nn.LazyLinear(edge_bias_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(edge_bias_hidden_dim, self.n_heads),
-        )
-        self.spoke_bias_v_mlp = nn.Sequential(
-            nn.LazyLinear(edge_bias_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(edge_bias_hidden_dim, self.n_heads),
-        )
-        self.pair_bias_w_mlp = nn.Sequential(
-            nn.LazyLinear(edge_bias_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(edge_bias_hidden_dim, self.n_heads),
-        )
-        for mlp in (self.spoke_bias_u_mlp, self.spoke_bias_v_mlp, self.pair_bias_w_mlp):
-            nn.init.zeros_(mlp[-1].weight)
-            nn.init.zeros_(mlp[-1].bias)
+        if self.mode != "none":
+            self.spoke_bias_u_mlp = nn.Sequential(
+                nn.LazyLinear(edge_bias_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(edge_bias_hidden_dim, self.n_heads),
+            )
+            self.spoke_bias_v_mlp = nn.Sequential(
+                nn.LazyLinear(edge_bias_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(edge_bias_hidden_dim, self.n_heads),
+            )
+            self.pair_bias_w_mlp = nn.Sequential(
+                nn.LazyLinear(edge_bias_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(edge_bias_hidden_dim, self.n_heads),
+            )
+            for mlp in (self.spoke_bias_u_mlp, self.spoke_bias_v_mlp, self.pair_bias_w_mlp):
+                nn.init.zeros_(mlp[-1].weight)
+                nn.init.zeros_(mlp[-1].bias)
+        else:
+            self.spoke_bias_u_mlp = None
+            self.spoke_bias_v_mlp = None
+            self.pair_bias_w_mlp = None
 
         if self.mode == "angle_residual":
             self.angle_residual_mlp = nn.Sequential(
@@ -540,6 +563,22 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         else:
             self.angle_left_mlp = None
             self.angle_right_mlp = None
+        if self.message_mode == "low_rank":
+            self.message_left_mlp = nn.Sequential(
+                nn.LazyLinear(edge_bias_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(edge_bias_hidden_dim, self.n_heads * self.message_rank),
+            )
+            self.message_right_mlp = nn.Sequential(
+                nn.LazyLinear(edge_bias_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(edge_bias_hidden_dim, self.n_heads * self.message_rank),
+            )
+            nn.init.zeros_(self.message_left_mlp[-1].weight)
+            nn.init.zeros_(self.message_left_mlp[-1].bias)
+        else:
+            self.message_left_mlp = None
+            self.message_right_mlp = None
 
     def _distance_rbf(self, dist_norm: torch.Tensor) -> torch.Tensor:
         centers = self._edge_rbf_centers.to(device=dist_norm.device, dtype=dist_norm.dtype)
@@ -613,6 +652,8 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         self,
         geom_features: GeometryFeatures,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.spoke_bias_u_mlp is None or self.spoke_bias_v_mlp is None or self.pair_bias_w_mlp is None:
+            raise RuntimeError("Factorized simplicial geometry requested without factorized geometry MLPs")
         spoke_feat = self._build_spoke_features(geom_features)
         pair_feat = self._build_pair_features(geom_features)
         u_bias = self.spoke_bias_u_mlp(spoke_feat).permute(0, 3, 1, 2).contiguous()
@@ -635,6 +676,23 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         factor_shape = (batch_size, num_atoms, num_atoms, self.n_heads, self.angle_residual_rank)
         left = self.angle_left_mlp(features).view(factor_shape).permute(0, 3, 1, 2, 4).contiguous()
         right = self.angle_right_mlp(features).view(factor_shape).permute(0, 3, 1, 2, 4).contiguous()
+        pair_mask = geom_features.pair_mask[:, None, :, :, None].to(dtype=left.dtype)
+        eye = torch.eye(num_atoms, device=left.device, dtype=torch.bool).view(1, 1, num_atoms, num_atoms, 1)
+        left = left.masked_fill(eye, 0.0) * pair_mask
+        right = right.masked_fill(eye, 0.0) * pair_mask
+        return left, right
+
+    def _compute_low_rank_message_residual(
+        self,
+        geom_features: GeometryFeatures,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.message_left_mlp is None or self.message_right_mlp is None:
+            raise RuntimeError("Low-rank message residual requested without message MLPs")
+        features = self._build_angle_spoke_features(geom_features)
+        batch_size, num_atoms, _, _ = geom_features.pair_delta.shape
+        factor_shape = (batch_size, num_atoms, num_atoms, self.n_heads, self.message_rank)
+        left = self.message_left_mlp(features).view(factor_shape).permute(0, 3, 1, 2, 4).contiguous()
+        right = self.message_right_mlp(features).view(factor_shape).permute(0, 3, 1, 2, 4).contiguous()
         pair_mask = geom_features.pair_mask[:, None, :, :, None].to(dtype=left.dtype)
         eye = torch.eye(num_atoms, device=left.device, dtype=torch.bool).view(1, 1, num_atoms, num_atoms, 1)
         left = left.masked_fill(eye, 0.0) * pair_mask
@@ -715,51 +773,68 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         seq_len: int | None = None,
         sigma: torch.Tensor | None = None,
     ) -> tuple[
-        SimplicialFactorizedBias,
+        SimplicialFactorizedBias | None,
         Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None,
         SimplicialLowRankAngleResidual | None,
+        SimplicialLowRankMessageResidual | None,
         SimplicialAttentionMask,
     ]:
-        u_atoms, v_atoms, w_atoms = self._compute_factorized_terms(geom_features)
         atom_pad_mask = pad_mask[:, :coords_len].bool() if pad_mask is not None else None
-        u_atoms = self._mask_atom_pairwise_bias(u_atoms, atom_pad_mask)
-        v_atoms = self._mask_atom_pairwise_bias(v_atoms, atom_pad_mask)
-        w_atoms = self._mask_atom_pairwise_bias(w_atoms, atom_pad_mask)
-
         target_seq_len = seq_len or coords_len
-        u_full = self._expand_atom_head_bias(u_atoms, seq_len=target_seq_len)
-        v_full = self._expand_atom_head_bias(v_atoms, seq_len=target_seq_len)
-        w_full = self._expand_atom_head_bias(w_atoms, seq_len=target_seq_len)
+        gate_source = geom_features.pair_dist_norm
         gate = self._sigma_gate(
             sigma=sigma,
-            batch_size=u_full.shape[0],
-            dtype=u_full.dtype,
-            device=u_full.device,
+            batch_size=gate_source.shape[0],
+            dtype=gate_source.dtype,
+            device=gate_source.device,
         )
         gate = gate.expand(-1, -1, target_seq_len, -1).squeeze(-1)
         if target_seq_len > coords_len:
             q_is_atom = (
-                torch.arange(target_seq_len, device=u_full.device) < coords_len
+                torch.arange(target_seq_len, device=gate.device) < coords_len
             ).to(dtype=gate.dtype)
             gate = gate * q_is_atom.view(1, 1, target_seq_len)
 
-        factorized_bias = SimplicialFactorizedBias(
-            u=u_full,
-            v=v_full,
-            w=w_full,
-            gate=gate,
-        )
         attention_mask = _build_simplicial_attention_mask(
             coords_len=coords_len,
             seq_len=target_seq_len,
-            batch_size=u_full.shape[0],
-            device=u_full.device,
+            batch_size=gate.shape[0],
+            device=gate.device,
             pad_mask=pad_mask,
             geom_pair_mask=geom_features.pair_mask,
         )
 
+        factorized_bias = None
+        if self.mode != "none":
+            u_atoms, v_atoms, w_atoms = self._compute_factorized_terms(geom_features)
+            u_atoms = self._mask_atom_pairwise_bias(u_atoms, atom_pad_mask)
+            v_atoms = self._mask_atom_pairwise_bias(v_atoms, atom_pad_mask)
+            w_atoms = self._mask_atom_pairwise_bias(w_atoms, atom_pad_mask)
+            factorized_bias = SimplicialFactorizedBias(
+                u=self._expand_atom_head_bias(u_atoms, seq_len=target_seq_len),
+                v=self._expand_atom_head_bias(v_atoms, seq_len=target_seq_len),
+                w=self._expand_atom_head_bias(w_atoms, seq_len=target_seq_len),
+                gate=gate,
+            )
+
+        message_residual = None
+        if self.message_mode == "low_rank":
+            message_left_atoms, message_right_atoms = self._compute_low_rank_message_residual(geom_features)
+            message_left_atoms = self._mask_atom_pairwise_rank_factor(message_left_atoms, atom_pad_mask)
+            message_right_atoms = self._mask_atom_pairwise_rank_factor(message_right_atoms, atom_pad_mask)
+            message_residual = SimplicialLowRankMessageResidual(
+                left=self._expand_atom_head_rank_factor(message_left_atoms, seq_len=target_seq_len),
+                right=self._expand_atom_head_rank_factor(message_right_atoms, seq_len=target_seq_len),
+            )
+
+        if self.mode == "none":
+            return None, None, None, message_residual, attention_mask
+
+        if factorized_bias is None:
+            raise RuntimeError("factorized_bias was not built for a non-none simplicial geometry mode")
+
         if self.mode == "factorized":
-            return factorized_bias, None, None, attention_mask
+            return factorized_bias, None, None, message_residual, attention_mask
 
         if self.mode == "angle_low_rank":
             left_atoms, right_atoms = self._compute_low_rank_angle_residual(geom_features)
@@ -772,7 +847,7 @@ class SimplicialGeometryBias(_GeometryBiasBase):
                 right=right_full,
                 gate=gate,
             )
-            return factorized_bias, None, angle_residual, attention_mask
+            return factorized_bias, None, angle_residual, message_residual, attention_mask
 
         def _residual_fn(
             start: int,
@@ -781,13 +856,13 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             device: torch.device,
         ) -> torch.Tensor:
             residual = torch.zeros(
-                u_full.shape[0],
+                gate.shape[0],
                 self.n_heads,
                 end - start,
                 target_seq_len,
                 target_seq_len,
-                device=u_full.device,
-                dtype=u_full.dtype,
+                device=gate.device,
+                dtype=gate.dtype,
             )
             atom_q_end = min(end, coords_len)
             if start < atom_q_end:
@@ -800,7 +875,7 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             gate_chunk = gate[:, :, start:end].unsqueeze(-1).unsqueeze(-1)
             return (gate_chunk * residual).to(device=device, dtype=dtype)
 
-        return factorized_bias, _residual_fn, None, attention_mask
+        return factorized_bias, _residual_fn, None, message_residual, attention_mask
 
     def build_bias_inputs(
         self,
@@ -810,11 +885,11 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         seq_len: int | None = None,
         sigma: torch.Tensor | None = None,
     ) -> tuple[
-        SimplicialFactorizedBias,
+        SimplicialFactorizedBias | None,
         Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None,
         SimplicialAttentionMask,
     ]:
-        factorized_bias, residual_fn, angle_residual, attention_mask = self.build_structured_bias_inputs(
+        factorized_bias, residual_fn, angle_residual, _, attention_mask = self.build_structured_bias_inputs(
             geom_features=geom_features,
             coords_len=coords_len,
             pad_mask=pad_mask,
@@ -842,7 +917,7 @@ class SimplicialGeometryBias(_GeometryBiasBase):
         seq_len: int | None = None,
         sigma: torch.Tensor | None = None,
     ) -> Callable[[int, int, torch.dtype, torch.device], torch.Tensor]:
-        factorized_bias, residual_fn, angle_residual, _ = self.build_structured_bias_inputs(
+        factorized_bias, residual_fn, angle_residual, _, _ = self.build_structured_bias_inputs(
             geom_features=geom_features,
             coords_len=coords_len,
             pad_mask=pad_mask,
@@ -856,6 +931,8 @@ class SimplicialGeometryBias(_GeometryBiasBase):
             dtype: torch.dtype,
             device: torch.device,
         ) -> torch.Tensor:
+            if factorized_bias is None:
+                raise RuntimeError("build_logit_bias_fn requires a non-none simplicial geometry mode")
             bias = factorized_bias.chunk(start, end, dtype=dtype, device=device)
             if residual_fn is None:
                 if angle_residual is None:
@@ -987,6 +1064,8 @@ class TransformerTrunk(nn.Module):
         simplicial_head_dim: int | None = None,
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
+        simplicial_message_mode: str = "none",
+        simplicial_message_rank: int = 16,
         geometry_adapter: BaseGeometryAdapter | None = None,
         geometry_bias: GeometryBiasBuilder | None = None,
         simplicial_geometry_bias: SimplicialGeometryBias | None = None,
@@ -1016,6 +1095,8 @@ class TransformerTrunk(nn.Module):
                     simplicial_head_dim=simplicial_head_dim,
                     simplicial_impl=simplicial_impl,
                     simplicial_precision=simplicial_precision,
+                    simplicial_message_mode=simplicial_message_mode,
+                    simplicial_message_rank=simplicial_message_rank,
                 )
                 for _ in range(n_layers)
             ]
@@ -1055,6 +1136,7 @@ class TransformerTrunk(nn.Module):
         simplicial_attention_mask = None
         simplicial_factorized_bias = None
         simplicial_angle_residual = None
+        simplicial_message_residual = None
         simplicial_logit_bias_fn = None
         if self.geometry_adapter is not None:
             if coords is None:
@@ -1075,6 +1157,7 @@ class TransformerTrunk(nn.Module):
                 simplicial_factorized_bias,
                 simplicial_logit_bias_fn,
                 simplicial_angle_residual,
+                simplicial_message_residual,
                 simplicial_attention_mask,
             ) = self.simplicial_geometry_bias.build_structured_bias_inputs(
                 geom_features=geom_features,
@@ -1117,6 +1200,7 @@ class TransformerTrunk(nn.Module):
                 simplicial_attention_mask=simplicial_attention_mask,
                 simplicial_factorized_bias=simplicial_factorized_bias,
                 simplicial_angle_residual=simplicial_angle_residual,
+                simplicial_message_residual=simplicial_message_residual,
                 simplicial_logit_bias_fn=simplicial_logit_bias_fn,
             )
         x = self.norm_out(x)

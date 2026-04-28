@@ -106,6 +106,25 @@ def test_qm9_edm_mha_factorized_marginal_loss_smoke():
     loss.backward()
 
 
+def test_qm9_edm_factorized_message_low_rank_loss_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        simplicial_geom_mode="factorized",
+        simplicial_message_mode="low_rank",
+        simplicial_message_rank=3,
+    )
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
 def test_qm9_generation_metrics_without_rdkit_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()

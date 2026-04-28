@@ -124,6 +124,8 @@ def maybe_configure_wandb(
                 "attn_type": args.attn_type,
                 "simplicial_geom_mode": args.simplicial_geom_mode,
                 "simplicial_angle_rank": args.simplicial_angle_rank,
+                "simplicial_message_mode": args.simplicial_message_mode,
+                "simplicial_message_rank": args.simplicial_message_rank,
                 "mha_geom_bias_mode": args.mha_geom_bias_mode,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
@@ -358,6 +360,8 @@ def main(args: argparse.Namespace) -> None:
         simplicial_impl=args.simplicial_impl,
         simplicial_precision=args.simplicial_precision,
         simplicial_angle_rank=args.simplicial_angle_rank,
+        simplicial_message_mode=args.simplicial_message_mode,
+        simplicial_message_rank=args.simplicial_message_rank,
         mha_geom_bias_mode=args.mha_geom_bias_mode,
         use_geometry_bias=not args.disable_geometry_bias,
     ).to(device)
@@ -860,6 +864,8 @@ if __name__ == "__main__":
         choices=["auto", "torch", "triton"],
     )
     parser.add_argument("--simplicial-angle-rank", type=int, default=16)
+    parser.add_argument("--simplicial-message-mode", type=str, default="none", choices=["none", "low_rank"])
+    parser.add_argument("--simplicial-message-rank", type=int, default=16)
     parser.add_argument(
         "--simplicial-precision",
         type=str,

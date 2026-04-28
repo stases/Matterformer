@@ -49,6 +49,8 @@ class QM9RegressionModel(nn.Module):
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
         simplicial_angle_rank: int = 16,
+        simplicial_message_mode: str = "none",
+        simplicial_message_rank: int = 16,
         readout_mode: str = "cls",
         mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
@@ -57,12 +59,15 @@ class QM9RegressionModel(nn.Module):
         super().__init__()
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
+        simplicial_message_mode = simplicial_message_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
         readout_mode = readout_mode.lower()
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
+        if simplicial_message_mode not in {"none", "low_rank"}:
+            raise ValueError("simplicial_message_mode must be one of {'none', 'low_rank'}")
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
                 "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
@@ -71,13 +76,20 @@ class QM9RegressionModel(nn.Module):
             raise ValueError("readout_mode must be one of {'cls', 'sum', 'mean'}")
         geometry_bias = None
         simplicial_geometry_bias = None
+        effective_message_mode = (
+            simplicial_message_mode
+            if use_geometry_bias and attn_type.lower() == "simplicial"
+            else "none"
+        )
         if use_geometry_bias:
             if attn_type.lower() == "simplicial":
-                if simplicial_geom_mode != "none":
+                if simplicial_geom_mode != "none" or effective_message_mode != "none":
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
                         mode=simplicial_geom_mode,
                         angle_residual_rank=simplicial_angle_rank,
+                        message_mode=effective_message_mode,
+                        message_rank=simplicial_message_rank,
                         use_periodic_features=geometry_adapter.geometry_kind == "periodic",
                         use_noise_gate=False,
                     )
@@ -117,6 +129,8 @@ class QM9RegressionModel(nn.Module):
             attn_type=attn_type,
             simplicial_impl=simplicial_impl,
             simplicial_precision=simplicial_precision,
+            simplicial_message_mode=effective_message_mode,
+            simplicial_message_rank=simplicial_message_rank,
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
@@ -193,6 +207,8 @@ class QM9EDMModel(nn.Module):
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
         simplicial_angle_rank: int = 16,
+        simplicial_message_mode: str = "none",
+        simplicial_message_rank: int = 16,
         mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
@@ -203,24 +219,34 @@ class QM9EDMModel(nn.Module):
         super().__init__()
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
+        simplicial_message_mode = simplicial_message_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
+        if simplicial_message_mode not in {"none", "low_rank"}:
+            raise ValueError("simplicial_message_mode must be one of {'none', 'low_rank'}")
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
                 "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
             )
         geometry_bias = None
         simplicial_geometry_bias = None
+        effective_message_mode = (
+            simplicial_message_mode
+            if use_geometry_bias and attn_type.lower() == "simplicial"
+            else "none"
+        )
         if use_geometry_bias:
             if attn_type.lower() == "simplicial":
-                if simplicial_geom_mode != "none":
+                if simplicial_geom_mode != "none" or effective_message_mode != "none":
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
                         mode=simplicial_geom_mode,
                         angle_residual_rank=simplicial_angle_rank,
+                        message_mode=effective_message_mode,
+                        message_rank=simplicial_message_rank,
                         use_periodic_features=geometry_adapter.geometry_kind == "periodic",
                         use_noise_gate=True,
                     )
@@ -254,6 +280,8 @@ class QM9EDMModel(nn.Module):
             attn_type=attn_type,
             simplicial_impl=simplicial_impl,
             simplicial_precision=simplicial_precision,
+            simplicial_message_mode=effective_message_mode,
+            simplicial_message_rank=simplicial_message_rank,
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
