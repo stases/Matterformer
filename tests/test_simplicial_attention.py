@@ -6,6 +6,7 @@ from matterformer.models import QM9EDMModel, SimplicialGeometryBias, TwoSimplici
 from matterformer.models.attention import (
     SimplicialAttentionMask,
     SimplicialFactorizedBias,
+    SimplicialLowRankAngleResidual,
     _TritonTwoSimplicialAttentionFunction,
     simplicial_attention_torch_from_projected,
 )
@@ -21,6 +22,7 @@ def _reference_from_projected(
     *,
     attention_mask: SimplicialAttentionMask,
     factorized_bias: SimplicialFactorizedBias | None = None,
+    angle_residual: SimplicialLowRankAngleResidual | None = None,
     logit_bias_fn=None,
     dropout_p: float = 0.0,
     training: bool = False,
@@ -40,6 +42,8 @@ def _reference_from_projected(
         logits = torch.matmul(k1.unsqueeze(-3), qk2.transpose(-1, -2)).float()
         if factorized_bias is not None:
             logits = logits + factorized_bias.chunk(start, end, dtype=logits.dtype, device=logits.device)
+        if angle_residual is not None:
+            logits = logits + angle_residual.chunk(start, end, dtype=logits.dtype, device=logits.device)
         if logit_bias_fn is not None:
             logits = logits + logit_bias_fn(start, end, logits.dtype, logits.device)
 
@@ -87,6 +91,37 @@ def _make_factorized_bias(
         requires_grad=requires_grad,
     )
     return SimplicialFactorizedBias(u=factory(), v=factory(), w=factory(), gate=gate)
+
+
+def _make_low_rank_angle_residual(
+    batch_size: int,
+    num_heads: int,
+    num_tokens: int,
+    rank: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    requires_grad: bool = False,
+) -> SimplicialLowRankAngleResidual:
+    factory = lambda: torch.randn(
+        batch_size,
+        num_heads,
+        num_tokens,
+        num_tokens,
+        rank,
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    gate = torch.randn(
+        batch_size,
+        num_heads,
+        num_tokens,
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    return SimplicialLowRankAngleResidual(left=factory(), right=factory(), gate=gate)
 
 
 def _mask_from_padding(
@@ -178,6 +213,48 @@ def test_torch_backend_matches_reference_with_factorized_bias():
         v2,
         attention_mask=attention_mask,
         factorized_bias=factorized_bias,
+        chunk_size=attn.chunk_size,
+    )
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_torch_backend_matches_reference_with_low_rank_angle_residual():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(dim=32, num_heads=4, impl="torch", chunk_size=3)
+    x = torch.randn(2, 5, 32)
+    angle_residual = _make_low_rank_angle_residual(
+        2,
+        4,
+        5,
+        3,
+        device=x.device,
+        dtype=x.dtype,
+    )
+    attention_mask = _mask_from_padding(
+        None,
+        batch_size=x.shape[0],
+        num_tokens=x.shape[1],
+        device=x.device,
+    )
+    q, k1, v1, k2, v2 = attn._project_inputs(x)
+    expected = _reference_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        angle_residual=angle_residual,
+        chunk_size=attn.chunk_size,
+    )
+    actual = simplicial_attention_torch_from_projected(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        angle_residual=angle_residual,
         chunk_size=attn.chunk_size,
     )
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
@@ -312,6 +389,41 @@ def test_factorized_bias_builder_zeros_cls_queries_and_builds_mask():
     assert torch.count_nonzero(attention_mask.pair_key_valid[:, coords.shape[1] :]) == 0
 
 
+def test_low_rank_angle_bias_builder_returns_structured_residual():
+    torch.manual_seed(0)
+    adapter = NonPeriodicGeometryAdapter()
+    coords = torch.randn(2, 4, 3)
+    pad_mask = torch.tensor(
+        [
+            [False, False, False, True, False],
+            [False, False, True, True, False],
+        ]
+    )
+    geom_features = adapter(coords, pad_mask=pad_mask[:, : coords.shape[1]])
+    simplicial_bias = SimplicialGeometryBias(
+        n_heads=4,
+        mode="angle_low_rank",
+        angle_residual_rank=3,
+        use_noise_gate=False,
+    )
+    factorized_bias, residual_fn, angle_residual, attention_mask = simplicial_bias.build_structured_bias_inputs(
+        geom_features=geom_features,
+        coords_len=coords.shape[1],
+        pad_mask=pad_mask,
+        seq_len=pad_mask.shape[1],
+        sigma=None,
+    )
+    assert residual_fn is None
+    assert angle_residual is not None
+    assert angle_residual.left.shape == (2, 4, pad_mask.shape[1], pad_mask.shape[1], 3)
+    assert angle_residual.right.shape == angle_residual.left.shape
+    assert angle_residual.gate.shape == factorized_bias.gate.shape
+    assert torch.count_nonzero(angle_residual.left) == 0
+    assert torch.count_nonzero(angle_residual.right) > 0
+    assert torch.count_nonzero(angle_residual.gate[:, :, coords.shape[1] :]) == 0
+    assert attention_mask.pair_valid is not None
+
+
 def test_checkpoint_roundtrip_preserves_simplicial_impl_and_precision():
     torch.manual_seed(0)
     model = QM9EDMModel(
@@ -403,6 +515,78 @@ def test_eval_mode_dropout_allows_triton():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_triton_no_bias_forward_backward_matches_torch_cuda():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    q_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_triton = q_torch.detach().clone().requires_grad_(True)
+    k1_triton = k1_torch.detach().clone().requires_grad_(True)
+    v1_triton = v1_torch.detach().clone().requires_grad_(True)
+    k2_triton = k2_torch.detach().clone().requires_grad_(True)
+    v2_triton = v2_torch.detach().clone().requires_grad_(True)
+    attention_mask = SimplicialAttentionMask.from_key_padding_mask(
+        torch.tensor(
+            [
+                [False, False, False, False, True],
+                [False, False, True, True, True],
+            ],
+            device=device,
+        ),
+        batch_size=2,
+        num_tokens=5,
+        device=device,
+    )
+    torch_out = simplicial_attention_torch_from_projected(
+        q_torch,
+        k1_torch,
+        v1_torch,
+        k2_torch,
+        v2_torch,
+        attention_mask=attention_mask,
+        chunk_size=2,
+        fp32_core=True,
+    )
+    triton_out = _TritonTwoSimplicialAttentionFunction.apply(
+        q_triton,
+        k1_triton,
+        v1_triton,
+        k2_triton,
+        v2_triton,
+        attention_mask.query_valid,
+        attention_mask.pair_key_valid,
+        torch.empty(0, device=device, dtype=torch.bool),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        "ieee_fp32",
+        2,
+        False,
+    )
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+    torch_loss = torch_out.square().mean()
+    triton_loss = triton_out.square().mean()
+    torch_loss.backward()
+    triton_loss.backward()
+    for actual, expected in (
+        (q_triton.grad, q_torch.grad),
+        (k1_triton.grad, k1_torch.grad),
+        (v1_triton.grad, v1_torch.grad),
+        (k2_triton.grad, k2_torch.grad),
+        (v2_triton.grad, v2_torch.grad),
+    ):
+        assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
 def test_triton_forward_backward_ieee_matches_torch_cuda():
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -459,6 +643,9 @@ def test_triton_forward_backward_ieee_matches_torch_cuda():
         factorized_bias_triton.v,
         factorized_bias_triton.w,
         factorized_bias_triton.gate,
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
         "ieee_fp32",
         2,
         True,
@@ -478,6 +665,88 @@ def test_triton_forward_backward_ieee_matches_torch_cuda():
         (factorized_bias_triton.v.grad, factorized_bias_torch.v.grad),
         (factorized_bias_triton.w.grad, factorized_bias_torch.w.grad),
         (factorized_bias_triton.gate.grad, factorized_bias_torch.gate.grad),
+    ):
+        assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_triton_low_rank_angle_forward_backward_matches_torch_cuda():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    q_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v1_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v2_torch = torch.randn(2, 4, 5, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_triton = q_torch.detach().clone().requires_grad_(True)
+    k1_triton = k1_torch.detach().clone().requires_grad_(True)
+    v1_triton = v1_torch.detach().clone().requires_grad_(True)
+    k2_triton = k2_torch.detach().clone().requires_grad_(True)
+    v2_triton = v2_torch.detach().clone().requires_grad_(True)
+    angle_torch = _make_low_rank_angle_residual(2, 4, 5, 4, device=device, dtype=torch.float32, requires_grad=True)
+    angle_triton = SimplicialLowRankAngleResidual(
+        left=angle_torch.left.detach().clone().requires_grad_(True),
+        right=angle_torch.right.detach().clone().requires_grad_(True),
+        gate=angle_torch.gate.detach().clone().requires_grad_(True),
+    )
+    attention_mask = SimplicialAttentionMask.from_key_padding_mask(
+        torch.tensor(
+            [
+                [False, False, False, False, True],
+                [False, False, True, True, True],
+            ],
+            device=device,
+        ),
+        batch_size=2,
+        num_tokens=5,
+        device=device,
+    )
+    torch_out = simplicial_attention_torch_from_projected(
+        q_torch,
+        k1_torch,
+        v1_torch,
+        k2_torch,
+        v2_torch,
+        attention_mask=attention_mask,
+        angle_residual=angle_torch,
+        chunk_size=2,
+        fp32_core=True,
+    )
+    triton_out = _TritonTwoSimplicialAttentionFunction.apply(
+        q_triton,
+        k1_triton,
+        v1_triton,
+        k2_triton,
+        v2_triton,
+        attention_mask.query_valid,
+        attention_mask.pair_key_valid,
+        torch.empty(0, device=device, dtype=torch.bool),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        angle_triton.left,
+        angle_triton.right,
+        angle_triton.gate,
+        "ieee_fp32",
+        2,
+        False,
+    )
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+    torch_loss = torch_out.square().mean()
+    triton_loss = triton_out.square().mean()
+    torch_loss.backward()
+    triton_loss.backward()
+    for actual, expected in (
+        (q_triton.grad, q_torch.grad),
+        (k1_triton.grad, k1_torch.grad),
+        (v1_triton.grad, v1_torch.grad),
+        (k2_triton.grad, k2_torch.grad),
+        (v2_triton.grad, v2_torch.grad),
+        (angle_triton.left.grad, angle_torch.left.grad),
+        (angle_triton.right.grad, angle_torch.right.grad),
+        (angle_triton.gate.grad, angle_torch.gate.grad),
     ):
         assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
 
@@ -540,6 +809,9 @@ def test_triton_bf16_forward_backward_within_tolerance():
         factorized_bias_triton.v.to(torch.bfloat16),
         factorized_bias_triton.w.to(torch.bfloat16),
         factorized_bias_triton.gate.to(torch.bfloat16),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
         "bf16_tc",
         4,
         False,

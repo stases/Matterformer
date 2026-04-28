@@ -15,7 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
-from matterformer.models import SimplicialAttentionMask, SimplicialFactorizedBias
+from matterformer.models import SimplicialAttentionMask, SimplicialFactorizedBias, SimplicialLowRankAngleResidual
 from matterformer.models.attention import (
     _TritonTwoSimplicialAttentionFunction,
     simplicial_attention_torch_from_projected,
@@ -48,6 +48,21 @@ PARITY_CASES = (
         "num_heads": 4,
         "tokens": 5,
         "head_dim": 8,
+        "chunk_size": 2,
+        "atol": 1e-4,
+        "rtol": 1e-4,
+    },
+    {
+        "name": "ieee_angle_low_rank_padding",
+        "dtype": torch.float32,
+        "precision": "ieee_fp32",
+        "mode": "angle_low_rank",
+        "mask_mode": "padding",
+        "batch_size": 2,
+        "num_heads": 4,
+        "tokens": 5,
+        "head_dim": 8,
+        "angle_rank": 4,
         "chunk_size": 2,
         "atol": 1e-4,
         "rtol": 1e-4,
@@ -133,6 +148,28 @@ def _make_factorized_bias(
     )
 
 
+def _make_low_rank_angle_residual(
+    batch_size: int,
+    num_heads: int,
+    num_tokens: int,
+    rank: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    requires_grad: bool,
+) -> SimplicialLowRankAngleResidual:
+    kwargs = {
+        "device": device,
+        "dtype": dtype,
+        "requires_grad": requires_grad,
+    }
+    return SimplicialLowRankAngleResidual(
+        left=torch.randn(batch_size, num_heads, num_tokens, num_tokens, rank, **kwargs),
+        right=torch.randn(batch_size, num_heads, num_tokens, num_tokens, rank, **kwargs),
+        gate=torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+    )
+
+
 def _grad_stats(actual: torch.Tensor, reference: torch.Tensor, *, atol: float, rtol: float) -> dict[str, float | bool]:
     diff = (actual - reference).abs().float()
     return {
@@ -198,6 +235,8 @@ def run_parity_case(case: dict[str, object], device: torch.device) -> dict[str, 
     attention_mask = _build_attention_mask(case, device)
     factorized_bias_ref = None
     factorized_bias_tri = None
+    angle_residual_ref = None
+    angle_residual_tri = None
     if case["mode"] == "factorized":
         factorized_bias_ref = _make_factorized_bias(
             batch_size,
@@ -213,6 +252,22 @@ def run_parity_case(case: dict[str, object], device: torch.device) -> dict[str, 
             w=factorized_bias_ref.w.detach().clone().requires_grad_(True),
             gate=factorized_bias_ref.gate.detach().clone().requires_grad_(True),
         )
+    if case["mode"] == "angle_low_rank":
+        angle_rank = int(case.get("angle_rank", 4))
+        angle_residual_ref = _make_low_rank_angle_residual(
+            batch_size,
+            num_heads,
+            tokens,
+            angle_rank,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        angle_residual_tri = SimplicialLowRankAngleResidual(
+            left=angle_residual_ref.left.detach().clone().requires_grad_(True),
+            right=angle_residual_ref.right.detach().clone().requires_grad_(True),
+            gate=angle_residual_ref.gate.detach().clone().requires_grad_(True),
+        )
 
     ref_out = simplicial_attention_torch_from_projected(
         q_ref,
@@ -222,6 +277,7 @@ def run_parity_case(case: dict[str, object], device: torch.device) -> dict[str, 
         v2_ref,
         attention_mask=attention_mask,
         factorized_bias=factorized_bias_ref,
+        angle_residual=angle_residual_ref,
         chunk_size=chunk_size,
         fp32_core=debug_torch_backward,
     )
@@ -238,6 +294,9 @@ def run_parity_case(case: dict[str, object], device: torch.device) -> dict[str, 
         factorized_bias_tri.v.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if factorized_bias_tri is not None else q_tri.new_empty(0),
         factorized_bias_tri.w.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if factorized_bias_tri is not None else q_tri.new_empty(0),
         factorized_bias_tri.gate.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if factorized_bias_tri is not None else q_tri.new_empty(0),
+        angle_residual_tri.left.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if angle_residual_tri is not None else q_tri.new_empty(0),
+        angle_residual_tri.right.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if angle_residual_tri is not None else q_tri.new_empty(0),
+        angle_residual_tri.gate.to(torch.float32 if precision != "bf16_tc" else torch.bfloat16) if angle_residual_tri is not None else q_tri.new_empty(0),
         precision,
         chunk_size,
         debug_torch_backward,
@@ -265,6 +324,29 @@ def run_parity_case(case: dict[str, object], device: torch.device) -> dict[str, 
                 "gate": _grad_stats(
                     factorized_bias_tri.gate.grad.float(),
                     factorized_bias_ref.gate.grad.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ),
+            }
+        )
+    if angle_residual_ref is not None and angle_residual_tri is not None:
+        gradients.update(
+            {
+                "angle_left": _grad_stats(
+                    angle_residual_tri.left.grad.float(),
+                    angle_residual_ref.left.grad.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ),
+                "angle_right": _grad_stats(
+                    angle_residual_tri.right.grad.float(),
+                    angle_residual_ref.right.grad.float(),
+                    atol=atol,
+                    rtol=rtol,
+                ),
+                "angle_gate": _grad_stats(
+                    angle_residual_tri.gate.grad.float(),
+                    angle_residual_ref.gate.grad.float(),
                     atol=atol,
                     rtol=rtol,
                 ),

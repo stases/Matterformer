@@ -47,6 +47,18 @@ def _num_warps_for_block_d(block_d: int) -> int:
     return 8
 
 
+def _block_r_for_angle_rank(angle_rank: int) -> int:
+    if angle_rank <= 0:
+        raise ValueError("angle_rank must be positive")
+    if angle_rank <= 16:
+        return 16
+    if angle_rank <= 32:
+        return 32
+    if angle_rank <= 64:
+        return 64
+    raise ValueError(f"Triton simplicial attention only supports angle_rank <= 64, got {angle_rank}")
+
+
 def _precision_kernel_config(precision: str) -> tuple[bool, str]:
     normalized = normalize_simplicial_precision(precision)
     if normalized == "bf16_tc":
@@ -72,20 +84,27 @@ if TRITON_AVAILABLE:
         v_bias_ptr,
         w_ptr,
         gate_ptr,
+        angle_left_ptr,
+        angle_right_ptr,
+        angle_gate_ptr,
         out_ptr,
         lse_ptr,
         num_tokens,
         head_dim,
+        angle_rank,
+        angle_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        HAS_LOW_RANK_ANGLE: tl.constexpr,
         USE_FP32_INPUT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         BLOCK_J: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        BLOCK_R: tl.constexpr,
     ):
         pid = tl.program_id(0)
         q_idx = pid % num_tokens
@@ -106,6 +125,7 @@ if TRITON_AVAILABLE:
             mask=offs_d < head_dim,
             other=0.0,
         )
+        offs_r = tl.arange(0, BLOCK_R)
         if USE_FP32_INPUT:
             q_score = q_raw.to(tl.float32)
         else:
@@ -146,6 +166,18 @@ if TRITON_AVAILABLE:
                     mask=offs_j < num_tokens,
                     other=0.0,
                 ).to(tl.float32)
+            if HAS_LOW_RANK_ANGLE:
+                angle_left_raw = tl.load(
+                    angle_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * angle_rank + offs_r[None, :]),
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                    other=0.0,
+                )
+                angle_left_32 = angle_left_raw.to(tl.float32)
+                if USE_FP32_INPUT:
+                    angle_left_score = angle_left_32
+                else:
+                    angle_left_score = angle_left_raw
 
             for tile_k in range(0, num_tiles_k):
                 offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -183,14 +215,14 @@ if TRITON_AVAILABLE:
                     ).to(tl.float32)
                     if USE_FP32_INPUT:
                         k2_score = k2_raw.to(tl.float32)
-                        qk1 = k1_score * q_score[None, :]
+                        qk2 = k2_score * q_score[None, :]
                     else:
                         k2_score = k2_raw
-                        qk1 = (k1_score * q_score[None, :]).to(k1_score.dtype)
+                        qk2 = (k2_score * q_score[None, :]).to(k2_score.dtype)
 
                     scores = tl.dot(
-                        qk1,
-                        tl.trans(k2_score),
+                        k1_score,
+                        tl.trans(qk2),
                         out_dtype=tl.float32,
                         input_precision=INPUT_PRECISION,
                     )
@@ -208,6 +240,29 @@ if TRITON_AVAILABLE:
                         ).to(tl.float32)
                         gate = tl.load(gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
                         scores = scores + gate * (u[:, None] + v_bias[None, :] + w)
+
+                    if HAS_LOW_RANK_ANGLE:
+                        angle_right_raw = tl.load(
+                            angle_right_ptr
+                            + (
+                                ((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * angle_rank
+                                + offs_r[None, :]
+                            ),
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                            other=0.0,
+                        )
+                        if USE_FP32_INPUT:
+                            angle_right_score = angle_right_raw.to(tl.float32)
+                        else:
+                            angle_right_score = angle_right_raw
+                        angle = tl.dot(
+                            angle_left_score,
+                            tl.trans(angle_right_score),
+                            out_dtype=tl.float32,
+                            input_precision=INPUT_PRECISION,
+                        )
+                        angle_gate = tl.load(angle_gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
+                        scores = scores + angle_gate * angle * angle_scale
 
                     scores = tl.where(valid, scores, -float("inf"))
                     tile_rowmax = tl.max(scores, axis=1)
@@ -249,6 +304,9 @@ if TRITON_AVAILABLE:
         v_bias_ptr,
         w_ptr,
         gate_ptr,
+        angle_left_ptr,
+        angle_right_ptr,
+        angle_gate_ptr,
         dq_ptr,
         dk1_ptr,
         dv1_ptr,
@@ -258,18 +316,25 @@ if TRITON_AVAILABLE:
         dv_bias_ptr,
         dw_ptr,
         dgate_ptr,
+        dangle_left_ptr,
+        dangle_right_ptr,
+        dangle_gate_ptr,
         num_tokens,
         head_dim,
+        angle_rank,
+        angle_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        HAS_LOW_RANK_ANGLE: tl.constexpr,
         USE_FP32_INPUT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         BLOCK_J: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        BLOCK_R: tl.constexpr,
     ):
         pid = tl.program_id(0)
         q_idx = pid % num_tokens
@@ -278,11 +343,14 @@ if TRITON_AVAILABLE:
 
         q_is_valid = tl.load(query_valid_ptr + batch_idx * num_tokens + q_idx) > 0
         offs_d = tl.arange(0, BLOCK_D)
+        offs_r = tl.arange(0, BLOCK_R)
         dq_row_ptr = dq_ptr + (bh_idx * num_tokens + q_idx) * head_dim + offs_d
         if not q_is_valid:
             tl.store(dq_row_ptr, 0.0, mask=offs_d < head_dim)
             if HAS_BIAS:
                 tl.store(dgate_ptr + bh_idx * num_tokens + q_idx, 0.0)
+            if HAS_LOW_RANK_ANGLE:
+                tl.store(dangle_gate_ptr + bh_idx * num_tokens + q_idx, 0.0)
             return
 
         q_raw = tl.load(
@@ -311,6 +379,7 @@ if TRITON_AVAILABLE:
 
         dq_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
         dgate_acc = 0.0
+        dangle_gate_acc = 0.0
 
         for tile_j in range(0, num_tiles_j):
             offs_j = tile_j * BLOCK_J + tl.arange(0, BLOCK_J)
@@ -346,6 +415,20 @@ if TRITON_AVAILABLE:
                     other=0.0,
                 ).to(tl.float32)
                 gate = tl.load(gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
+            if HAS_LOW_RANK_ANGLE:
+                angle_left_raw = tl.load(
+                    angle_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * angle_rank + offs_r[None, :]),
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                    other=0.0,
+                )
+                angle_left_32 = angle_left_raw.to(tl.float32)
+                if USE_FP32_INPUT:
+                    angle_left_score = angle_left_32
+                else:
+                    angle_left_score = angle_left_raw
+                dangle_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
+                angle_gate = tl.load(angle_gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
 
             for tile_k in range(0, num_tiles_k):
                 offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -384,14 +467,14 @@ if TRITON_AVAILABLE:
                     ).to(tl.float32)
                     if USE_FP32_INPUT:
                         k2_score = k2_raw.to(tl.float32)
-                        qk1 = k1_score * q_score[None, :]
+                        qk2 = k2_score * q_score[None, :]
                     else:
                         k2_score = k2_raw
-                        qk1 = (k1_score * q_score[None, :]).to(k1_score.dtype)
+                        qk2 = (k2_score * q_score[None, :]).to(k2_score.dtype)
 
                     scores = tl.dot(
-                        qk1,
-                        tl.trans(k2_score),
+                        k1_score,
+                        tl.trans(qk2),
                         out_dtype=tl.float32,
                         input_precision=INPUT_PRECISION,
                     )
@@ -410,6 +493,30 @@ if TRITON_AVAILABLE:
                         ).to(tl.float32)
                         bias_base = u[:, None] + v_bias[None, :] + w
                         scores = scores + gate * bias_base
+
+                    angle = tl.zeros((BLOCK_J, BLOCK_K), dtype=tl.float32)
+                    if HAS_LOW_RANK_ANGLE:
+                        angle_right_raw = tl.load(
+                            angle_right_ptr
+                            + (
+                                ((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * angle_rank
+                                + offs_r[None, :]
+                            ),
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                            other=0.0,
+                        )
+                        angle_right_32 = angle_right_raw.to(tl.float32)
+                        if USE_FP32_INPUT:
+                            angle_right_score = angle_right_32
+                        else:
+                            angle_right_score = angle_right_raw
+                        angle = tl.dot(
+                            angle_left_score,
+                            tl.trans(angle_right_score),
+                            out_dtype=tl.float32,
+                            input_precision=INPUT_PRECISION,
+                        )
+                        scores = scores + angle_gate * angle * angle_scale
 
                     scores = tl.where(valid, scores, -float("inf"))
                     probs = tl.where(valid, tl.exp(scores - lse), 0.0)
@@ -476,16 +583,55 @@ if TRITON_AVAILABLE:
                         )
                         dgate_acc += tl.sum(tl.sum(dscores * bias_base, axis=1), axis=0)
 
+                    if HAS_LOW_RANK_ANGLE:
+                        angle_grad_scale = angle_gate * angle_scale
+                        dangle_left_running += angle_grad_scale * tl.dot(
+                            dscores,
+                            angle_right_32,
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
+                        dangle_right_tile = angle_grad_scale * tl.dot(
+                            tl.trans(dscores),
+                            angle_left_32,
+                            out_dtype=tl.float32,
+                            input_precision="ieee",
+                        )
+                        dangle_right_tile_ptr = (
+                            dangle_right_ptr
+                            + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * angle_rank + offs_r[None, :])
+                        )
+                        dangle_right_prev = tl.load(
+                            dangle_right_tile_ptr,
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                            other=0.0,
+                        )
+                        tl.store(
+                            dangle_right_tile_ptr,
+                            dangle_right_prev + dangle_right_tile,
+                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                        )
+                        dangle_gate_acc += tl.sum(tl.sum(dscores * angle * angle_scale, axis=1), axis=0)
+
             if HAS_BIAS:
                 tl.store(
                     du_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_j,
                     du_running,
                     mask=offs_j < num_tokens,
                 )
+            if HAS_LOW_RANK_ANGLE:
+                tl.store(
+                    dangle_left_ptr
+                    + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * angle_rank + offs_r[None, :]),
+                    dangle_left_running,
+                    mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                )
 
         tl.store(dq_row_ptr, dq_acc, mask=offs_d < head_dim)
         if HAS_BIAS:
             tl.store(dgate_ptr + bh_idx * num_tokens + q_idx, dgate_acc)
+        if HAS_LOW_RANK_ANGLE:
+            tl.store(dangle_gate_ptr + bh_idx * num_tokens + q_idx, dangle_gate_acc)
 
 
 def _reshape_batch_heads(tensor: torch.Tensor) -> torch.Tensor:
@@ -507,8 +653,11 @@ def triton_simplicial_attention_forward(
     v_bias: torch.Tensor | None,
     w: torch.Tensor | None,
     gate: torch.Tensor | None,
+    angle_left: torch.Tensor | None,
+    angle_right: torch.Tensor | None,
+    angle_gate: torch.Tensor | None,
     precision: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if not TRITON_AVAILABLE:  # pragma: no cover - guarded by dispatch logic.
         raise RuntimeError("triton is not installed")
     if q.device.type != "cuda":
@@ -527,14 +676,30 @@ def triton_simplicial_attention_forward(
     has_pair_valid = pair_valid is not None
     pair_valid_tensor = pair_valid.contiguous() if has_pair_valid else torch.empty(0, device=q.device, dtype=torch.bool)
     has_bias = u is not None and v_bias is not None and w is not None and gate is not None
+    empty = q_bh.new_empty(0, dtype=torch.float32)
     if has_bias:
         u_bh = _reshape_batch_heads(u)
         v_bias_bh = _reshape_batch_heads(v_bias)
         w_bh = _reshape_batch_heads(w)
         gate_bh = gate.contiguous().view(batch_size * num_heads, num_tokens)
     else:
-        empty = q_bh.new_empty(0)
         u_bh = v_bias_bh = w_bh = gate_bh = empty
+
+    has_low_rank_angle = angle_left is not None and angle_right is not None and angle_gate is not None
+    if has_low_rank_angle:
+        if angle_left.shape != angle_right.shape:
+            raise ValueError(f"angle_left and angle_right must have the same shape, got {angle_left.shape} and {angle_right.shape}")
+        angle_rank = int(angle_left.shape[-1])
+        angle_scale = angle_rank**-0.5
+        block_r = _block_r_for_angle_rank(angle_rank)
+        angle_left_bh = _reshape_batch_heads(angle_left)
+        angle_right_bh = _reshape_batch_heads(angle_right)
+        angle_gate_bh = angle_gate.contiguous().view(batch_size * num_heads, num_tokens)
+    else:
+        angle_rank = 1
+        angle_scale = 1.0
+        block_r = 16
+        angle_left_bh = angle_right_bh = angle_gate_bh = empty
 
     batch_heads = batch_size * num_heads
     out = torch.empty((batch_heads, num_tokens, head_dim), device=q.device, dtype=torch.float32)
@@ -555,25 +720,33 @@ def triton_simplicial_attention_forward(
         v_bias_bh,
         w_bh,
         gate_bh,
+        angle_left_bh,
+        angle_right_bh,
+        angle_gate_bh,
         out,
         lse,
         num_tokens,
         head_dim,
+        angle_rank,
+        angle_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID=has_pair_valid,
         HAS_BIAS=has_bias,
+        HAS_LOW_RANK_ANGLE=has_low_rank_angle,
         USE_FP32_INPUT=use_fp32_input,
         INPUT_PRECISION=input_precision,
         BLOCK_J=_BLOCK_J,
         BLOCK_K=_BLOCK_K,
         BLOCK_D=block_d,
+        BLOCK_R=block_r,
         num_warps=_num_warps_for_block_d(block_d),
     )
-    out = out.view(batch_size, num_heads, num_tokens, head_dim).to(q.dtype)
+    out_for_backward = out.view(batch_size, num_heads, num_tokens, head_dim)
+    out = out_for_backward.to(q.dtype)
     lse = lse.view(batch_size, num_heads, num_tokens)
-    return out, lse
+    return out, lse, out_for_backward
 
 
 def triton_simplicial_attention_backward(
@@ -593,6 +766,9 @@ def triton_simplicial_attention_backward(
     v_bias: torch.Tensor | None,
     w: torch.Tensor | None,
     gate: torch.Tensor | None,
+    angle_left: torch.Tensor | None,
+    angle_right: torch.Tensor | None,
+    angle_gate: torch.Tensor | None,
     precision: str,
 ) -> tuple[
     torch.Tensor,
@@ -600,6 +776,9 @@ def triton_simplicial_attention_backward(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -632,6 +811,7 @@ def triton_simplicial_attention_backward(
     has_pair_valid = pair_valid is not None
     pair_valid_tensor = pair_valid.contiguous() if has_pair_valid else torch.empty(0, device=q.device, dtype=torch.bool)
     has_bias = u is not None and v_bias is not None and w is not None and gate is not None
+    empty = q_bh.new_empty(0, dtype=torch.float32)
     if has_bias:
         u_bh = _reshape_batch_heads(u)
         v_bias_bh = _reshape_batch_heads(v_bias)
@@ -642,9 +822,28 @@ def triton_simplicial_attention_backward(
         dw = torch.zeros_like(w_bh, dtype=torch.float32)
         dgate = torch.zeros_like(gate_bh, dtype=torch.float32)
     else:
-        empty = q_bh.new_empty(0, dtype=torch.float32)
         u_bh = v_bias_bh = w_bh = gate_bh = empty
         du = dv_bias = dw = dgate = None
+
+    has_low_rank_angle = angle_left is not None and angle_right is not None and angle_gate is not None
+    if has_low_rank_angle:
+        if angle_left.shape != angle_right.shape:
+            raise ValueError(f"angle_left and angle_right must have the same shape, got {angle_left.shape} and {angle_right.shape}")
+        angle_rank = int(angle_left.shape[-1])
+        angle_scale = angle_rank**-0.5
+        block_r = _block_r_for_angle_rank(angle_rank)
+        angle_left_bh = _reshape_batch_heads(angle_left)
+        angle_right_bh = _reshape_batch_heads(angle_right)
+        angle_gate_bh = angle_gate.contiguous().view(batch_size * num_heads, num_tokens)
+        dangle_left = torch.zeros_like(angle_left_bh, dtype=torch.float32)
+        dangle_right = torch.zeros_like(angle_right_bh, dtype=torch.float32)
+        dangle_gate = torch.zeros_like(angle_gate_bh, dtype=torch.float32)
+    else:
+        angle_rank = 1
+        angle_scale = 1.0
+        block_r = 16
+        angle_left_bh = angle_right_bh = angle_gate_bh = empty
+        dangle_left = dangle_right = dangle_gate = None
 
     batch_heads = batch_size * num_heads
     num_tiles_j = triton.cdiv(num_tokens, _BLOCK_J)
@@ -666,6 +865,9 @@ def triton_simplicial_attention_backward(
         v_bias_bh,
         w_bh,
         gate_bh,
+        angle_left_bh,
+        angle_right_bh,
+        angle_gate_bh,
         dq,
         dk1,
         dv1,
@@ -675,18 +877,25 @@ def triton_simplicial_attention_backward(
         dv_bias if dv_bias is not None else empty,
         dw if dw is not None else empty,
         dgate if dgate is not None else empty,
+        dangle_left if dangle_left is not None else empty,
+        dangle_right if dangle_right is not None else empty,
+        dangle_gate if dangle_gate is not None else empty,
         num_tokens,
         head_dim,
+        angle_rank,
+        angle_scale,
         num_heads,
         num_tiles_j,
         num_tiles_k,
         HAS_PAIR_VALID=has_pair_valid,
         HAS_BIAS=has_bias,
+        HAS_LOW_RANK_ANGLE=has_low_rank_angle,
         USE_FP32_INPUT=use_fp32_input,
         INPUT_PRECISION=input_precision,
         BLOCK_J=_BLOCK_J,
         BLOCK_K=_BLOCK_K,
         BLOCK_D=block_d,
+        BLOCK_R=block_r,
         num_warps=_num_warps_for_block_d(block_d),
     )
 
@@ -697,12 +906,34 @@ def triton_simplicial_attention_backward(
     dk2_out = dk2.view(reshape).to(k2.dtype)
     dv2_out = dv2.view(reshape).to(v2.dtype)
 
-    if not has_bias:
-        return dq_out, dk1_out, dv1_out, dk2_out, dv2_out, None, None, None, None
+    if has_bias:
+        pair_shape = (batch_size, num_heads, num_tokens, num_tokens)
+        du_out = du.view(pair_shape).to(u.dtype)
+        dv_bias_out = dv_bias.view(pair_shape).to(v_bias.dtype)
+        dw_out = dw.view(pair_shape).to(w.dtype)
+        dgate_out = dgate.view(batch_size, num_heads, num_tokens).to(gate.dtype)
+    else:
+        du_out = dv_bias_out = dw_out = dgate_out = None
 
-    pair_shape = (batch_size, num_heads, num_tokens, num_tokens)
-    du_out = du.view(pair_shape).to(u.dtype)
-    dv_bias_out = dv_bias.view(pair_shape).to(v_bias.dtype)
-    dw_out = dw.view(pair_shape).to(w.dtype)
-    dgate_out = dgate.view(batch_size, num_heads, num_tokens).to(gate.dtype)
-    return dq_out, dk1_out, dv1_out, dk2_out, dv2_out, du_out, dv_bias_out, dw_out, dgate_out
+    if has_low_rank_angle:
+        angle_shape = (batch_size, num_heads, num_tokens, num_tokens, angle_rank)
+        dangle_left_out = dangle_left.view(angle_shape).to(angle_left.dtype)
+        dangle_right_out = dangle_right.view(angle_shape).to(angle_right.dtype)
+        dangle_gate_out = dangle_gate.view(batch_size, num_heads, num_tokens).to(angle_gate.dtype)
+    else:
+        dangle_left_out = dangle_right_out = dangle_gate_out = None
+
+    return (
+        dq_out,
+        dk1_out,
+        dv1_out,
+        dk2_out,
+        dv2_out,
+        du_out,
+        dv_bias_out,
+        dw_out,
+        dgate_out,
+        dangle_left_out,
+        dangle_right_out,
+        dangle_gate_out,
+    )

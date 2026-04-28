@@ -48,6 +48,7 @@ class QM9RegressionModel(nn.Module):
         simplicial_geom_mode: str = "factorized",
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
+        simplicial_angle_rank: int = 16,
         readout_mode: str = "cls",
         mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
@@ -58,9 +59,9 @@ class QM9RegressionModel(nn.Module):
         simplicial_geom_mode = simplicial_geom_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
         readout_mode = readout_mode.lower()
-        if simplicial_geom_mode not in {"none", "factorized", "angle_residual"}:
+        if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
-                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual'}"
+                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
@@ -76,6 +77,7 @@ class QM9RegressionModel(nn.Module):
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
                         mode=simplicial_geom_mode,
+                        angle_residual_rank=simplicial_angle_rank,
                         use_periodic_features=geometry_adapter.geometry_kind == "periodic",
                         use_noise_gate=False,
                     )
@@ -190,6 +192,7 @@ class QM9EDMModel(nn.Module):
         simplicial_geom_mode: str = "factorized",
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
+        simplicial_angle_rank: int = 16,
         mha_geom_bias_mode: str = "standard",
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
@@ -201,9 +204,9 @@ class QM9EDMModel(nn.Module):
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
-        if simplicial_geom_mode not in {"none", "factorized", "angle_residual"}:
+        if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
-                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual'}"
+                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
@@ -217,6 +220,7 @@ class QM9EDMModel(nn.Module):
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
                         mode=simplicial_geom_mode,
+                        angle_residual_rank=simplicial_angle_rank,
                         use_periodic_features=geometry_adapter.geometry_kind == "periodic",
                         use_noise_gate=True,
                     )

@@ -123,6 +123,7 @@ def maybe_configure_wandb(
             "model": {
                 "attn_type": args.attn_type,
                 "simplicial_geom_mode": args.simplicial_geom_mode,
+                "simplicial_angle_rank": args.simplicial_angle_rank,
                 "mha_geom_bias_mode": args.mha_geom_bias_mode,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
@@ -356,6 +357,7 @@ def main(args: argparse.Namespace) -> None:
         simplicial_geom_mode=args.simplicial_geom_mode,
         simplicial_impl=args.simplicial_impl,
         simplicial_precision=args.simplicial_precision,
+        simplicial_angle_rank=args.simplicial_angle_rank,
         mha_geom_bias_mode=args.mha_geom_bias_mode,
         use_geometry_bias=not args.disable_geometry_bias,
     ).to(device)
@@ -849,7 +851,7 @@ if __name__ == "__main__":
         "--simplicial-geom-mode",
         type=str,
         default="factorized",
-        choices=["none", "factorized", "angle_residual"],
+        choices=["none", "factorized", "angle_residual", "angle_low_rank"],
     )
     parser.add_argument(
         "--simplicial-impl",
@@ -857,6 +859,7 @@ if __name__ == "__main__":
         default="auto",
         choices=["auto", "torch", "triton"],
     )
+    parser.add_argument("--simplicial-angle-rank", type=int, default=16)
     parser.add_argument(
         "--simplicial-precision",
         type=str,

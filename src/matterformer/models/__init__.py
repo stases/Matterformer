@@ -1,6 +1,7 @@
 from matterformer.models.attention import (
     SimplicialAttentionMask,
     SimplicialFactorizedBias,
+    SimplicialLowRankAngleResidual,
     TwoSimplicialAttention,
 )
 from matterformer.models.embeddings import (
@@ -39,6 +40,7 @@ __all__ = [
     "SimplicialAttentionMask",
     "SimplicialFactorizedBias",
     "SimplicialGeometryBias",
+    "SimplicialLowRankAngleResidual",
     "TimeEmbedder",
     "TransformerTrunk",
     "TokenEmbedder",

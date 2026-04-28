@@ -16,7 +16,12 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
-from matterformer.models import SimplicialFactorizedBias, SimplicialAttentionMask, TwoSimplicialAttention
+from matterformer.models import (
+    SimplicialAttentionMask,
+    SimplicialFactorizedBias,
+    SimplicialLowRankAngleResidual,
+    TwoSimplicialAttention,
+)
 
 
 BENCHMARK_GRID = (
@@ -90,6 +95,28 @@ def _make_factorized_bias(
     )
 
 
+def _make_low_rank_angle_residual(
+    batch_size: int,
+    n_heads: int,
+    num_tokens: int,
+    rank: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    requires_grad: bool,
+) -> SimplicialLowRankAngleResidual:
+    kwargs = {
+        "device": device,
+        "dtype": dtype,
+        "requires_grad": requires_grad,
+    }
+    return SimplicialLowRankAngleResidual(
+        left=torch.randn(batch_size, n_heads, num_tokens, num_tokens, rank, **kwargs),
+        right=torch.randn(batch_size, n_heads, num_tokens, num_tokens, rank, **kwargs),
+        gate=torch.randn(batch_size, n_heads, num_tokens, **kwargs),
+    )
+
+
 def _make_inputs(
     *,
     batch_size: int,
@@ -100,14 +127,30 @@ def _make_inputs(
     dtype: torch.dtype,
     device: torch.device,
     requires_grad: bool,
-) -> tuple[torch.Tensor, SimplicialFactorizedBias | None, SimplicialAttentionMask]:
+) -> tuple[
+    torch.Tensor,
+    SimplicialFactorizedBias | None,
+    SimplicialLowRankAngleResidual | None,
+    SimplicialAttentionMask,
+]:
     x = torch.randn(batch_size, tokens, d_model, device=device, dtype=dtype, requires_grad=requires_grad)
     factorized_bias = None
+    angle_residual = None
     if mode == "factorized":
         factorized_bias = _make_factorized_bias(
             batch_size,
             n_heads,
             tokens,
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+    elif mode == "angle_low_rank":
+        angle_residual = _make_low_rank_angle_residual(
+            batch_size,
+            n_heads,
+            tokens,
+            16,
             device=device,
             dtype=dtype,
             requires_grad=requires_grad,
@@ -118,7 +161,7 @@ def _make_inputs(
         num_tokens=tokens,
         device=device,
     )
-    return x, factorized_bias, attention_mask
+    return x, factorized_bias, angle_residual, attention_mask
 
 
 def _run_single_case(
@@ -151,7 +194,7 @@ def _run_single_case(
 
     def run_once() -> None:
         requires_grad = pass_type == "train_step"
-        x, factorized_bias, attention_mask = _make_inputs(
+        x, factorized_bias, angle_residual, attention_mask = _make_inputs(
             batch_size=batch_size,
             tokens=tokens,
             d_model=d_model,
@@ -164,9 +207,19 @@ def _run_single_case(
         attn.zero_grad(set_to_none=True)
         if pass_type == "forward":
             with torch.no_grad():
-                _ = attn(x, attention_mask=attention_mask, factorized_bias=factorized_bias)
+                _ = attn(
+                    x,
+                    attention_mask=attention_mask,
+                    factorized_bias=factorized_bias,
+                    angle_residual=angle_residual,
+                )
             return
-        out = attn(x, attention_mask=attention_mask, factorized_bias=factorized_bias)
+        out = attn(
+            x,
+            attention_mask=attention_mask,
+            factorized_bias=factorized_bias,
+            angle_residual=angle_residual,
+        )
         loss = out.square().mean()
         loss.backward()
 
@@ -224,7 +277,12 @@ def _format_table(results: list[BenchmarkResult]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark dense simplicial attention backends")
     parser.add_argument("--impls", nargs="+", default=["torch", "triton"], choices=["auto", "torch", "triton"])
-    parser.add_argument("--modes", nargs="+", default=["none", "factorized"], choices=["none", "factorized"])
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=["none", "factorized"],
+        choices=["none", "factorized", "angle_low_rank"],
+    )
     parser.add_argument("--precisions", nargs="+", default=["bf16_tc"], choices=["bf16_tc", "tf32", "ieee_fp32"])
     parser.add_argument("--passes", nargs="+", default=["forward", "train_step"], choices=["forward", "train_step"])
     parser.add_argument("--dtype", type=str, default="bfloat16")

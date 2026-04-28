@@ -37,6 +37,7 @@ def main(args: argparse.Namespace) -> None:
         attn_dropout=float(model_args.get("attn_dropout", 0.0)),
         attn_type=str(model_args.get("attn_type", "mha")),
         simplicial_geom_mode=str(model_args.get("simplicial_geom_mode", "factorized")),
+        simplicial_angle_rank=int(model_args.get("simplicial_angle_rank", 16)),
         simplicial_impl=args.simplicial_impl or str(model_args.get("simplicial_impl", "auto")),
         simplicial_precision=args.simplicial_precision
         or str(model_args.get("simplicial_precision", "ieee_fp32")),

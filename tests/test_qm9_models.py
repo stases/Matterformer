@@ -41,7 +41,7 @@ def _dummy_batch() -> QM9Batch:
     )
 
 
-@pytest.mark.parametrize("simplicial_geom_mode", ["none", "factorized", "angle_residual"])
+@pytest.mark.parametrize("simplicial_geom_mode", ["none", "factorized", "angle_residual", "angle_low_rank"])
 def test_qm9_regression_model_forward_backward(simplicial_geom_mode):
     torch.manual_seed(0)
     batch = _dummy_batch()

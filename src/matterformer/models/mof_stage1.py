@@ -39,6 +39,7 @@ class MOFStage1EDMModel(nn.Module):
         simplicial_geom_mode: str = "factorized",
         simplicial_impl: str = "auto",
         simplicial_precision: str = "bf16_tc",
+        simplicial_angle_rank: int = 16,
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
         lattice_repr: str = "ltri",
@@ -57,9 +58,9 @@ class MOFStage1EDMModel(nn.Module):
             lattice_repr=lattice_repr,
         )
         simplicial_geom_mode = simplicial_geom_mode.lower()
-        if simplicial_geom_mode not in {"none", "factorized", "angle_residual"}:
+        if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
-                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual'}"
+                "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
         geometry_bias = None
         simplicial_geometry_bias = None
@@ -69,6 +70,7 @@ class MOFStage1EDMModel(nn.Module):
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
                         mode=simplicial_geom_mode,
+                        angle_residual_rank=simplicial_angle_rank,
                         use_periodic_features=True,
                         use_noise_gate=True,
                     )
