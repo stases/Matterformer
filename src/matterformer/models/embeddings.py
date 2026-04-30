@@ -54,8 +54,10 @@ class FourierCoordEmbedder(nn.Module):
         rff_sigma: float = 1.0,
     ) -> None:
         super().__init__()
-        self.mode = mode.lower()
-        if self.mode not in {"fourier", "rff"}:
+        self.mode = mode.lower().replace("-", "_")
+        if self.mode in {"learned_rff", "fieldformer_rff"}:
+            self.mode = "learnable_rff"
+        if self.mode not in {"fourier", "rff", "learnable_rff"}:
             raise ValueError(f"Unsupported coord embed mode: {mode}")
 
         if self.mode == "fourier":
@@ -66,13 +68,20 @@ class FourierCoordEmbedder(nn.Module):
                 persistent=False,
             )
             in_dim = 6 * self.n_freqs
-        else:
+        elif self.mode == "rff":
             self.n_rff = int(rff_dim) if rff_dim is not None else int(n_freqs)
             self.register_buffer(
                 "proj",
                 torch.randn(3, self.n_rff) * float(rff_sigma),
                 persistent=False,
             )
+            in_dim = 2 * self.n_rff
+        else:
+            self.n_rff = int(rff_dim) if rff_dim is not None else int(n_freqs)
+            if self.n_rff <= 0:
+                raise ValueError("rff_dim/n_freqs must be positive for learnable_rff")
+            sigma = max(float(rff_sigma), 1e-8)
+            self.proj = nn.Parameter(torch.randn(3, self.n_rff) / sigma)
             in_dim = 2 * self.n_rff
 
         self.mlp = nn.Sequential(
@@ -90,8 +99,12 @@ class FourierCoordEmbedder(nn.Module):
             feats = feats.reshape(coords.shape[0], coords.shape[1], -1)
         else:
             proj = coords @ self.proj
-            args = 2.0 * math.pi * proj
-            feats = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+            if self.mode == "rff":
+                args = 2.0 * math.pi * proj
+                feats = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+            else:
+                feats = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+                feats = feats * math.sqrt(2.0 / feats.shape[-1])
         return self.mlp(feats)
 
 

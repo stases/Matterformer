@@ -7,7 +7,7 @@ import torch
 from matterformer.data import QM9_DATASET_INFO
 from matterformer.evaluators.qm9.bonds import check_stability
 from matterformer.evaluators.qm9.rdkit import BasicMolecularMetrics, Chem
-from matterformer.tasks import decode_atom_types, edm_sampler
+from matterformer.tasks import decode_atom_types, decode_qm9_charges, edm_sampler
 
 
 def has_rdkit() -> bool:
@@ -28,13 +28,15 @@ def sample_qm9_molecules(
     num_molecules: int,
     sample_batch_size: int,
     sampler_kwargs: dict[str, float | int],
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
+) -> list[tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     if num_molecules <= 0:
         return []
     sample_batch_size = max(int(sample_batch_size), 1)
-    generated: list[tuple[torch.Tensor, torch.Tensor]] = []
+    generated: list[tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     remaining = int(num_molecules)
     net.eval()
+    model_channels = int(getattr(net.model, "atom_channels", 5))
+    charge_feature_scale = float(getattr(net.model, "charge_feature_scale", 8.0))
     with torch.no_grad():
         while remaining > 0:
             batch_size = min(sample_batch_size, remaining)
@@ -42,31 +44,42 @@ def sample_qm9_molecules(
             atom_features, coords, pad_mask = edm_sampler(
                 net,
                 num_atoms,
+                atom_channels=model_channels,
                 **sampler_kwargs,
             )
             atom_types = decode_atom_types(atom_features, pad_mask)
+            charges = decode_qm9_charges(
+                atom_features,
+                pad_mask,
+                charge_feature_scale=charge_feature_scale,
+            )
             for batch_idx in range(batch_size):
                 count = int(num_atoms[batch_idx].item())
-                generated.append(
-                    (
-                        coords[batch_idx, :count].detach().cpu(),
-                        atom_types[batch_idx, :count].detach().cpu(),
-                    )
+                molecule = (
+                    coords[batch_idx, :count].detach().cpu(),
+                    atom_types[batch_idx, :count].detach().cpu(),
                 )
+                if model_channels > 5:
+                    molecule = (
+                        molecule[0],
+                        molecule[1],
+                        charges[batch_idx, :count].detach().cpu(),
+                    )
+                generated.append(molecule)
             remaining -= batch_size
     return generated
 
 
 def evaluate_generated_qm9(
-    generated: list[tuple[torch.Tensor, torch.Tensor]],
+    generated: list[tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     *,
     rdkit_metrics: BasicMolecularMetrics | None = None,
 ) -> dict[str, float]:
     stable_molecules = 0
     stable_atoms = 0
     total_atoms = 0
-    for positions, atom_types in generated:
-        molecule_stable, num_stable_atoms, num_atoms = check_stability(positions, atom_types)
+    for molecule in generated:
+        molecule_stable, num_stable_atoms, num_atoms = check_stability(*molecule)
         stable_molecules += int(molecule_stable)
         stable_atoms += int(num_stable_atoms)
         total_atoms += int(num_atoms)

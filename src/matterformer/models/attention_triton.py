@@ -382,6 +382,16 @@ if TRITON_AVAILABLE:
         HAS_BIAS: tl.constexpr,
         HAS_LOW_RANK_ANGLE: tl.constexpr,
         HAS_LOW_RANK_MESSAGE: tl.constexpr,
+        COMPUTE_DU: tl.constexpr,
+        COMPUTE_DV_BIAS: tl.constexpr,
+        COMPUTE_DW: tl.constexpr,
+        COMPUTE_DGATE: tl.constexpr,
+        COMPUTE_DANGLE_LEFT: tl.constexpr,
+        COMPUTE_DANGLE_RIGHT: tl.constexpr,
+        COMPUTE_DANGLE_GATE: tl.constexpr,
+        COMPUTE_DMESSAGE_LEFT: tl.constexpr,
+        COMPUTE_DMESSAGE_RIGHT: tl.constexpr,
+        COMPUTE_DMESSAGE_BASIS: tl.constexpr,
         USE_FP32_INPUT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         BLOCK_J: tl.constexpr,
@@ -400,9 +410,9 @@ if TRITON_AVAILABLE:
         dq_row_ptr = dq_ptr + (bh_idx * num_tokens + q_idx) * head_dim + offs_d
         if not q_is_valid:
             tl.store(dq_row_ptr, 0.0, mask=offs_d < head_dim)
-            if HAS_BIAS:
+            if COMPUTE_DGATE:
                 tl.store(dgate_ptr + bh_idx * num_tokens + q_idx, 0.0)
-            if HAS_LOW_RANK_ANGLE:
+            if COMPUTE_DANGLE_GATE:
                 tl.store(dangle_gate_ptr + bh_idx * num_tokens + q_idx, 0.0)
             return
 
@@ -468,7 +478,8 @@ if TRITON_AVAILABLE:
             else:
                 k1_score = k1_raw
 
-            du_running = tl.zeros((BLOCK_J,), dtype=tl.float32)
+            if COMPUTE_DU:
+                du_running = tl.zeros((BLOCK_J,), dtype=tl.float32)
             if HAS_BIAS:
                 u = tl.load(
                     u_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_j,
@@ -488,7 +499,8 @@ if TRITON_AVAILABLE:
                     angle_left_score = angle_left_32
                 else:
                     angle_left_score = angle_left_raw
-                dangle_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
+                if COMPUTE_DANGLE_LEFT:
+                    dangle_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
                 angle_gate = tl.load(angle_gate_ptr + bh_idx * num_tokens + q_idx).to(tl.float32)
             if HAS_LOW_RANK_MESSAGE:
                 message_left_32 = tl.load(
@@ -497,7 +509,8 @@ if TRITON_AVAILABLE:
                     mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
                     other=0.0,
                 ).to(tl.float32)
-                dmessage_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
+                if COMPUTE_DMESSAGE_LEFT:
+                    dmessage_left_running = tl.zeros((BLOCK_J, BLOCK_R), dtype=tl.float32)
 
             for tile_k in range(0, num_tiles_k):
                 offs_k = tile_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -652,52 +665,59 @@ if TRITON_AVAILABLE:
                     if HAS_BIAS:
                         dsum_k = tl.sum(dscores, axis=1)
                         dsum_j = tl.sum(dscores, axis=0)
-                        du_running += gate * dsum_k
+                        if COMPUTE_DU:
+                            du_running += gate * dsum_k
 
-                        dv_bias_row_ptr = dv_bias_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_k
-                        dv_bias_prev = tl.load(dv_bias_row_ptr, mask=offs_k < num_tokens, other=0.0)
-                        tl.store(
-                            dv_bias_row_ptr,
-                            dv_bias_prev + gate * dsum_j,
-                            mask=offs_k < num_tokens,
-                        )
+                        if COMPUTE_DV_BIAS:
+                            dv_bias_row_ptr = dv_bias_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_k
+                            dv_bias_prev = tl.load(dv_bias_row_ptr, mask=offs_k < num_tokens, other=0.0)
+                            tl.store(
+                                dv_bias_row_ptr,
+                                dv_bias_prev + gate * dsum_j,
+                                mask=offs_k < num_tokens,
+                            )
 
-                        tl.atomic_add(
-                            dw_ptr + ((bh_idx * num_tokens + offs_j[:, None]) * num_tokens + offs_k[None, :]),
-                            gate * dscores,
-                            mask=(offs_j[:, None] < num_tokens) & (offs_k[None, :] < num_tokens),
-                        )
-                        dgate_acc += tl.sum(tl.sum(dscores * bias_base, axis=1), axis=0)
+                        if COMPUTE_DW:
+                            tl.atomic_add(
+                                dw_ptr + ((bh_idx * num_tokens + offs_j[:, None]) * num_tokens + offs_k[None, :]),
+                                gate * dscores,
+                                mask=(offs_j[:, None] < num_tokens) & (offs_k[None, :] < num_tokens),
+                            )
+                        if COMPUTE_DGATE:
+                            dgate_acc += tl.sum(tl.sum(dscores * bias_base, axis=1), axis=0)
 
                     if HAS_LOW_RANK_ANGLE:
                         angle_grad_scale = angle_gate * angle_scale
-                        dangle_left_running += angle_grad_scale * tl.dot(
-                            dscores,
-                            angle_right_32,
-                            out_dtype=tl.float32,
-                            input_precision="ieee",
-                        )
-                        dangle_right_tile = angle_grad_scale * tl.dot(
-                            tl.trans(dscores),
-                            angle_left_32,
-                            out_dtype=tl.float32,
-                            input_precision="ieee",
-                        )
-                        dangle_right_tile_ptr = (
-                            dangle_right_ptr
-                            + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * angle_rank + offs_r[None, :])
-                        )
-                        dangle_right_prev = tl.load(
-                            dangle_right_tile_ptr,
-                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
-                            other=0.0,
-                        )
-                        tl.store(
-                            dangle_right_tile_ptr,
-                            dangle_right_prev + dangle_right_tile,
-                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
-                        )
-                        dangle_gate_acc += tl.sum(tl.sum(dscores * angle * angle_scale, axis=1), axis=0)
+                        if COMPUTE_DANGLE_LEFT:
+                            dangle_left_running += angle_grad_scale * tl.dot(
+                                dscores,
+                                angle_right_32,
+                                out_dtype=tl.float32,
+                                input_precision="ieee",
+                            )
+                        if COMPUTE_DANGLE_RIGHT:
+                            dangle_right_tile = angle_grad_scale * tl.dot(
+                                tl.trans(dscores),
+                                angle_left_32,
+                                out_dtype=tl.float32,
+                                input_precision="ieee",
+                            )
+                            dangle_right_tile_ptr = (
+                                dangle_right_ptr
+                                + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * angle_rank + offs_r[None, :])
+                            )
+                            dangle_right_prev = tl.load(
+                                dangle_right_tile_ptr,
+                                mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                                other=0.0,
+                            )
+                            tl.store(
+                                dangle_right_tile_ptr,
+                                dangle_right_prev + dangle_right_tile,
+                                mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
+                            )
+                        if COMPUTE_DANGLE_GATE:
+                            dangle_gate_acc += tl.sum(tl.sum(dscores * angle * angle_scale, axis=1), axis=0)
 
                     if HAS_LOW_RANK_MESSAGE:
                         message_tmp_right = tl.dot(
@@ -712,45 +732,48 @@ if TRITON_AVAILABLE:
                             out_dtype=tl.float32,
                             input_precision="ieee",
                         )
-                        dmessage_left_running += message_scale * message_tmp_right * message_basis_go[None, :]
-                        dmessage_right_tile = message_scale * message_tmp_left * message_basis_go[None, :]
-                        dmessage_right_tile_ptr = (
-                            dmessage_right_ptr
-                            + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * message_rank + offs_r[None, :])
-                        )
-                        dmessage_right_prev = tl.load(
-                            dmessage_right_tile_ptr,
-                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
-                            other=0.0,
-                        )
-                        tl.store(
-                            dmessage_right_tile_ptr,
-                            dmessage_right_prev + dmessage_right_tile,
-                            mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
-                        )
-                        message_coeff = tl.sum(message_tmp_left * message_right_32, axis=0)
-                        tl.atomic_add(
-                            dmessage_basis_ptr
-                            + (head_idx * message_rank + offs_r[:, None]) * head_dim
-                            + offs_d[None, :],
-                            message_scale * message_coeff[:, None] * go[None, :],
-                            mask=(offs_r[:, None] < message_rank) & (offs_d[None, :] < head_dim),
-                        )
+                        if COMPUTE_DMESSAGE_LEFT:
+                            dmessage_left_running += message_scale * message_tmp_right * message_basis_go[None, :]
+                        if COMPUTE_DMESSAGE_RIGHT:
+                            dmessage_right_tile = message_scale * message_tmp_left * message_basis_go[None, :]
+                            dmessage_right_tile_ptr = (
+                                dmessage_right_ptr
+                                + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_k[:, None]) * message_rank + offs_r[None, :])
+                            )
+                            dmessage_right_prev = tl.load(
+                                dmessage_right_tile_ptr,
+                                mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                                other=0.0,
+                            )
+                            tl.store(
+                                dmessage_right_tile_ptr,
+                                dmessage_right_prev + dmessage_right_tile,
+                                mask=(offs_k[:, None] < num_tokens) & (offs_r[None, :] < message_rank),
+                            )
+                        if COMPUTE_DMESSAGE_BASIS:
+                            message_coeff = tl.sum(message_tmp_left * message_right_32, axis=0)
+                            tl.atomic_add(
+                                dmessage_basis_ptr
+                                + (head_idx * message_rank + offs_r[:, None]) * head_dim
+                                + offs_d[None, :],
+                                message_scale * message_coeff[:, None] * go[None, :],
+                                mask=(offs_r[:, None] < message_rank) & (offs_d[None, :] < head_dim),
+                            )
 
-            if HAS_BIAS:
+            if COMPUTE_DU:
                 tl.store(
                     du_ptr + (bh_idx * num_tokens + q_idx) * num_tokens + offs_j,
                     du_running,
                     mask=offs_j < num_tokens,
                 )
-            if HAS_LOW_RANK_ANGLE:
+            if COMPUTE_DANGLE_LEFT:
                 tl.store(
                     dangle_left_ptr
                     + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * angle_rank + offs_r[None, :]),
                     dangle_left_running,
                     mask=(offs_j[:, None] < num_tokens) & (offs_r[None, :] < angle_rank),
                 )
-            if HAS_LOW_RANK_MESSAGE:
+            if COMPUTE_DMESSAGE_LEFT:
                 tl.store(
                     dmessage_left_ptr
                     + (((bh_idx * num_tokens + q_idx) * num_tokens + offs_j[:, None]) * message_rank + offs_r[None, :]),
@@ -759,9 +782,9 @@ if TRITON_AVAILABLE:
                 )
 
         tl.store(dq_row_ptr, dq_acc, mask=offs_d < head_dim)
-        if HAS_BIAS:
+        if COMPUTE_DGATE:
             tl.store(dgate_ptr + bh_idx * num_tokens + q_idx, dgate_acc)
-        if HAS_LOW_RANK_ANGLE:
+        if COMPUTE_DANGLE_GATE:
             tl.store(dangle_gate_ptr + bh_idx * num_tokens + q_idx, dangle_gate_acc)
 
 
@@ -933,6 +956,16 @@ def triton_simplicial_attention_backward(
     message_right: torch.Tensor | None,
     message_basis: torch.Tensor | None,
     precision: str,
+    need_du: bool = True,
+    need_dv_bias: bool = True,
+    need_dw: bool = True,
+    need_dgate: bool = True,
+    need_dangle_left: bool = True,
+    need_dangle_right: bool = True,
+    need_dangle_gate: bool = True,
+    need_dmessage_left: bool = True,
+    need_dmessage_right: bool = True,
+    need_dmessage_basis: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -978,20 +1011,27 @@ def triton_simplicial_attention_backward(
     pair_valid_tensor = pair_valid.contiguous() if has_pair_valid else torch.empty(0, device=q.device, dtype=torch.bool)
     has_bias = u is not None and v_bias is not None and w is not None and gate is not None
     empty = q_bh.new_empty(0, dtype=torch.float32)
+    compute_du = bool(has_bias and need_du)
+    compute_dv_bias = bool(has_bias and need_dv_bias)
+    compute_dw = bool(has_bias and need_dw)
+    compute_dgate = bool(has_bias and need_dgate)
     if has_bias:
         u_bh = _reshape_batch_heads(u)
         v_bias_bh = _reshape_batch_heads(v_bias)
         w_bh = _reshape_batch_heads(w)
         gate_bh = gate.contiguous().view(batch_size * num_heads, num_tokens)
-        du = torch.zeros_like(u_bh, dtype=torch.float32)
-        dv_bias = torch.zeros_like(v_bias_bh, dtype=torch.float32)
-        dw = torch.zeros_like(w_bh, dtype=torch.float32)
-        dgate = torch.zeros_like(gate_bh, dtype=torch.float32)
+        du = torch.zeros_like(u_bh, dtype=torch.float32) if compute_du else None
+        dv_bias = torch.zeros_like(v_bias_bh, dtype=torch.float32) if compute_dv_bias else None
+        dw = torch.zeros_like(w_bh, dtype=torch.float32) if compute_dw else None
+        dgate = torch.zeros_like(gate_bh, dtype=torch.float32) if compute_dgate else None
     else:
         u_bh = v_bias_bh = w_bh = gate_bh = empty
         du = dv_bias = dw = dgate = None
 
     has_low_rank_angle = angle_left is not None and angle_right is not None and angle_gate is not None
+    compute_dangle_left = bool(has_low_rank_angle and need_dangle_left)
+    compute_dangle_right = bool(has_low_rank_angle and need_dangle_right)
+    compute_dangle_gate = bool(has_low_rank_angle and need_dangle_gate)
     if has_low_rank_angle:
         if angle_left.shape != angle_right.shape:
             raise ValueError(f"angle_left and angle_right must have the same shape, got {angle_left.shape} and {angle_right.shape}")
@@ -1000,9 +1040,9 @@ def triton_simplicial_attention_backward(
         angle_left_bh = _reshape_batch_heads(angle_left)
         angle_right_bh = _reshape_batch_heads(angle_right)
         angle_gate_bh = angle_gate.contiguous().view(batch_size * num_heads, num_tokens)
-        dangle_left = torch.zeros_like(angle_left_bh, dtype=torch.float32)
-        dangle_right = torch.zeros_like(angle_right_bh, dtype=torch.float32)
-        dangle_gate = torch.zeros_like(angle_gate_bh, dtype=torch.float32)
+        dangle_left = torch.zeros_like(angle_left_bh, dtype=torch.float32) if compute_dangle_left else None
+        dangle_right = torch.zeros_like(angle_right_bh, dtype=torch.float32) if compute_dangle_right else None
+        dangle_gate = torch.zeros_like(angle_gate_bh, dtype=torch.float32) if compute_dangle_gate else None
     else:
         angle_rank = 1
         angle_scale = 1.0
@@ -1010,6 +1050,9 @@ def triton_simplicial_attention_backward(
         dangle_left = dangle_right = dangle_gate = None
 
     has_low_rank_message = message_left is not None and message_right is not None and message_basis is not None
+    compute_dmessage_left = bool(has_low_rank_message and need_dmessage_left)
+    compute_dmessage_right = bool(has_low_rank_message and need_dmessage_right)
+    compute_dmessage_basis = bool(has_low_rank_message and need_dmessage_basis)
     if has_low_rank_message:
         if message_left.shape != message_right.shape:
             raise ValueError(
@@ -1024,9 +1067,9 @@ def triton_simplicial_attention_backward(
         message_left_bh = _reshape_batch_heads(message_left)
         message_right_bh = _reshape_batch_heads(message_right)
         message_basis_h = message_basis.contiguous()
-        dmessage_left = torch.zeros_like(message_left_bh, dtype=torch.float32)
-        dmessage_right = torch.zeros_like(message_right_bh, dtype=torch.float32)
-        dmessage_basis = torch.zeros_like(message_basis_h, dtype=torch.float32)
+        dmessage_left = torch.zeros_like(message_left_bh, dtype=torch.float32) if compute_dmessage_left else None
+        dmessage_right = torch.zeros_like(message_right_bh, dtype=torch.float32) if compute_dmessage_right else None
+        dmessage_basis = torch.zeros_like(message_basis_h, dtype=torch.float32) if compute_dmessage_basis else None
     else:
         message_rank = 1
         message_scale = 1.0
@@ -1089,6 +1132,16 @@ def triton_simplicial_attention_backward(
         HAS_BIAS=has_bias,
         HAS_LOW_RANK_ANGLE=has_low_rank_angle,
         HAS_LOW_RANK_MESSAGE=has_low_rank_message,
+        COMPUTE_DU=compute_du,
+        COMPUTE_DV_BIAS=compute_dv_bias,
+        COMPUTE_DW=compute_dw,
+        COMPUTE_DGATE=compute_dgate,
+        COMPUTE_DANGLE_LEFT=compute_dangle_left,
+        COMPUTE_DANGLE_RIGHT=compute_dangle_right,
+        COMPUTE_DANGLE_GATE=compute_dangle_gate,
+        COMPUTE_DMESSAGE_LEFT=compute_dmessage_left,
+        COMPUTE_DMESSAGE_RIGHT=compute_dmessage_right,
+        COMPUTE_DMESSAGE_BASIS=compute_dmessage_basis,
         USE_FP32_INPUT=use_fp32_input,
         INPUT_PRECISION=input_precision,
         BLOCK_J=_BLOCK_J,
@@ -1107,26 +1160,34 @@ def triton_simplicial_attention_backward(
 
     if has_bias:
         pair_shape = (batch_size, num_heads, num_tokens, num_tokens)
-        du_out = du.view(pair_shape).to(u.dtype)
-        dv_bias_out = dv_bias.view(pair_shape).to(v_bias.dtype)
-        dw_out = dw.view(pair_shape).to(w.dtype)
-        dgate_out = dgate.view(batch_size, num_heads, num_tokens).to(gate.dtype)
+        du_out = du.view(pair_shape).to(u.dtype) if du is not None else None
+        dv_bias_out = dv_bias.view(pair_shape).to(v_bias.dtype) if dv_bias is not None else None
+        dw_out = dw.view(pair_shape).to(w.dtype) if dw is not None else None
+        dgate_out = dgate.view(batch_size, num_heads, num_tokens).to(gate.dtype) if dgate is not None else None
     else:
         du_out = dv_bias_out = dw_out = dgate_out = None
 
     if has_low_rank_angle:
         angle_shape = (batch_size, num_heads, num_tokens, num_tokens, angle_rank)
-        dangle_left_out = dangle_left.view(angle_shape).to(angle_left.dtype)
-        dangle_right_out = dangle_right.view(angle_shape).to(angle_right.dtype)
-        dangle_gate_out = dangle_gate.view(batch_size, num_heads, num_tokens).to(angle_gate.dtype)
+        dangle_left_out = dangle_left.view(angle_shape).to(angle_left.dtype) if dangle_left is not None else None
+        dangle_right_out = dangle_right.view(angle_shape).to(angle_right.dtype) if dangle_right is not None else None
+        dangle_gate_out = (
+            dangle_gate.view(batch_size, num_heads, num_tokens).to(angle_gate.dtype)
+            if dangle_gate is not None
+            else None
+        )
     else:
         dangle_left_out = dangle_right_out = dangle_gate_out = None
 
     if has_low_rank_message:
         message_shape = (batch_size, num_heads, num_tokens, num_tokens, message_rank)
-        dmessage_left_out = dmessage_left.view(message_shape).to(message_left.dtype)
-        dmessage_right_out = dmessage_right.view(message_shape).to(message_right.dtype)
-        dmessage_basis_out = dmessage_basis.to(message_basis.dtype)
+        dmessage_left_out = dmessage_left.view(message_shape).to(message_left.dtype) if dmessage_left is not None else None
+        dmessage_right_out = (
+            dmessage_right.view(message_shape).to(message_right.dtype)
+            if dmessage_right is not None
+            else None
+        )
+        dmessage_basis_out = dmessage_basis.to(message_basis.dtype) if dmessage_basis is not None else None
     else:
         dmessage_left_out = dmessage_right_out = dmessage_basis_out = None
 

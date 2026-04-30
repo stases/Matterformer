@@ -34,10 +34,11 @@ class BasicMolecularMetrics:
         self.atom_decoder = dataset_info["atom_decoder"]
         self.dataset_smiles_list = dataset_smiles_list
 
-    def compute_validity(self, generated: list[tuple[torch.Tensor, torch.Tensor]]):
+    def compute_validity(self, generated: list[tuple[torch.Tensor, ...]]):
         _require_rdkit()
         valid_smiles: list[str] = []
-        for positions, atom_types in generated:
+        for molecule_data in generated:
+            positions, atom_types = molecule_data[:2]
             molecule = build_molecule(positions, atom_types, self.dataset_info)
             smiles = mol_to_smiles(molecule)
             if smiles is None:
@@ -63,7 +64,7 @@ class BasicMolecularMetrics:
         novelty = len(novel) / max(len(unique_smiles), 1)
         return novel, novelty
 
-    def evaluate(self, generated: list[tuple[torch.Tensor, torch.Tensor]]):
+    def evaluate(self, generated: list[tuple[torch.Tensor, ...]]):
         valid, validity = self.compute_validity(generated)
         if not valid:
             return [0.0, 0.0, 0.0], []

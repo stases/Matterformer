@@ -50,6 +50,9 @@ class MOFStage1EDMModel(nn.Module):
         coord_n_freqs: int = 32,
         coord_rff_dim: int | None = None,
         coord_rff_sigma: float = 1.0,
+        mha_position_mode: str = "none",
+        mha_rope_freq_sigma: float = 1.0,
+        mha_rope_learned_freqs: bool = False,
         lattice_embed_mode: str = "rff",
         lattice_rff_dim: int = 256,
         lattice_rff_sigma: float = 5.0,
@@ -61,12 +64,33 @@ class MOFStage1EDMModel(nn.Module):
         )
         simplicial_geom_mode = simplicial_geom_mode.lower()
         simplicial_message_mode = simplicial_message_mode.lower()
+        coord_embed_mode = coord_embed_mode.lower().replace("-", "_")
+        mha_position_mode = mha_position_mode.lower().replace("-", "_")
+        if coord_embed_mode in {"disabled", "off", "false", "no"}:
+            coord_embed_mode = "none"
+        if coord_embed_mode in {"rope", "mha_rope", "rotary"}:
+            coord_embed_mode = "none"
+            mha_position_mode = "rope"
+        if coord_embed_mode in {"learned_rff", "fieldformer_rff"}:
+            coord_embed_mode = "learnable_rff"
+        if mha_position_mode in {"disabled", "off", "false", "no"}:
+            mha_position_mode = "none"
+        if mha_position_mode in {"rotary", "mha_rope", "rotary_position_embedding"}:
+            mha_position_mode = "rope"
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
             )
         if simplicial_message_mode not in {"none", "low_rank"}:
             raise ValueError("simplicial_message_mode must be one of {'none', 'low_rank'}")
+        if coord_embed_mode not in {"none", "fourier", "rff", "learnable_rff"}:
+            raise ValueError(
+                "coord_embed_mode must be one of {'none', 'fourier', 'rff', 'learnable_rff'}"
+            )
+        if mha_position_mode not in {"none", "rope"}:
+            raise ValueError("mha_position_mode must be one of {'none', 'rope'}")
+        if mha_position_mode == "rope" and attn_type.lower() != "mha":
+            raise ValueError("mha_position_mode='rope' requires attn_type='mha'")
         geometry_bias = None
         simplicial_geometry_bias = None
         effective_message_mode = (
@@ -106,12 +130,18 @@ class MOFStage1EDMModel(nn.Module):
             d_model,
             padding_idx=self.block_pad_token,
         )
-        self.coord_embedding = FourierCoordEmbedder(
-            d_model=d_model,
-            n_freqs=coord_n_freqs,
-            mode=coord_embed_mode,
-            rff_dim=coord_rff_dim,
-            rff_sigma=coord_rff_sigma,
+        self.coord_embed_mode = coord_embed_mode
+        self.mha_position_mode = mha_position_mode
+        self.coord_embedding = (
+            FourierCoordEmbedder(
+                d_model=d_model,
+                n_freqs=coord_n_freqs,
+                mode=coord_embed_mode,
+                rff_dim=coord_rff_dim,
+                rff_sigma=coord_rff_sigma,
+            )
+            if coord_embed_mode != "none"
+            else None
         )
         self.lattice_embedding = LatticeEmbedder(
             d_model=d_model,
@@ -136,6 +166,9 @@ class MOFStage1EDMModel(nn.Module):
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
+            mha_position_mode=mha_position_mode,
+            mha_rope_freq_sigma=mha_rope_freq_sigma,
+            mha_rope_learned_freqs=mha_rope_learned_freqs,
         )
         self.coord_head = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -178,9 +211,10 @@ class MOFStage1EDMModel(nn.Module):
         block_tokens = (
             self.block_feature_proj(block_features)
             + self.block_type_embedding(block_type_ids.clamp(min=0, max=self.block_pad_token))
-            + self.coord_embedding(coords_wrapped)
             + self.segment_embedding.weight[0]
         )
+        if self.coord_embedding is not None:
+            block_tokens = block_tokens + self.coord_embedding(coords_wrapped)
         block_tokens = block_tokens.masked_fill(pad_mask[..., None], 0.0)
         lattice_token = lattice_features[:, None, :] + self.segment_embedding.weight[1]
         token_features = torch.cat([block_tokens, lattice_token], dim=1)

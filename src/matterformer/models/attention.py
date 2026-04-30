@@ -637,6 +637,17 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
                 None,
             )
 
+        need_du = bool(ctx.has_factorized_bias and ctx.needs_input_grad[8])
+        need_dv_bias = bool(ctx.has_factorized_bias and ctx.needs_input_grad[9])
+        need_dw = bool(ctx.has_factorized_bias and ctx.needs_input_grad[10])
+        need_dgate = bool(ctx.has_factorized_bias and ctx.needs_input_grad[11])
+        need_dangle_left = bool(ctx.has_low_rank_angle and ctx.needs_input_grad[12])
+        need_dangle_right = bool(ctx.has_low_rank_angle and ctx.needs_input_grad[13])
+        need_dangle_gate = bool(ctx.has_low_rank_angle and ctx.needs_input_grad[14])
+        need_dmessage_left = bool(ctx.has_low_rank_message and ctx.needs_input_grad[15])
+        need_dmessage_right = bool(ctx.has_low_rank_message and ctx.needs_input_grad[16])
+        need_dmessage_basis = bool(ctx.has_low_rank_message and ctx.needs_input_grad[17])
+
         (
             dq,
             dk1,
@@ -676,6 +687,16 @@ class _TritonTwoSimplicialAttentionFunction(torch.autograd.Function):
             message_right=message_right if ctx.has_low_rank_message else None,
             message_basis=message_basis if ctx.has_low_rank_message else None,
             precision=ctx.precision_mode,
+            need_du=need_du,
+            need_dv_bias=need_dv_bias,
+            need_dw=need_dw,
+            need_dgate=need_dgate,
+            need_dangle_left=need_dangle_left,
+            need_dangle_right=need_dangle_right,
+            need_dangle_gate=need_dangle_gate,
+            need_dmessage_left=need_dmessage_left,
+            need_dmessage_right=need_dmessage_right,
+            need_dmessage_basis=need_dmessage_basis,
         )
         return (
             dq,
@@ -849,21 +870,6 @@ class TwoSimplicialAttention(nn.Module):
             return torch.bfloat16
         return torch.float32
 
-    def _cast_factorized_bias_for_triton(
-        self,
-        factorized_bias: SimplicialFactorizedBias | None,
-        *,
-        dtype: torch.dtype,
-    ) -> SimplicialFactorizedBias | None:
-        if factorized_bias is None:
-            return None
-        return SimplicialFactorizedBias(
-            u=factorized_bias.u.to(dtype=dtype),
-            v=factorized_bias.v.to(dtype=dtype),
-            w=factorized_bias.w.to(dtype=dtype),
-            gate=factorized_bias.gate.to(dtype=dtype),
-        )
-
     def _cast_angle_residual_for_triton(
         self,
         angle_residual: SimplicialLowRankAngleResidual | None,
@@ -918,7 +924,6 @@ class TwoSimplicialAttention(nn.Module):
         v1 = v1.to(dtype=compute_dtype)
         k2 = k2.to(dtype=compute_dtype)
         v2 = v2.to(dtype=compute_dtype)
-        factorized_bias = self._cast_factorized_bias_for_triton(factorized_bias, dtype=torch.float32)
         angle_residual = self._cast_angle_residual_for_triton(angle_residual, dtype=torch.float32)
         message_residual = self._cast_message_residual_for_triton(message_residual, dtype=torch.float32)
 

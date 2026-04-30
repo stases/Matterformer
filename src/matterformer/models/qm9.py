@@ -34,6 +34,51 @@ def _masked_rms_radius(coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Te
     return torch.sqrt(mean_sq_norm.clamp_min(1e-8)).unsqueeze(-1)
 
 
+def _canonicalize_noise_conditioning(
+    noise_conditioning: object,
+    concat_sigma_condition: bool | None,
+) -> tuple[str, ...]:
+    if noise_conditioning is None:
+        modes = ["adaln"]
+        if concat_sigma_condition is None or bool(concat_sigma_condition):
+            modes.insert(0, "concat")
+        return tuple(modes)
+
+    if isinstance(noise_conditioning, str):
+        text = noise_conditioning.strip().strip("[]()")
+        for separator in ("+", "|", ";"):
+            text = text.replace(separator, ",")
+        raw_values: list[object] = []
+        for chunk in text.split(","):
+            raw_values.extend(chunk.split())
+    elif isinstance(noise_conditioning, (list, tuple, set)):
+        raw_values = list(noise_conditioning)
+    else:
+        raw_values = [noise_conditioning]
+
+    modes: set[str] = set()
+    for value in raw_values:
+        token = str(value).strip().strip("'\"").lower().replace("-", "_")
+        if not token:
+            continue
+        if token in {"none", "off", "false", "no", "disabled"}:
+            continue
+        if token in {"both", "all", "concat_adaln", "adaln_concat"}:
+            modes.update({"concat", "adaln"})
+            continue
+        if token in {"concat", "sigma_concat", "concat_sigma", "c_noise", "cnoise"}:
+            modes.add("concat")
+            continue
+        if token in {"adaln", "ada_ln", "time", "time_embed", "time_embedder", "time_embedding"}:
+            modes.add("adaln")
+            continue
+        raise ValueError(
+            "noise_conditioning entries must be drawn from {'concat', 'adaln'} "
+            f"or aliases; got {value!r}"
+        )
+    return tuple(mode for mode in ("concat", "adaln") if mode in modes)
+
+
 class QM9RegressionModel(nn.Module):
     def __init__(
         self,
@@ -53,6 +98,11 @@ class QM9RegressionModel(nn.Module):
         simplicial_message_rank: int = 16,
         readout_mode: str = "cls",
         mha_geom_bias_mode: str = "standard",
+        mha_position_mode: str = "none",
+        mha_rope_freq_sigma: float = 1.0,
+        mha_rope_learned_freqs: bool = False,
+        mha_rope_use_key: bool = True,
+        mha_rope_on_values: bool = False,
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
     ) -> None:
@@ -134,6 +184,11 @@ class QM9RegressionModel(nn.Module):
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
+            mha_position_mode=mha_position_mode,
+            mha_rope_freq_sigma=mha_rope_freq_sigma,
+            mha_rope_learned_freqs=mha_rope_learned_freqs,
+            mha_rope_use_key=mha_rope_use_key,
+            mha_rope_on_values=mha_rope_on_values,
         )
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -195,7 +250,7 @@ class QM9EDMModel(nn.Module):
     def __init__(
         self,
         *,
-        atom_channels: int = QM9_NUM_ATOM_TYPES,
+        atom_channels: int = QM9_NUM_ATOM_TYPES + 1,
         d_model: int = 256,
         n_heads: int = 8,
         n_layers: int = 8,
@@ -210,8 +265,22 @@ class QM9EDMModel(nn.Module):
         simplicial_message_mode: str = "none",
         simplicial_message_rank: int = 16,
         mha_geom_bias_mode: str = "standard",
+        mha_position_mode: str = "none",
+        mha_rope_freq_sigma: float = 1.0,
+        mha_rope_learned_freqs: bool = False,
         geometry_adapter: BaseGeometryAdapter | None = None,
         use_geometry_bias: bool = True,
+        coord_embed_mode: str = "none",
+        coord_n_freqs: int = 32,
+        coord_rff_dim: int | None = None,
+        coord_rff_sigma: float = 1.0,
+        coord_embed_normalize: bool = False,
+        coord_head_mode: str = "equivariant",
+        noise_conditioning: object = None,
+        concat_sigma_condition: bool | None = None,
+        mha_rope_use_key: bool = True,
+        mha_rope_on_values: bool = False,
+        charge_feature_scale: float = 8.0,
         pair_hidden_dim: int = 128,
         pair_n_rbf: int = 16,
         pair_rbf_max: float = 4.0,
@@ -221,6 +290,24 @@ class QM9EDMModel(nn.Module):
         simplicial_geom_mode = simplicial_geom_mode.lower()
         simplicial_message_mode = simplicial_message_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
+        mha_position_mode = mha_position_mode.lower().replace("-", "_")
+        coord_embed_mode = coord_embed_mode.lower().replace("-", "_")
+        coord_head_mode = coord_head_mode.lower().replace("-", "_")
+        if coord_embed_mode in {"disabled", "off", "false", "no"}:
+            coord_embed_mode = "none"
+        if coord_embed_mode in {"rope", "mha_rope", "rotary"}:
+            coord_embed_mode = "none"
+            mha_position_mode = "rope"
+        if coord_embed_mode in {"coords", "coord", "input", "on", "true", "yes", "learned_rff", "fieldformer_rff"}:
+            coord_embed_mode = "learnable_rff"
+        if mha_position_mode in {"disabled", "off", "false", "no"}:
+            mha_position_mode = "none"
+        if mha_position_mode in {"rotary", "mha_rope", "rotary_position_embedding"}:
+            mha_position_mode = "rope"
+        if coord_head_mode in {"relative", "pair", "pairwise"}:
+            coord_head_mode = "equivariant"
+        if coord_head_mode in {"non_relative", "non_equivariant", "nonrelative"}:
+            coord_head_mode = "direct"
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
@@ -230,6 +317,18 @@ class QM9EDMModel(nn.Module):
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
                 "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
+            )
+        if coord_embed_mode not in {"none", "fourier", "rff", "learnable_rff"}:
+            raise ValueError(
+                "coord_embed_mode must be one of {'none', 'fourier', 'rff', 'learnable_rff'}"
+            )
+        if mha_position_mode not in {"none", "rope"}:
+            raise ValueError("mha_position_mode must be one of {'none', 'rope'}")
+        if mha_position_mode == "rope" and attn_type.lower() != "mha":
+            raise ValueError("mha_position_mode='rope' requires attn_type='mha'")
+        if coord_head_mode not in {"equivariant", "direct"}:
+            raise ValueError(
+                "coord_head_mode must be one of {'equivariant', 'direct'}"
             )
         geometry_bias = None
         simplicial_geometry_bias = None
@@ -268,8 +367,31 @@ class QM9EDMModel(nn.Module):
 
         self.atom_channels = int(atom_channels)
         self.geometry_adapter = geometry_adapter
-        self.atom_proj = nn.Linear(atom_channels, d_model)
-        self.conditioning = TimeEmbedder(d_model)
+        self.coord_embed_mode = coord_embed_mode
+        self.mha_position_mode = mha_position_mode
+        self.coord_embed_normalize = bool(coord_embed_normalize)
+        self.coord_head_mode = coord_head_mode
+        self.noise_conditioning = _canonicalize_noise_conditioning(
+            noise_conditioning,
+            concat_sigma_condition,
+        )
+        self.concat_sigma_condition = "concat" in self.noise_conditioning
+        self.use_adaln_conditioning = "adaln" in self.noise_conditioning
+        self.charge_feature_scale = float(charge_feature_scale)
+        atom_input_channels = self.atom_channels + (1 if self.concat_sigma_condition else 0)
+        self.atom_proj = nn.Linear(atom_input_channels, d_model)
+        self.coord_embedding = (
+            FourierCoordEmbedder(
+                d_model=d_model,
+                n_freqs=coord_n_freqs,
+                mode=coord_embed_mode,
+                rff_dim=coord_rff_dim,
+                rff_sigma=coord_rff_sigma,
+            )
+            if coord_embed_mode != "none"
+            else None
+        )
+        self.conditioning = TimeEmbedder(d_model) if self.use_adaln_conditioning else None
         self.trunk = TransformerTrunk(
             d_model=d_model,
             n_heads=n_heads,
@@ -285,6 +407,12 @@ class QM9EDMModel(nn.Module):
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,
             simplicial_geometry_bias=simplicial_geometry_bias,
+            mha_position_mode=mha_position_mode,
+            mha_rope_freq_sigma=mha_rope_freq_sigma,
+            mha_rope_learned_freqs=mha_rope_learned_freqs,
+            mha_rope_use_key=mha_rope_use_key,
+            mha_rope_on_values=mha_rope_on_values,
+            use_adaln_conditioning=self.use_adaln_conditioning,
         )
         self.atom_head = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -292,13 +420,23 @@ class QM9EDMModel(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, atom_channels),
         )
-        self.pair_head = nn.Sequential(
-            nn.LazyLinear(pair_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(pair_hidden_dim, 1),
-        )
-        nn.init.zeros_(self.pair_head[-1].weight)
-        nn.init.zeros_(self.pair_head[-1].bias)
+        if self.coord_head_mode == "equivariant":
+            self.pair_head = nn.Sequential(
+                nn.LazyLinear(pair_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(pair_hidden_dim, 1),
+            )
+            nn.init.zeros_(self.pair_head[-1].weight)
+            nn.init.zeros_(self.pair_head[-1].bias)
+        else:
+            self.coord_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 3),
+            )
+            nn.init.zeros_(self.coord_head[-1].weight)
+            nn.init.zeros_(self.coord_head[-1].bias)
 
         self.register_buffer(
             "_pair_rbf_centers",
@@ -323,36 +461,19 @@ class QM9EDMModel(nn.Module):
         )
         return torch.exp(-gamma * (pair_dist_norm.unsqueeze(-1) - centers.view(1, 1, 1, -1)).square())
 
-    def forward(
+    def _coords_for_embedding(self, coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        coords = _center_coords(coords, pad_mask)
+        if self.coord_embed_normalize:
+            coord_scale = _masked_rms_radius(coords, pad_mask)
+            coords = coords / coord_scale.clamp_min(1e-8)
+        return coords.masked_fill(pad_mask[..., None], 0.0)
+
+    def _equivariant_coord_delta(
         self,
-        atom_noisy: torch.Tensor,
-        coords_noisy: torch.Tensor,
+        trunk_out: torch.Tensor,
+        geom_features,
         pad_mask: torch.Tensor,
-        sigma: torch.Tensor,
-        lattice: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if sigma.ndim == 2 and sigma.shape[-1] == 1:
-            sigma = sigma[:, 0]
-        if sigma.ndim != 1:
-            raise ValueError(f"sigma must have shape (B,) or (B, 1), got {tuple(sigma.shape)}")
-        sigma_condition = torch.log(sigma.clamp_min(1e-8)) / 4.0
-
-        trunk_out = self.trunk(
-            self.atom_proj(atom_noisy),
-            self.conditioning(sigma_condition, sigma_condition),
-            pad_mask=pad_mask,
-            coords=coords_noisy,
-            lattice=lattice,
-            sigma=sigma,
-        )
-        atom_delta = self.atom_head(trunk_out)
-        atom_delta = atom_delta.masked_fill(pad_mask[..., None], 0.0)
-
-        geom_features = self.trunk.compute_geometry_features(
-            coords=coords_noisy,
-            pad_mask=pad_mask,
-            lattice=lattice,
-        )
+    ) -> torch.Tensor:
         pair_rbf = self._distance_rbf(geom_features.pair_dist_norm)
         num_atoms = trunk_out.shape[1]
         hi = trunk_out[:, :, None, :].expand(-1, -1, num_atoms, -1)
@@ -370,5 +491,68 @@ class QM9EDMModel(nn.Module):
         coord_delta = coord_delta / denom.unsqueeze(-1)
         coord_delta = coord_delta.masked_fill(pad_mask[..., None], 0.0)
         coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
+        return coord_delta.masked_fill(pad_mask[..., None], 0.0)
+
+    def _direct_coord_delta(self, trunk_out: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        coord_delta = self.coord_head(trunk_out)
         coord_delta = coord_delta.masked_fill(pad_mask[..., None], 0.0)
+        coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
+        return coord_delta.masked_fill(pad_mask[..., None], 0.0)
+
+    def forward(
+        self,
+        atom_noisy: torch.Tensor,
+        coords_noisy: torch.Tensor,
+        pad_mask: torch.Tensor,
+        sigma: torch.Tensor,
+        lattice: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if sigma.ndim == 2 and sigma.shape[-1] == 1:
+            sigma = sigma[:, 0]
+        if sigma.ndim != 1:
+            raise ValueError(f"sigma must have shape (B,) or (B, 1), got {tuple(sigma.shape)}")
+        if atom_noisy.shape[-1] != self.atom_channels:
+            raise ValueError(
+                f"atom_noisy last dim must match atom_channels={self.atom_channels}, "
+                f"got {atom_noisy.shape[-1]}"
+            )
+        sigma_condition = torch.log(sigma.clamp_min(1e-8)) / 4.0
+
+        atom_input = atom_noisy
+        if self.concat_sigma_condition:
+            sigma_feature = sigma_condition[:, None, None].expand(-1, atom_noisy.shape[1], 1)
+            sigma_feature = sigma_feature.masked_fill(pad_mask[..., None], 0.0)
+            atom_input = torch.cat([atom_noisy, sigma_feature], dim=-1)
+        token_features = self.atom_proj(atom_input)
+        if self.coord_embedding is not None:
+            coord_features = self.coord_embedding(
+                self._coords_for_embedding(coords_noisy, pad_mask)
+            ).masked_fill(pad_mask[..., None], 0.0)
+            token_features = token_features + coord_features
+
+        cond_emb = (
+            self.conditioning(sigma_condition, sigma_condition)
+            if self.conditioning is not None
+            else None
+        )
+        trunk_out = self.trunk(
+            token_features,
+            cond_emb,
+            pad_mask=pad_mask,
+            coords=coords_noisy,
+            lattice=lattice,
+            sigma=sigma,
+        )
+        atom_delta = self.atom_head(trunk_out)
+        atom_delta = atom_delta.masked_fill(pad_mask[..., None], 0.0)
+
+        if self.coord_head_mode == "equivariant":
+            geom_features = self.trunk.compute_geometry_features(
+                coords=coords_noisy,
+                pad_mask=pad_mask,
+                lattice=lattice,
+            )
+            coord_delta = self._equivariant_coord_delta(trunk_out, geom_features, pad_mask)
+        else:
+            coord_delta = self._direct_coord_delta(trunk_out, pad_mask)
         return atom_delta, coord_delta

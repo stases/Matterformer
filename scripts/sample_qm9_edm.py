@@ -12,7 +12,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 
-from matterformer.data import QM9Dataset
+from matterformer.data import QM9Dataset, QM9_NUM_ATOM_TYPES
 from matterformer.metrics import build_rdkit_metrics, sample_and_evaluate_qm9
 from matterformer.models import QM9EDMModel
 from matterformer.tasks import EDMPreconditioner
@@ -29,6 +29,7 @@ def main(args: argparse.Namespace) -> None:
     rdkit_metrics = build_rdkit_metrics(train_dataset.smiles_list)
 
     model = QM9EDMModel(
+        atom_channels=QM9_NUM_ATOM_TYPES + (1 if bool(model_args.get("use_charges", False)) else 0),
         d_model=int(model_args.get("d_model", 256)),
         n_heads=int(model_args.get("n_heads", 8)),
         n_layers=int(model_args.get("n_layers", 8)),
@@ -44,7 +45,25 @@ def main(args: argparse.Namespace) -> None:
         simplicial_precision=args.simplicial_precision
         or str(model_args.get("simplicial_precision", "ieee_fp32")),
         mha_geom_bias_mode=str(model_args.get("mha_geom_bias_mode", "standard")),
+        mha_position_mode=str(model_args.get("mha_position_mode", "none")),
+        mha_rope_freq_sigma=float(model_args.get("mha_rope_freq_sigma", 1.0)),
+        mha_rope_learned_freqs=bool(model_args.get("mha_rope_learned_freqs", False)),
+        mha_rope_use_key=bool(model_args.get("mha_rope_use_key", True)),
+        mha_rope_on_values=bool(model_args.get("mha_rope_on_values", False)),
         use_geometry_bias=not bool(model_args.get("disable_geometry_bias", False)),
+        coord_embed_mode=str(model_args.get("coord_embed_mode", "none")),
+        coord_n_freqs=int(model_args.get("coord_n_freqs", 32)),
+        coord_rff_dim=(
+            None
+            if model_args.get("coord_rff_dim", None) is None
+            else int(model_args.get("coord_rff_dim"))
+        ),
+        coord_rff_sigma=float(model_args.get("coord_rff_sigma", 1.0)),
+        coord_embed_normalize=bool(model_args.get("coord_embed_normalize", False)),
+        coord_head_mode=str(model_args.get("coord_head_mode", "equivariant")),
+        noise_conditioning=model_args.get("noise_conditioning", None),
+        concat_sigma_condition=bool(model_args.get("concat_sigma_condition", False)),
+        charge_feature_scale=float(model_args.get("charge_feature_scale", 8.0)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     net = EDMPreconditioner(

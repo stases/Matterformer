@@ -117,6 +117,9 @@ def maybe_configure_wandb(
                 "simplicial_message_rank": args.simplicial_message_rank,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
+                "mha_position_mode": args.mha_position_mode,
+                "mha_rope_freq_sigma": args.mha_rope_freq_sigma,
+                "mha_rope_learned_freqs": args.mha_rope_learned_freqs,
                 "readout_mode": args.readout_mode,
                 "num_parameters": num_parameters,
                 "num_trainable_parameters": num_trainable_parameters,
@@ -264,6 +267,9 @@ def main(args: argparse.Namespace) -> None:
         simplicial_message_mode=args.simplicial_message_mode,
         simplicial_message_rank=args.simplicial_message_rank,
         readout_mode=args.readout_mode,
+        mha_position_mode=args.mha_position_mode,
+        mha_rope_freq_sigma=args.mha_rope_freq_sigma,
+        mha_rope_learned_freqs=args.mha_rope_learned_freqs,
         use_geometry_bias=not args.disable_geometry_bias,
     ).to(device)
     initialize_model_parameters(model, train_dataset, device, bf16_enabled=args.bf16)
@@ -620,6 +626,15 @@ if __name__ == "__main__":
         default="cls",
         choices=["cls", "sum", "mean"],
     )
+    parser.add_argument(
+        "--mha-position-mode",
+        type=str,
+        default="none",
+        choices=["none", "rope", "rotary", "mha_rope", "mha-rope"],
+        help="Optional MHA-only positional operation. 'rope' applies 3D rotary embeddings to Q/K.",
+    )
+    parser.add_argument("--mha-rope-freq-sigma", type=float, default=1.0)
+    parser.add_argument("--mha-rope-learned-freqs", action="store_true")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-augm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-geometry-bias", action="store_true")

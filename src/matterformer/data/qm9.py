@@ -47,6 +47,7 @@ QM9_DATASET_INFO = {
 @dataclass
 class QM9Batch:
     atom_types: torch.Tensor
+    charges: torch.Tensor | None
     coords: torch.Tensor
     pad_mask: torch.Tensor
     num_atoms: torch.Tensor
@@ -59,6 +60,7 @@ class QM9Batch:
     def to(self, device: torch.device | str) -> "QM9Batch":
         return QM9Batch(
             atom_types=self.atom_types.to(device),
+            charges=None if self.charges is None else self.charges.to(device),
             coords=self.coords.to(device),
             pad_mask=self.pad_mask.to(device),
             num_atoms=self.num_atoms.to(device),
@@ -73,6 +75,20 @@ class QM9Batch:
         atom_types = self.atom_types.clamp(min=0, max=num_classes - 1)
         one_hot = torch.nn.functional.one_hot(atom_types, num_classes=num_classes).float()
         return one_hot.masked_fill(self.pad_mask[..., None], 0.0)
+
+    def formal_charges(self) -> torch.Tensor:
+        if self.charges is None:
+            charges = torch.zeros_like(self.atom_types)
+        else:
+            charges = self.charges
+        return charges.masked_fill(self.pad_mask, 0)
+
+    def node_features(self, *, use_charges: bool = False) -> torch.Tensor:
+        atom_features = self.atom_onehot()
+        if not use_charges:
+            return atom_features
+        charges = self.formal_charges().to(dtype=atom_features.dtype)
+        return torch.cat([atom_features, charges[..., None]], dim=-1)
 
 
 def build_pad_mask(num_atoms: torch.Tensor, max_atoms: int | None = None) -> torch.Tensor:
@@ -109,6 +125,7 @@ def collate_qm9(samples: list[dict[str, object]]) -> QM9Batch:
     batch_size = len(samples)
 
     atom_types = torch.full((batch_size, max_atoms), QM9_ATOM_PAD_TOKEN, dtype=torch.long)
+    charges = torch.zeros(batch_size, max_atoms, dtype=torch.long)
     coords = torch.zeros(batch_size, max_atoms, 3, dtype=torch.float32)
     targets = None
     target_name = str(samples[0].get("target_name")) if samples[0].get("target_name") is not None else None
@@ -121,8 +138,13 @@ def collate_qm9(samples: list[dict[str, object]]) -> QM9Batch:
     for batch_idx, sample in enumerate(samples):
         count = int(sample["num_atoms"])
         atom_tensor = torch.as_tensor(sample["atom_types"], dtype=torch.long)
+        charge_tensor = torch.as_tensor(
+            sample.get("charges", torch.zeros(count, dtype=torch.long)),
+            dtype=torch.long,
+        )
         coord_tensor = torch.as_tensor(sample["coords"], dtype=torch.float32)
         atom_types[batch_idx, :count] = atom_tensor
+        charges[batch_idx, :count] = charge_tensor
         coords[batch_idx, :count] = coord_tensor
         if targets is not None:
             targets[batch_idx] = torch.as_tensor(sample["targets"], dtype=torch.float32).reshape(-1)
@@ -133,6 +155,7 @@ def collate_qm9(samples: list[dict[str, object]]) -> QM9Batch:
     coords = coords.masked_fill(pad_mask[..., None], 0.0)
     return QM9Batch(
         atom_types=atom_types,
+        charges=charges.masked_fill(pad_mask, 0),
         coords=coords,
         pad_mask=pad_mask,
         num_atoms=num_atoms,
@@ -245,13 +268,28 @@ class QM9Dataset(Dataset):
             atom_types = np.asarray(item["atom_types"], dtype=np.int64).reshape(-1)
             coords = np.asarray(item["coords"], dtype=np.float32)
             targets = np.asarray(item["targets"], dtype=np.float32).reshape(-1)
+            charges = np.asarray(
+                item.get("charges", np.zeros_like(atom_types)),
+                dtype=np.int64,
+            ).reshape(-1)
         elif {"pos", "x", "y"}.issubset(item):
             coords = np.asarray(item["pos"], dtype=np.float32)
             node_features = np.asarray(item["x"])
             if node_features.ndim == 2:
-                atom_types = node_features.argmax(axis=-1).astype(np.int64)
+                atom_type_features = node_features[:, :QM9_NUM_ATOM_TYPES]
+                atom_types = atom_type_features.argmax(axis=-1).astype(np.int64)
+                if "charges" in item:
+                    charges = np.asarray(item["charges"], dtype=np.int64).reshape(-1)
+                elif node_features.shape[-1] > QM9_NUM_ATOM_TYPES:
+                    charges = np.rint(node_features[:, QM9_NUM_ATOM_TYPES]).astype(np.int64)
+                else:
+                    charges = np.zeros(atom_types.shape[0], dtype=np.int64)
             else:
                 atom_types = node_features.astype(np.int64).reshape(-1)
+                charges = np.asarray(
+                    item.get("charges", np.zeros_like(atom_types)),
+                    dtype=np.int64,
+                ).reshape(-1)
             targets = np.asarray(item["y"], dtype=np.float32).reshape(-1)
         else:
             raise KeyError(
@@ -260,8 +298,11 @@ class QM9Dataset(Dataset):
             )
 
         num_atoms = int(item.get("num_atoms", atom_types.shape[0]))
+        if charges.shape[0] != num_atoms:
+            charges = np.zeros(num_atoms, dtype=np.int64)
         return {
             "atom_types": atom_types,
+            "charges": charges,
             "coords": coords,
             "targets": targets,
             "edge_index": np.asarray(item.get("edge_index", np.zeros((2, 0), dtype=np.int64)), dtype=np.int64),
@@ -342,6 +383,7 @@ class QM9Dataset(Dataset):
                 continue
             num_atoms = molecule.GetNumAtoms()
             atom_types = np.zeros(num_atoms, dtype=np.int64)
+            charges = np.zeros(num_atoms, dtype=np.int64)
             coords = np.array(
                 [molecule.GetConformer().GetAtomPosition(i) for i in range(num_atoms)],
                 dtype=np.float32,
@@ -350,6 +392,7 @@ class QM9Dataset(Dataset):
             for atom_index in range(num_atoms):
                 atom = molecule.GetAtomWithIdx(atom_index)
                 atom_types[atom_index] = atomic_number_to_index[atom.GetAtomicNum()]
+                charges[atom_index] = atom.GetFormalCharge()
 
             edge_indices: list[tuple[int, int]] = []
             edge_attrs: list[list[int]] = []
@@ -380,6 +423,7 @@ class QM9Dataset(Dataset):
             data_list.append(
                 {
                     "atom_types": atom_types,
+                    "charges": charges,
                     "coords": coords.astype(np.float32),
                     "targets": targets[index].astype(np.float32),
                     "edge_index": edge_index,
@@ -402,6 +446,7 @@ class QM9Dataset(Dataset):
             targets = targets[self.target_index : self.target_index + 1]
         return {
             "atom_types": torch.as_tensor(item["atom_types"], dtype=torch.long),
+            "charges": torch.as_tensor(item.get("charges", np.zeros(int(item["num_atoms"]))), dtype=torch.long),
             "coords": torch.as_tensor(item["coords"], dtype=torch.float32),
             "targets": torch.as_tensor(targets, dtype=torch.float32),
             "edge_index": torch.as_tensor(item.get("edge_index", np.zeros((2, 0))), dtype=torch.long),

@@ -112,6 +112,10 @@ def maybe_configure_wandb(
                 "simplicial_message_rank": args.simplicial_message_rank,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
+                "mha_position_mode": args.mha_position_mode,
+                "mha_rope_freq_sigma": args.mha_rope_freq_sigma,
+                "mha_rope_learned_freqs": args.mha_rope_learned_freqs,
+                "coord_embed_mode": args.coord_embed_mode,
                 "lattice_repr": args.lattice_repr,
                 "d_model": args.d_model,
                 "n_heads": args.n_heads,
@@ -546,9 +550,13 @@ def main(args: argparse.Namespace) -> None:
         simplicial_angle_rank=args.simplicial_angle_rank,
         simplicial_message_mode=args.simplicial_message_mode,
         simplicial_message_rank=args.simplicial_message_rank,
+        mha_position_mode=args.mha_position_mode,
+        mha_rope_freq_sigma=args.mha_rope_freq_sigma,
+        mha_rope_learned_freqs=args.mha_rope_learned_freqs,
         use_geometry_bias=not args.disable_geometry_bias,
         lattice_repr=args.lattice_repr,
         pbc_radius=args.pbc_radius,
+        coord_embed_mode=args.coord_embed_mode,
     ).to(device)
     net = MOFStage1EDMPreconditioner(
         model,
@@ -986,6 +994,22 @@ if __name__ == "__main__":
         type=str,
         default="bf16_tc",
         choices=["bf16_tc", "tf32", "ieee_fp32"],
+    )
+    parser.add_argument(
+        "--mha-position-mode",
+        type=str,
+        default="none",
+        choices=["none", "rope", "rotary", "mha_rope", "mha-rope"],
+        help="Optional MHA-only positional operation. 'rope' applies 3D rotary embeddings to Q/K.",
+    )
+    parser.add_argument("--mha-rope-freq-sigma", type=float, default=1.0)
+    parser.add_argument("--mha-rope-learned-freqs", action="store_true")
+    parser.add_argument(
+        "--coord-embed-mode",
+        type=str,
+        default="rff",
+        choices=["none", "rope", "mha_rope", "mha-rope", "rotary", "fourier", "rff", "learnable_rff", "learnable-rff"],
+        help="Optional coordinate token embedding. 'rope' enables MHA RoPE without additive coordinate tokens.",
     )
     parser.add_argument("--disable-geometry-bias", action="store_true")
     parser.add_argument("--lattice-repr", type=str, default="y1", choices=["y1", "ltri"])

@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import matterformer.models.attention as attention_module
 from matterformer.geometry import NonPeriodicGeometryAdapter
 from matterformer.models import QM9EDMModel, SimplicialGeometryBias, TwoSimplicialAttention
 from matterformer.models.attention import (
@@ -693,6 +694,109 @@ def test_eval_mode_dropout_allows_triton():
     x = torch.randn(2, 5, 32, device=device, dtype=torch.float32)
     _ = attn(x)
     assert attn._last_impl_used == "triton"
+
+
+def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
+    captured: dict[str, bool] = {}
+
+    def fake_forward(q, k1, v1, k2, v2, **kwargs):
+        del k1, v1, k2, v2, kwargs
+        out = torch.zeros_like(q)
+        lse = q.new_zeros(q.shape[:3], dtype=torch.float32)
+        return out, lse, out.float()
+
+    def fake_backward(grad_out, q, k1, v1, k2, v2, *args, **kwargs):
+        del grad_out, args
+        for name in (
+            "need_du",
+            "need_dv_bias",
+            "need_dw",
+            "need_dgate",
+            "need_dangle_left",
+            "need_dangle_right",
+            "need_dangle_gate",
+            "need_dmessage_left",
+            "need_dmessage_right",
+            "need_dmessage_basis",
+        ):
+            captured[name] = bool(kwargs[name])
+        zeros = [torch.zeros_like(tensor) for tensor in (q, k1, v1, k2, v2)]
+        angle_left = kwargs["angle_left"]
+        angle_gate = kwargs["angle_gate"]
+        message_right = kwargs["message_right"]
+        return (
+            *zeros,
+            None,
+            None,
+            None,
+            None,
+            torch.zeros_like(angle_left),
+            None,
+            torch.zeros_like(angle_gate),
+            None,
+            torch.zeros_like(message_right),
+            None,
+        )
+
+    monkeypatch.setattr(attention_module, "triton_simplicial_attention_forward", fake_forward)
+    monkeypatch.setattr(attention_module, "triton_simplicial_attention_backward", fake_backward)
+
+    q = torch.randn(1, 2, 3, 4, requires_grad=True)
+    k1 = torch.randn_like(q, requires_grad=True)
+    v1 = torch.randn_like(q, requires_grad=True)
+    k2 = torch.randn_like(q, requires_grad=True)
+    v2 = torch.randn_like(q, requires_grad=True)
+    query_valid = torch.ones(1, 3, dtype=torch.bool)
+    pair_key_valid = torch.ones(1, 3, dtype=torch.bool)
+    pair_valid = torch.empty(0, dtype=torch.bool)
+    u = torch.randn(1, 2, 3, 3)
+    v = torch.randn_like(u)
+    w = torch.randn_like(u)
+    gate = torch.randn(1, 2, 3)
+    angle_left = torch.randn(1, 2, 3, 3, 2, requires_grad=True)
+    angle_right = torch.randn(1, 2, 3, 3, 2)
+    angle_gate = torch.randn(1, 2, 3, requires_grad=True)
+    message_left = torch.randn(1, 2, 3, 3, 2)
+    message_right = torch.randn(1, 2, 3, 3, 2, requires_grad=True)
+    message_basis = torch.randn(2, 2, 4)
+
+    out = _TritonTwoSimplicialAttentionFunction.apply(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        query_valid,
+        pair_key_valid,
+        pair_valid,
+        u,
+        v,
+        w,
+        gate,
+        angle_left,
+        angle_right,
+        angle_gate,
+        message_left,
+        message_right,
+        message_basis,
+        "ieee_fp32",
+        128,
+        False,
+    )
+    out.sum().backward()
+
+    assert captured == {
+        "need_du": False,
+        "need_dv_bias": False,
+        "need_dw": False,
+        "need_dgate": False,
+        "need_dangle_left": True,
+        "need_dangle_right": False,
+        "need_dangle_gate": True,
+        "need_dmessage_left": False,
+        "need_dmessage_right": True,
+        "need_dmessage_basis": False,
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")

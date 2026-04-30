@@ -15,7 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 import torch
 from torch.utils.data import DataLoader
 
-from matterformer.data import QM9Dataset, collate_qm9
+from matterformer.data import QM9Dataset, QM9_NUM_ATOM_TYPES, collate_qm9
 from matterformer.metrics import build_rdkit_metrics, sample_and_evaluate_qm9
 from matterformer.models import QM9EDMModel
 from matterformer.tasks import EDMLoss, EDMPreconditioner
@@ -127,6 +127,21 @@ def maybe_configure_wandb(
                 "simplicial_message_mode": args.simplicial_message_mode,
                 "simplicial_message_rank": args.simplicial_message_rank,
                 "mha_geom_bias_mode": args.mha_geom_bias_mode,
+                "mha_position_mode": args.mha_position_mode,
+                "mha_rope_freq_sigma": args.mha_rope_freq_sigma,
+                "mha_rope_learned_freqs": args.mha_rope_learned_freqs,
+                "mha_rope_use_key": args.mha_rope_use_key,
+                "mha_rope_on_values": args.mha_rope_on_values,
+                "coord_embed_mode": args.coord_embed_mode,
+                "coord_n_freqs": args.coord_n_freqs,
+                "coord_rff_dim": args.coord_rff_dim,
+                "coord_rff_sigma": args.coord_rff_sigma,
+                "coord_embed_normalize": args.coord_embed_normalize,
+                "coord_head_mode": args.coord_head_mode,
+                "use_charges": args.use_charges,
+                "noise_conditioning": list(model.noise_conditioning),
+                "concat_sigma_condition": args.concat_sigma_condition,
+                "charge_feature_scale": args.charge_feature_scale,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
                 "num_parameters": num_parameters,
@@ -148,6 +163,17 @@ def maybe_configure_wandb(
             "ema": {
                 "decay": args.ema_decay,
                 "use_for_sampling": args.ema_use_for_sampling,
+            },
+            "diffusion": {
+                "sigma_data": args.sigma_data,
+                "p_mean": args.p_mean,
+                "p_std": args.p_std,
+                "atom_feature_scale": args.atom_feature_scale,
+                "charge_feature_scale": args.charge_feature_scale,
+                "use_charges": args.use_charges,
+                "noise_conditioning": list(model.noise_conditioning),
+                "concat_sigma_condition": args.concat_sigma_condition,
+                "max_loss_weight": args.max_loss_weight,
             },
             "sampler": sampler_kwargs_from_args(args),
             "checkpointing": {
@@ -349,6 +375,7 @@ def main(args: argparse.Namespace) -> None:
     run = maybe_init_wandb(args)
 
     model = QM9EDMModel(
+        atom_channels=QM9_NUM_ATOM_TYPES + (1 if args.use_charges else 0),
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -363,12 +390,29 @@ def main(args: argparse.Namespace) -> None:
         simplicial_message_mode=args.simplicial_message_mode,
         simplicial_message_rank=args.simplicial_message_rank,
         mha_geom_bias_mode=args.mha_geom_bias_mode,
+        mha_position_mode=args.mha_position_mode,
+        mha_rope_freq_sigma=args.mha_rope_freq_sigma,
+        mha_rope_learned_freqs=args.mha_rope_learned_freqs,
+        mha_rope_use_key=args.mha_rope_use_key,
+        mha_rope_on_values=args.mha_rope_on_values,
         use_geometry_bias=not args.disable_geometry_bias,
+        coord_embed_mode=args.coord_embed_mode,
+        coord_n_freqs=args.coord_n_freqs,
+        coord_rff_dim=args.coord_rff_dim,
+        coord_rff_sigma=args.coord_rff_sigma,
+        coord_embed_normalize=args.coord_embed_normalize,
+        coord_head_mode=args.coord_head_mode,
+        noise_conditioning=args.noise_conditioning,
+        concat_sigma_condition=args.concat_sigma_condition,
+        charge_feature_scale=args.charge_feature_scale,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
     criterion = EDMLoss(
         sigma_data=args.sigma_data,
         atom_feature_scale=args.atom_feature_scale,
+        charge_feature_scale=args.charge_feature_scale,
+        use_charges=args.use_charges,
+        max_weight=args.max_loss_weight,
         p_mean=args.p_mean,
         p_std=args.p_std,
     )
@@ -415,6 +459,14 @@ def main(args: argparse.Namespace) -> None:
     print(
         "ema: "
         f"decay={args.ema_decay} use_for_sampling={args.ema_use_for_sampling}"
+    )
+    print(
+        "diffusion_features: "
+        f"use_charges={args.use_charges} atom_feature_scale={args.atom_feature_scale} "
+        f"charge_feature_scale={args.charge_feature_scale} "
+        f"noise_conditioning={model.noise_conditioning} "
+        f"legacy_concat_sigma_condition={args.concat_sigma_condition} "
+        f"max_loss_weight={args.max_loss_weight}"
     )
     print(f"precision: bf16={args.bf16}")
     print(
@@ -553,6 +605,8 @@ def main(args: argparse.Namespace) -> None:
                         "noise/sigma_std": diagnostics["sigma"].std(unbiased=False).item(),
                         "noise/log_sigma_over_4_mean": diagnostics["log_sigma_over_4"].mean().item(),
                         "noise/log_sigma_over_4_std": diagnostics["log_sigma_over_4"].std(unbiased=False).item(),
+                        "noise/loss_weight_mean": diagnostics["loss_weight"].mean().item(),
+                        "noise/loss_weight_clamped_frac": diagnostics["loss_weight_clamped"].mean().item(),
                         "optim/grad_norm": float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm),
                         "optim/lr": lr,
                     },
@@ -878,11 +932,97 @@ if __name__ == "__main__":
         default="standard",
         choices=["standard", "factorized_marginal"],
     )
+    parser.add_argument(
+        "--mha-position-mode",
+        type=str,
+        default="none",
+        choices=["none", "rope", "rotary", "mha_rope", "mha-rope"],
+        help="Optional MHA-only positional operation. 'rope' applies 3D rotary embeddings to Q/K.",
+    )
+    parser.add_argument("--mha-rope-freq-sigma", type=float, default=1.0)
+    parser.add_argument("--mha-rope-learned-freqs", action="store_true")
+    parser.add_argument(
+        "--mha-rope-use-key",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When MHA RoPE is active, learn token keys. Disable to use RoPE-rotated all-ones keys.",
+    )
+    parser.add_argument(
+        "--mha-rope-on-values",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When MHA RoPE is active, rotate values and inverse-rotate attention outputs.",
+    )
+    parser.add_argument(
+        "--coord-embed-mode",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "rope",
+            "mha_rope",
+            "mha-rope",
+            "rotary",
+            "fourier",
+            "rff",
+            "learnable_rff",
+            "learnable-rff",
+            "fieldformer_rff",
+            "fieldformer-rff",
+            "coords",
+            "on",
+        ],
+        help=(
+            "Optionally add coordinate embeddings to EDM atom tokens. 'rope' is an alias for "
+            "--mha-position-mode=rope with no additive coordinate token embedding."
+        ),
+    )
+    parser.add_argument(
+        "--coord-n-freqs",
+        type=int,
+        default=32,
+        help="Coordinate Fourier frequencies, or default RFF dimension when --coord-rff-dim is unset.",
+    )
+    parser.add_argument("--coord-rff-dim", type=int, default=None)
+    parser.add_argument("--coord-rff-sigma", type=float, default=1.0)
+    parser.add_argument(
+        "--coord-embed-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="RMS-normalize centered coordinates before optional coordinate token embedding.",
+    )
+    parser.add_argument(
+        "--coord-head-mode",
+        type=str,
+        default="equivariant",
+        choices=[
+            "equivariant",
+            "direct",
+            "relative",
+            "non_equivariant",
+            "non-equivariant",
+            "non-relative",
+        ],
+        help="Use the current pair-vector coordinate head or a direct non-equivariant xyz head.",
+    )
     parser.add_argument("--train-augm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sigma-data", type=float, default=1.0)
     parser.add_argument("--p-mean", type=float, default=-1.2)
     parser.add_argument("--p-std", type=float, default=1.2)
     parser.add_argument("--atom-feature-scale", type=float, default=4.0)
+    parser.add_argument("--charge-feature-scale", type=float, default=8.0)
+    parser.add_argument("--use-charges", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--noise-conditioning",
+        type=str,
+        default=None,
+        help=(
+            "Comma/space separated modes from {'concat', 'adaln'}. "
+            "Default keeps legacy behavior: concat plus AdaLN unless --no-concat-sigma-condition is used."
+        ),
+    )
+    parser.add_argument("--concat-sigma-condition", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-loss-weight", type=float, default=1000.0)
     parser.add_argument("--disable-geometry-bias", action="store_true")
     parser.add_argument("--sample-num-steps", type=int, default=100)
     parser.add_argument("--sample-sigma-min", type=float, default=0.002)

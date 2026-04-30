@@ -62,11 +62,13 @@ class GeomDrugsEDMLoss:
         p_std: float = 1.2,
         sigma_data: float = 0.5,
         node_feature_scale: float = 4.0,
+        max_weight: float | None = 1000.0,
     ) -> None:
         self.p_mean = float(p_mean)
         self.p_std = float(p_std)
         self.sigma_data = float(sigma_data)
         self.node_feature_scale = float(node_feature_scale)
+        self.max_weight = None if max_weight is None else float(max_weight)
 
     def __call__(self, net: EDMPreconditioner, batch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         node_clean = batch.node_features().float() / self.node_feature_scale
@@ -76,7 +78,10 @@ class GeomDrugsEDMLoss:
             torch.randn(node_clean.shape[0], device=node_clean.device, dtype=node_clean.dtype) * self.p_std
             + self.p_mean
         )
-        weight = (sigma.square() + self.sigma_data**2) / (sigma * self.sigma_data).square()
+        raw_weight = (sigma.square() + self.sigma_data**2) / (sigma * self.sigma_data).square()
+        weight = raw_weight
+        if self.max_weight is not None:
+            weight = weight.clamp(max=self.max_weight)
 
         node_noisy = node_clean + torch.randn_like(node_clean) * sigma[:, None, None]
         coord_noise = torch.randn_like(coords_clean) * sigma[:, None, None]
@@ -99,4 +104,6 @@ class GeomDrugsEDMLoss:
             "log_sigma_over_4": log_sigma_over_4,
             "node_loss": node_loss,
             "coord_loss": coord_loss,
+            "loss_weight": weight,
+            "loss_weight_clamped": (raw_weight > weight).to(dtype=weight.dtype),
         }

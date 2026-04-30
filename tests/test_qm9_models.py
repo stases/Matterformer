@@ -32,6 +32,7 @@ def _dummy_batch() -> QM9Batch:
     )
     return QM9Batch(
         atom_types=atom_types,
+        charges=torch.zeros_like(atom_types),
         coords=coords,
         pad_mask=pad_mask,
         num_atoms=torch.tensor([3, 2], dtype=torch.long),
@@ -61,12 +62,16 @@ def test_qm9_edm_loss_and_sampling_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()
     model = QM9EDMModel(d_model=32, n_heads=4, n_layers=2)
+    assert model.coord_embedding is None
+    assert model.coord_head_mode == "equivariant"
     net = EDMPreconditioner(model, sigma_data=1.0)
     criterion = EDMLoss(sigma_data=1.0)
     loss, diagnostics = criterion(net, batch)
     assert loss.ndim == 0
     assert diagnostics["sigma"].shape == (2,)
     assert diagnostics["log_sigma_over_4"].shape == (2,)
+    assert diagnostics["loss_weight"].shape == (2,)
+    assert diagnostics["loss_weight_clamped"].shape == (2,)
     loss.backward()
 
     atom_features, coords, pad_mask = edm_sampler(
@@ -98,6 +103,128 @@ def test_qm9_edm_mha_factorized_marginal_loss_smoke():
         simplicial_geom_mode="factorized",
         mha_geom_bias_mode="factorized_marginal",
     )
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
+@pytest.mark.parametrize("coord_embed_mode", ["fourier", "rff", "learnable_rff"])
+def test_qm9_edm_coord_input_embedding_smoke(coord_embed_mode):
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        coord_embed_mode=coord_embed_mode,
+        coord_n_freqs=8,
+    )
+    assert model.coord_embedding is not None
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
+def test_qm9_edm_learnable_rff_coord_embedding_has_trainable_projection():
+    torch.manual_seed(0)
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        coord_embed_mode="learnable-rff",
+        coord_rff_dim=8,
+    )
+    assert model.coord_embed_mode == "learnable_rff"
+    assert model.coord_embedding is not None
+    assert model.coord_embedding.proj.requires_grad
+    assert tuple(model.coord_embedding.proj.shape) == (3, 8)
+
+
+def test_qm9_edm_rope_coord_mode_uses_mha_rope_without_token_coord_embedding():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        attn_type="mha",
+        use_geometry_bias=False,
+        coord_embed_mode="rope",
+    )
+    assert model.coord_embed_mode == "none"
+    assert model.coord_embedding is None
+    assert model.mha_position_mode == "rope"
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
+@pytest.mark.parametrize(
+    ("noise_conditioning", "expected_concat", "expected_adaln"),
+    [
+        ("concat", True, False),
+        ("adaln", False, True),
+        ("concat,adaln", True, True),
+    ],
+)
+def test_qm9_edm_noise_conditioning_modes(noise_conditioning, expected_concat, expected_adaln):
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        attn_type="mha",
+        use_geometry_bias=False,
+        noise_conditioning=noise_conditioning,
+    )
+    assert model.concat_sigma_condition is expected_concat
+    assert model.use_adaln_conditioning is expected_adaln
+    assert model.trunk.blocks[0].use_adaln_conditioning is expected_adaln
+
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
+def test_qm9_edm_legacy_concat_flag_maps_to_adaln_only_when_disabled():
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=1,
+        concat_sigma_condition=False,
+    )
+    assert model.noise_conditioning == ("adaln",)
+    assert not model.concat_sigma_condition
+    assert model.use_adaln_conditioning
+
+
+def test_qm9_edm_direct_coord_head_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        attn_type="mha",
+        use_geometry_bias=False,
+        coord_embed_mode="rff",
+        coord_n_freqs=8,
+        coord_head_mode="direct",
+    )
+    assert model.coord_head_mode == "direct"
     net = EDMPreconditioner(model, sigma_data=1.0)
     criterion = EDMLoss(sigma_data=1.0)
     loss, diagnostics = criterion(net, batch)

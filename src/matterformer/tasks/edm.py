@@ -89,21 +89,40 @@ class EDMLoss:
         p_std: float = 1.2,
         sigma_data: float = 0.5,
         atom_feature_scale: float = 4.0,
+        charge_feature_scale: float = 8.0,
+        use_charges: bool = True,
+        max_weight: float | None = 1000.0,
     ) -> None:
         self.p_mean = float(p_mean)
         self.p_std = float(p_std)
         self.sigma_data = float(sigma_data)
         self.atom_feature_scale = float(atom_feature_scale)
+        self.charge_feature_scale = float(charge_feature_scale)
+        self.use_charges = bool(use_charges)
+        self.max_weight = None if max_weight is None else float(max_weight)
 
     def __call__(self, net: EDMPreconditioner, batch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         atom_clean = batch.atom_onehot().float() / self.atom_feature_scale
+        if self.use_charges:
+            charges = batch.formal_charges().to(dtype=atom_clean.dtype)
+            charge_clean = charges[..., None] / self.charge_feature_scale
+            atom_clean = torch.cat([atom_clean, charge_clean], dim=-1)
+        model_channels = int(getattr(net.model, "atom_channels", atom_clean.shape[-1]))
+        if atom_clean.shape[-1] != model_channels:
+            raise ValueError(
+                f"EDMLoss produced {atom_clean.shape[-1]} atom channels, "
+                f"but model expects {model_channels}. Set --use-charges consistently."
+            )
         coords_clean = recenter_coordinates(batch.coords.float(), batch.pad_mask)
 
         sigma = torch.exp(
             torch.randn(atom_clean.shape[0], device=atom_clean.device, dtype=atom_clean.dtype) * self.p_std
             + self.p_mean
         )
-        weight = (sigma.square() + self.sigma_data**2) / (sigma * self.sigma_data).square()
+        raw_weight = (sigma.square() + self.sigma_data**2) / (sigma * self.sigma_data).square()
+        weight = raw_weight
+        if self.max_weight is not None:
+            weight = weight.clamp(max=self.max_weight)
 
         atom_noisy = atom_clean + torch.randn_like(atom_clean) * sigma[:, None, None]
         coord_noise = torch.randn_like(coords_clean) * sigma[:, None, None]
@@ -126,6 +145,8 @@ class EDMLoss:
             "log_sigma_over_4": log_sigma_over_4,
             "atom_loss": atom_loss,
             "coord_loss": coord_loss,
+            "loss_weight": weight,
+            "loss_weight_clamped": (raw_weight > weight).to(dtype=weight.dtype),
         }
 
 
@@ -133,7 +154,7 @@ def edm_sampler(
     net: EDMPreconditioner,
     num_atoms: torch.Tensor,
     *,
-    atom_channels: int = QM9_NUM_ATOM_TYPES,
+    atom_channels: int | None = None,
     lattice: torch.Tensor | None = None,
     num_steps: int = 100,
     sigma_min: float = 0.002,
@@ -148,6 +169,8 @@ def edm_sampler(
     num_atoms = num_atoms.to(device=device, dtype=torch.long)
     pad_mask = build_pad_mask(num_atoms).to(device)
     batch_size, max_atoms = pad_mask.shape
+    if atom_channels is None:
+        atom_channels = int(getattr(net.model, "atom_channels", QM9_NUM_ATOM_TYPES))
 
     atom_next = torch.randn(batch_size, max_atoms, atom_channels, device=device)
     atom_next = atom_next.masked_fill(pad_mask[..., None], 0.0)
@@ -211,6 +234,20 @@ def edm_sampler(
 
 
 def decode_atom_types(atom_features: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
-    atom_types = atom_features.argmax(dim=-1)
+    atom_type_features = atom_features[..., :QM9_NUM_ATOM_TYPES]
+    atom_types = atom_type_features.argmax(dim=-1)
     atom_types = atom_types.masked_fill(pad_mask, QM9_ATOM_PAD_TOKEN)
     return atom_types
+
+
+def decode_qm9_charges(
+    atom_features: torch.Tensor,
+    pad_mask: torch.Tensor,
+    *,
+    charge_feature_scale: float = 8.0,
+) -> torch.Tensor:
+    if atom_features.shape[-1] <= QM9_NUM_ATOM_TYPES:
+        charges = torch.zeros_like(pad_mask, dtype=torch.long)
+    else:
+        charges = (atom_features[..., QM9_NUM_ATOM_TYPES] * float(charge_feature_scale)).round().long()
+    return charges.masked_fill(pad_mask, 0)

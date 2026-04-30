@@ -11,6 +11,7 @@ def _dummy_entry(index: int, num_atoms: int) -> dict[str, object]:
     coords = coords - coords.mean(axis=0, keepdims=True)
     return {
         "atom_types": np.arange(num_atoms, dtype=np.int64) % 5,
+        "charges": np.zeros(num_atoms, dtype=np.int64),
         "coords": coords,
         "targets": np.arange(19, dtype=np.float32) + index,
         "edge_index": np.zeros((2, 0), dtype=np.int64),
@@ -34,6 +35,7 @@ def test_qm9_dataset_uses_cached_processed_file(tmp_path):
     assert sample["targets"].shape == (1,)
     batch = collate_qm9([dataset[0], dataset[1]])
     assert batch.atom_types.shape == (2, 5)
+    assert batch.charges.shape == (2, 5)
     assert batch.pad_mask.shape == (2, 5)
     mean, std = compute_target_stats(dataset)
     assert mean.shape == (1,)
@@ -65,6 +67,7 @@ def test_qm9_dataset_accepts_legacy_processed_schema(tmp_path):
     dataset = QM9Dataset(tmp_path, split=None, target="homo", download=False)
     sample = dataset[0]
     assert torch.equal(sample["atom_types"], torch.tensor([1, 0], dtype=torch.long))
+    assert torch.equal(sample["charges"], torch.tensor([6, 1], dtype=torch.long))
     assert sample["coords"].shape == (2, 3)
     assert sample["targets"].shape == (1,)
     assert sample["idx"] == 17

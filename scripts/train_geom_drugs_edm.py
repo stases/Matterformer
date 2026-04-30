@@ -126,6 +126,18 @@ def maybe_configure_wandb(
                 "simplicial_angle_rank": args.simplicial_angle_rank,
                 "simplicial_message_mode": args.simplicial_message_mode,
                 "simplicial_message_rank": args.simplicial_message_rank,
+                "mha_position_mode": args.mha_position_mode,
+                "mha_rope_freq_sigma": args.mha_rope_freq_sigma,
+                "mha_rope_learned_freqs": args.mha_rope_learned_freqs,
+                "mha_rope_use_key": args.mha_rope_use_key,
+                "mha_rope_on_values": args.mha_rope_on_values,
+                "coord_embed_mode": args.coord_embed_mode,
+                "coord_n_freqs": args.coord_n_freqs,
+                "coord_rff_dim": args.coord_rff_dim,
+                "coord_rff_sigma": args.coord_rff_sigma,
+                "coord_embed_normalize": args.coord_embed_normalize,
+                "coord_head_mode": args.coord_head_mode,
+                "noise_conditioning": list(model.noise_conditioning),
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
                 "num_parameters": num_parameters,
@@ -413,7 +425,19 @@ def main(args: argparse.Namespace) -> None:
         simplicial_angle_rank=args.simplicial_angle_rank,
         simplicial_message_mode=args.simplicial_message_mode,
         simplicial_message_rank=args.simplicial_message_rank,
+        mha_position_mode=args.mha_position_mode,
+        mha_rope_freq_sigma=args.mha_rope_freq_sigma,
+        mha_rope_learned_freqs=args.mha_rope_learned_freqs,
+        mha_rope_use_key=args.mha_rope_use_key,
+        mha_rope_on_values=args.mha_rope_on_values,
         use_geometry_bias=not args.disable_geometry_bias,
+        coord_embed_mode=args.coord_embed_mode,
+        coord_n_freqs=args.coord_n_freqs,
+        coord_rff_dim=args.coord_rff_dim,
+        coord_rff_sigma=args.coord_rff_sigma,
+        coord_embed_normalize=args.coord_embed_normalize,
+        coord_head_mode=args.coord_head_mode,
+        noise_conditioning=args.noise_conditioning,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
     criterion = GeomDrugsEDMLoss(
@@ -928,7 +952,69 @@ if __name__ == "__main__":
         default="bf16_tc",
         choices=["bf16_tc", "tf32", "ieee_fp32"],
     )
+    parser.add_argument(
+        "--mha-position-mode",
+        type=str,
+        default="none",
+        choices=["none", "rope", "rotary", "mha_rope", "mha-rope"],
+        help="Optional MHA-only positional operation. 'rope' applies 3D rotary embeddings to Q/K.",
+    )
+    parser.add_argument("--mha-rope-freq-sigma", type=float, default=1.0)
+    parser.add_argument("--mha-rope-learned-freqs", action="store_true")
+    parser.add_argument(
+        "--mha-rope-use-key",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When MHA RoPE is active, learn token keys. Disable to use RoPE-rotated all-ones keys.",
+    )
+    parser.add_argument(
+        "--mha-rope-on-values",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When MHA RoPE is active, rotate values and inverse-rotate attention outputs.",
+    )
+    parser.add_argument(
+        "--coord-embed-mode",
+        type=str,
+        default="none",
+        choices=["none", "rope", "mha_rope", "mha-rope", "rotary", "fourier", "rff", "learnable_rff", "learnable-rff"],
+        help="Optionally add coordinate token embeddings. 'rope' enables MHA RoPE without additive coordinate tokens.",
+    )
+    parser.add_argument(
+        "--coord-n-freqs",
+        type=int,
+        default=32,
+        help="Coordinate Fourier frequencies, or default RFF dimension when --coord-rff-dim is unset.",
+    )
+    parser.add_argument("--coord-rff-dim", type=int, default=None)
+    parser.add_argument("--coord-rff-sigma", type=float, default=1.0)
+    parser.add_argument(
+        "--coord-embed-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="RMS-normalize centered coordinates before optional coordinate token embedding.",
+    )
+    parser.add_argument(
+        "--coord-head-mode",
+        type=str,
+        default="equivariant",
+        choices=[
+            "equivariant",
+            "direct",
+            "relative",
+            "non_equivariant",
+            "non-equivariant",
+            "non-relative",
+        ],
+        help="Use the current pair-vector coordinate head or a direct non-equivariant xyz head.",
+    )
     parser.add_argument("--train-augm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--noise-conditioning",
+        type=str,
+        default=None,
+        help="Comma/space separated modes from {'concat', 'adaln'}. Default keeps legacy concat plus AdaLN.",
+    )
     parser.add_argument("--sigma-data", type=float, default=1.0)
     parser.add_argument("--p-mean", type=float, default=-1.2)
     parser.add_argument("--p-std", type=float, default=1.2)

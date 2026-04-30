@@ -1,4 +1,11 @@
-from matterformer.tasks.edm import EDMLoss, EDMPreconditioner, decode_atom_types, edm_sampler, recenter_coordinates
+from matterformer.tasks.edm import (
+    EDMLoss,
+    EDMPreconditioner,
+    decode_atom_types,
+    decode_qm9_charges,
+    edm_sampler,
+    recenter_coordinates,
+)
 from matterformer.tasks.geom_drugs_edm import (
     GeomDrugsEDMLoss,
     decode_geom_drugs_types_and_charges,
@@ -23,6 +30,7 @@ __all__ = [
     "MOFStage1EDMLoss",
     "MOFStage1EDMPreconditioner",
     "decode_atom_types",
+    "decode_qm9_charges",
     "decode_geom_drugs_types_and_charges",
     "edm_sampler",
     "lattice_latent_to_lattice_params",
