@@ -126,6 +126,16 @@ def maybe_configure_wandb(
                 "simplicial_angle_rank": args.simplicial_angle_rank,
                 "simplicial_message_mode": args.simplicial_message_mode,
                 "simplicial_message_rank": args.simplicial_message_rank,
+                "simplicial_position_mode": args.simplicial_position_mode,
+                "simplicial_rope_key_mode": args.simplicial_rope_key_mode,
+                "simplicial_rope_n_freqs": args.simplicial_rope_n_freqs,
+                "simplicial_rope_freq_sigma": args.simplicial_rope_freq_sigma,
+                "simplicial_rope_learned_freqs": args.simplicial_rope_learned_freqs,
+                "simplicial_rope_gate": args.simplicial_rope_gate,
+                "simplicial_rope_value_n_freqs": args.simplicial_rope_value_n_freqs,
+                "simplicial_rope_value_scale_init": args.simplicial_rope_value_scale_init,
+                "simplicial_rope_on_values": args.simplicial_rope_on_values,
+                "simplicial_content_logits": args.simplicial_content_logits,
                 "mha_geom_bias_mode": args.mha_geom_bias_mode,
                 "mha_position_mode": args.mha_position_mode,
                 "mha_rope_freq_sigma": args.mha_rope_freq_sigma,
@@ -389,6 +399,16 @@ def main(args: argparse.Namespace) -> None:
         simplicial_angle_rank=args.simplicial_angle_rank,
         simplicial_message_mode=args.simplicial_message_mode,
         simplicial_message_rank=args.simplicial_message_rank,
+        simplicial_position_mode=args.simplicial_position_mode,
+        simplicial_rope_key_mode=args.simplicial_rope_key_mode,
+        simplicial_rope_n_freqs=args.simplicial_rope_n_freqs,
+        simplicial_rope_freq_sigma=args.simplicial_rope_freq_sigma,
+        simplicial_rope_learned_freqs=args.simplicial_rope_learned_freqs,
+        simplicial_rope_gate=args.simplicial_rope_gate,
+        simplicial_rope_value_n_freqs=args.simplicial_rope_value_n_freqs,
+        simplicial_rope_value_scale_init=args.simplicial_rope_value_scale_init,
+        simplicial_rope_on_values=args.simplicial_rope_on_values,
+        simplicial_content_logits=args.simplicial_content_logits,
         mha_geom_bias_mode=args.mha_geom_bias_mode,
         mha_position_mode=args.mha_position_mode,
         mha_rope_freq_sigma=args.mha_rope_freq_sigma,
@@ -920,6 +940,31 @@ if __name__ == "__main__":
     parser.add_argument("--simplicial-angle-rank", type=int, default=16)
     parser.add_argument("--simplicial-message-mode", type=str, default="none", choices=["none", "low_rank"])
     parser.add_argument("--simplicial-message-rank", type=int, default=16)
+    parser.add_argument(
+        "--simplicial-position-mode",
+        type=str,
+        default="none",
+        choices=[
+            "none",
+            "closed_rope",
+            "closed-rope",
+            "center_edge_rope",
+            "center-edge-rope",
+            "closed_simplicial_rope",
+            "closed-simplicial-rope",
+            "cs_rope",
+            "cs-rope",
+        ],
+    )
+    parser.add_argument("--simplicial-rope-key-mode", type=str, default="constant", choices=["constant"])
+    parser.add_argument("--simplicial-rope-n-freqs", type=int, default=16)
+    parser.add_argument("--simplicial-rope-freq-sigma", type=float, default=1.0)
+    parser.add_argument("--simplicial-rope-learned-freqs", action="store_true")
+    parser.add_argument("--simplicial-rope-gate", type=str, default="none", choices=["none", "learned", "sigma"])
+    parser.add_argument("--simplicial-rope-value-n-freqs", type=int, default=None)
+    parser.add_argument("--simplicial-rope-value-scale-init", type=float, default=1.0)
+    parser.add_argument("--simplicial-rope-on-values", type=str, default="none", choices=["none", "carrier"])
+    parser.add_argument("--simplicial-content-logits", type=str, default="on", choices=["on", "off", "learned"])
     parser.add_argument(
         "--simplicial-precision",
         type=str,

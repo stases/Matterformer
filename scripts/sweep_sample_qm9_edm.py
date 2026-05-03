@@ -159,6 +159,20 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[EDMPreco
         simplicial_angle_rank=int(model_args.get("simplicial_angle_rank", 16)),
         simplicial_message_mode=str(model_args.get("simplicial_message_mode", "none")),
         simplicial_message_rank=int(model_args.get("simplicial_message_rank", 16)),
+        simplicial_position_mode=str(model_args.get("simplicial_position_mode", "none")),
+        simplicial_rope_key_mode=str(model_args.get("simplicial_rope_key_mode", "constant")),
+        simplicial_rope_n_freqs=int(model_args.get("simplicial_rope_n_freqs", 16)),
+        simplicial_rope_freq_sigma=float(model_args.get("simplicial_rope_freq_sigma", 1.0)),
+        simplicial_rope_learned_freqs=bool(model_args.get("simplicial_rope_learned_freqs", False)),
+        simplicial_rope_gate=str(model_args.get("simplicial_rope_gate", "none")),
+        simplicial_rope_value_n_freqs=(
+            None
+            if model_args.get("simplicial_rope_value_n_freqs", None) is None
+            else int(model_args.get("simplicial_rope_value_n_freqs"))
+        ),
+        simplicial_rope_value_scale_init=float(model_args.get("simplicial_rope_value_scale_init", 1.0)),
+        simplicial_rope_on_values=str(model_args.get("simplicial_rope_on_values", "none")),
+        simplicial_content_logits=str(model_args.get("simplicial_content_logits", "on")),
         simplicial_impl=args.simplicial_impl or str(model_args.get("simplicial_impl", "auto")),
         simplicial_precision=args.simplicial_precision
         or str(model_args.get("simplicial_precision", "ieee_fp32")),

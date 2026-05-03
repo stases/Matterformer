@@ -1,5 +1,6 @@
 from matterformer.models.attention import (
     SimplicialAttentionMask,
+    SimplicialClosedRoPE,
     SimplicialFactorizedBias,
     SimplicialLowRankAngleResidual,
     SimplicialLowRankMessageResidual,
@@ -43,6 +44,7 @@ __all__ = [
     "RotaryPositionEmbedding3D",
     "ScalarConditionEmbedding",
     "SimplicialAttentionMask",
+    "SimplicialClosedRoPE",
     "SimplicialFactorizedBias",
     "SimplicialGeometryBias",
     "SimplicialLowRankAngleResidual",

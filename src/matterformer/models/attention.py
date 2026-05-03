@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable
 
 import torch
@@ -198,6 +199,481 @@ class SimplicialAttentionMask:
         if self.pair_valid is not None:
             pair_valid = pair_valid & self.pair_valid.bool()
         return pair_valid
+
+
+def _canonicalize_simplicial_position_mode(mode: str) -> str:
+    mode = str(mode).lower().replace("-", "_")
+    if mode in {"disabled", "off", "false", "no"}:
+        return "none"
+    if mode in {"center_edge_rope", "closed_simplicial_rope", "cs_rope"}:
+        return "closed_rope"
+    if mode not in {"none", "closed_rope"}:
+        raise ValueError("simplicial_position_mode must be one of {'none', 'closed_rope'}")
+    return mode
+
+
+def _canonicalize_simplicial_rope_gate(mode: str) -> str:
+    mode = str(mode).lower().replace("-", "_")
+    if mode in {"disabled", "off", "false", "no"}:
+        return "none"
+    if mode not in {"none", "learned", "sigma"}:
+        raise ValueError("simplicial_rope_gate must be one of {'none', 'learned', 'sigma'}")
+    return mode
+
+
+def _canonicalize_simplicial_content_logits(mode: str) -> str:
+    mode = str(mode).lower().replace("-", "_")
+    if mode in {"disabled", "off", "false", "no"}:
+        return "off"
+    if mode in {"enabled", "on", "true", "yes"}:
+        return "on"
+    if mode in {"gated", "learned_scale", "learnable", "learnable_scale"}:
+        return "learned"
+    if mode not in {"on", "off", "learned"}:
+        raise ValueError("simplicial_content_logits must be one of {'on', 'off', 'learned'}")
+    return mode
+
+
+def _canonicalize_simplicial_rope_on_values(mode: str) -> str:
+    mode = str(mode).lower().replace("-", "_")
+    if mode in {"disabled", "off", "false", "no"}:
+        return "none"
+    if mode not in {"none", "carrier"}:
+        raise ValueError("simplicial_rope_on_values must be one of {'none', 'carrier'}")
+    return mode
+
+
+def _softplus_inverse(value: torch.Tensor) -> torch.Tensor:
+    return value + torch.log(-torch.expm1(-value))
+
+
+class SimplicialClosedRoPE(nn.Module):
+    """Constant-key closed simplicial RoPE as a low-rank logit residual."""
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        *,
+        n_freqs: int = 16,
+        freq_sigma: float = 1.0,
+        learned_freqs: bool = False,
+        gate: str = "none",
+        gate_init: float = 0.0,
+        logit_scale_init: float | None = None,
+        value_n_freqs: int | None = None,
+        value_scale_init: float = 1.0,
+        enable_value_carrier: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.n_freqs = int(n_freqs)
+        self.value_n_freqs = int(value_n_freqs) if value_n_freqs is not None else min(self.n_freqs, 16)
+        self.value_carrier_enabled = bool(enable_value_carrier)
+        self.freq_sigma = float(freq_sigma)
+        self.gate = _canonicalize_simplicial_rope_gate(gate)
+        if self.n_freqs <= 0:
+            raise ValueError("simplicial_rope_n_freqs must be positive")
+        if 2 * self.n_freqs > self.head_dim:
+            raise ValueError(
+                "closed simplicial RoPE uses two real query channels per frequency; "
+                f"got n_freqs={self.n_freqs} and head_dim={self.head_dim}"
+            )
+        if self.value_carrier_enabled:
+            if self.value_n_freqs <= 0:
+                raise ValueError("simplicial_rope_value_n_freqs must be positive")
+            if self.value_n_freqs > self.n_freqs:
+                raise ValueError(
+                    "simplicial_rope_value_n_freqs must be <= simplicial_rope_n_freqs; "
+                    f"got {self.value_n_freqs} > {self.n_freqs}"
+                )
+            if 2 * self.value_n_freqs > self.head_dim:
+                raise ValueError(
+                    "closed simplicial RoPE value carrier uses two real value channels per frequency; "
+                    f"got value_n_freqs={self.value_n_freqs} and head_dim={self.head_dim}"
+                )
+
+        mu = self._build_spiral_frequencies(
+            num_heads=self.num_heads,
+            num_freqs=self.n_freqs,
+            freq_sigma=0.5 * self.freq_sigma,
+            phase_offset=0.0,
+        )
+        nu = self._build_spiral_frequencies(
+            num_heads=self.num_heads,
+            num_freqs=self.n_freqs,
+            freq_sigma=self.freq_sigma,
+            phase_offset=math.pi / max(self.num_heads, 1),
+        )
+        if learned_freqs:
+            self.mu = nn.Parameter(mu)
+            self.nu = nn.Parameter(nu)
+        else:
+            self.register_buffer("mu", mu, persistent=False)
+            self.register_buffer("nu", nu, persistent=False)
+
+        if self.gate == "learned":
+            self.gate_logit = nn.Parameter(torch.full((1, self.num_heads, 1), float(gate_init)))
+        else:
+            self.gate_logit = None
+        if self.gate == "sigma":
+            alpha_init = torch.ones((1, self.num_heads, 1), dtype=torch.float32)
+            self.sigma_gate_alpha_raw = nn.Parameter(_softplus_inverse(alpha_init))
+            self.sigma_gate_beta = nn.Parameter(torch.full((1, self.num_heads, 1), float(gate_init)))
+        else:
+            self.sigma_gate_alpha_raw = None
+            self.sigma_gate_beta = None
+        if logit_scale_init is None:
+            logit_scale_init = math.sqrt(self.head_dim)
+        if logit_scale_init <= 0:
+            raise ValueError("simplicial_rope_logit_scale_init must be positive")
+        self.logit_scale = nn.Parameter(
+            torch.full((1, self.num_heads, 1, 1, 1), math.log(float(logit_scale_init)), dtype=torch.float32)
+        )
+        if self.value_carrier_enabled:
+            if value_scale_init <= 0:
+                raise ValueError("simplicial_rope_value_scale_init must be positive")
+            self.value_log_scale = nn.Parameter(
+                torch.full((self.num_heads, 1, 1), math.log(float(value_scale_init)), dtype=torch.float32)
+            )
+            self.register_buffer("value_carrier_basis", self._build_value_carrier_basis(), persistent=False)
+        else:
+            self.value_log_scale = None
+            self.register_buffer("value_carrier_basis", torch.empty(0, dtype=torch.float32), persistent=False)
+
+    def _build_value_carrier_basis(self) -> torch.Tensor:
+        value_rank = 4 * self.value_n_freqs
+        basis = torch.zeros(self.num_heads, value_rank, self.head_dim, dtype=torch.float32)
+        scale = math.sqrt(value_rank)
+        for freq_idx in range(self.value_n_freqs):
+            base = 4 * freq_idx
+            real_dim = 2 * freq_idx
+            imag_dim = real_dim + 1
+            basis[:, base + 0, real_dim] = scale
+            basis[:, base + 1, real_dim] = -scale
+            basis[:, base + 2, imag_dim] = scale
+            basis[:, base + 3, imag_dim] = scale
+        return basis
+
+    @staticmethod
+    def _build_spiral_frequencies(
+        *,
+        num_heads: int,
+        num_freqs: int,
+        freq_sigma: float,
+        phase_offset: float,
+    ) -> torch.Tensor:
+        indices = torch.arange(num_freqs, dtype=torch.float32) + 0.5
+        magnitudes = torch.linspace(
+            freq_sigma / max(num_freqs, 1),
+            freq_sigma,
+            num_freqs,
+            dtype=torch.float32,
+        )
+        head_phases = torch.linspace(0.0, 2.0 * math.pi, num_heads + 1, dtype=torch.float32)[:-1]
+        head_phases = head_phases[:, None] + float(phase_offset)
+
+        golden_ratio = (1.0 + math.sqrt(5.0)) / 2.0
+        y = (1.0 - 2.0 * indices / float(num_freqs)).clamp(min=-1.0, max=1.0)
+        radius = torch.sqrt((1.0 - y.square()).clamp_min(0.0))
+        theta = (2.0 * math.pi * indices / golden_ratio)[None, :] + head_phases
+        x = radius[None, :] * torch.cos(theta)
+        z = radius[None, :] * torch.sin(theta)
+        directions = torch.stack([x, y[None, :].expand(num_heads, -1), z], dim=-1)
+        return directions * magnitudes.view(1, num_freqs, 1)
+
+    def _gate(
+        self,
+        *,
+        batch_size: int,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        sigma: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.gate == "none":
+            return torch.ones((batch_size, self.num_heads, num_tokens), device=device, dtype=dtype)
+        if self.gate == "learned":
+            assert self.gate_logit is not None
+            return torch.sigmoid(self.gate_logit).to(device=device, dtype=dtype).expand(batch_size, -1, num_tokens)
+        if sigma is None:
+            raise ValueError("sigma must be provided when simplicial_rope_gate='sigma'")
+        if sigma.ndim == 2 and sigma.shape[-1] == 1:
+            sigma = sigma[:, 0]
+        if sigma.ndim != 1:
+            raise ValueError(f"sigma must have shape (B,) or (B, 1), got {tuple(sigma.shape)}")
+        if sigma.shape[0] == 1 and batch_size > 1:
+            sigma = sigma.expand(batch_size)
+        if sigma.shape[0] != batch_size:
+            raise ValueError(f"sigma batch {sigma.shape[0]} does not match batch size {batch_size}")
+        assert self.sigma_gate_alpha_raw is not None
+        assert self.sigma_gate_beta is not None
+        sigma_feat = -torch.log(sigma.to(device=device, dtype=torch.float32).clamp_min(1e-8))
+        alpha = F.softplus(self.sigma_gate_alpha_raw).to(device=device, dtype=torch.float32)
+        beta = self.sigma_gate_beta.to(device=device, dtype=torch.float32)
+        gate = torch.sigmoid(alpha * sigma_feat[:, None, None] + beta)
+        return gate.to(dtype=dtype).expand(-1, -1, num_tokens)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        sigma: torch.Tensor | None = None,
+        position_query_mask: torch.Tensor | None = None,
+    ) -> SimplicialLowRankAngleResidual:
+        if q.ndim != 4:
+            raise ValueError(f"q must have shape (B, H, T, D), got {tuple(q.shape)}")
+        batch_size, num_heads, num_tokens, head_dim = q.shape
+        if num_heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"q shape {(num_heads, head_dim)} does not match closed RoPE "
+                f"{(self.num_heads, self.head_dim)}"
+            )
+        if positions.ndim != 3 or positions.shape[-1] != 3:
+            raise ValueError(f"simplicial RoPE positions must have shape (B, T, 3), got {tuple(positions.shape)}")
+        if positions.shape[:2] != (batch_size, num_tokens):
+            raise ValueError(
+                f"simplicial RoPE positions shape {tuple(positions.shape[:2])} must match "
+                f"{(batch_size, num_tokens)}"
+            )
+        if position_query_mask is not None and position_query_mask.shape != (batch_size, num_tokens):
+            raise ValueError(
+                f"position_query_mask must have shape {(batch_size, num_tokens)}, "
+                f"got {tuple(position_query_mask.shape)}"
+            )
+
+        work_dtype = torch.float32
+        q_pairs = q[..., : 2 * self.n_freqs].to(dtype=work_dtype).view(
+            batch_size,
+            num_heads,
+            num_tokens,
+            self.n_freqs,
+            2,
+        )
+        q_r, q_i = q_pairs.unbind(dim=-1)
+
+        mu = self.mu.to(device=q.device, dtype=work_dtype)
+        nu = self.nu.to(device=q.device, dtype=work_dtype)
+        a = 0.5 * (mu + nu)
+        b = 0.5 * (mu - nu)
+
+        positions_work = positions.to(device=q.device, dtype=work_dtype)
+        rel = positions_work[:, None, :, :] - positions_work[:, :, None, :]
+        phi = torch.einsum("bqjd,hmd->bhqjm", rel, a)
+        psi = torch.einsum("bqkd,hmd->bhqkm", rel, b)
+        cos_phi = torch.cos(phi)
+        sin_phi = torch.sin(phi)
+        cos_psi = torch.cos(psi)
+        sin_psi = torch.sin(psi)
+
+        q_r = q_r.unsqueeze(3)
+        q_i = q_i.unsqueeze(3)
+        left_even = q_r * cos_phi + q_i * sin_phi
+        left_odd = -q_r * sin_phi + q_i * cos_phi
+        right_even = cos_psi
+        right_odd = sin_psi
+
+        rank = 2 * self.n_freqs
+        left = math.sqrt(2.0) * torch.stack((left_even, left_odd), dim=-1).reshape(
+            batch_size,
+            num_heads,
+            num_tokens,
+            num_tokens,
+            rank,
+        )
+        left = left * self.logit_scale.to(device=q.device, dtype=left.dtype).exp()
+        right = torch.stack((right_even, right_odd), dim=-1).reshape(
+            batch_size,
+            num_heads,
+            num_tokens,
+            num_tokens,
+            rank,
+        )
+        gate = self._gate(
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            dtype=left.dtype,
+            device=q.device,
+            sigma=sigma,
+        )
+        if position_query_mask is not None:
+            gate = gate * position_query_mask.to(device=q.device, dtype=gate.dtype)[:, None, :]
+        return SimplicialLowRankAngleResidual(
+            left=left.contiguous(),
+            right=right.contiguous(),
+            gate=gate.contiguous(),
+        )
+
+    def build_value_carrier(
+        self,
+        v1: torch.Tensor,
+        v2: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        position_query_mask: torch.Tensor | None = None,
+    ) -> tuple[SimplicialLowRankMessageResidual, torch.Tensor]:
+        if not self.value_carrier_enabled or self.value_log_scale is None:
+            raise ValueError("simplicial RoPE value carrier is not enabled")
+        if v1.shape != v2.shape:
+            raise ValueError(f"v1 and v2 must have the same shape, got {tuple(v1.shape)} and {tuple(v2.shape)}")
+        if v1.ndim != 4:
+            raise ValueError(f"v1/v2 must have shape (B, H, T, D), got {tuple(v1.shape)}")
+        batch_size, num_heads, num_tokens, head_dim = v1.shape
+        if num_heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"value shape {(num_heads, head_dim)} does not match closed RoPE "
+                f"{(self.num_heads, self.head_dim)}"
+            )
+        if positions.ndim != 3 or positions.shape != (batch_size, num_tokens, 3):
+            raise ValueError(f"positions must have shape {(batch_size, num_tokens, 3)}, got {tuple(positions.shape)}")
+        if position_query_mask is not None and position_query_mask.shape != (batch_size, num_tokens):
+            raise ValueError(
+                f"position_query_mask must have shape {(batch_size, num_tokens)}, "
+                f"got {tuple(position_query_mask.shape)}"
+            )
+
+        work_dtype = torch.float32
+        value_n_freqs = self.value_n_freqs
+        value_rank = 4 * value_n_freqs
+        v1_pairs = v1[..., : 2 * value_n_freqs].to(dtype=work_dtype).view(
+            batch_size,
+            num_heads,
+            num_tokens,
+            value_n_freqs,
+            2,
+        )
+        v2_pairs = v2[..., : 2 * value_n_freqs].to(dtype=work_dtype).view(
+            batch_size,
+            num_heads,
+            num_tokens,
+            value_n_freqs,
+            2,
+        )
+        v1_r, v1_i = v1_pairs.unbind(dim=-1)
+        v2_r, v2_i = v2_pairs.unbind(dim=-1)
+
+        mu = self.mu[:, :value_n_freqs].to(device=v1.device, dtype=work_dtype)
+        nu = self.nu[:, :value_n_freqs].to(device=v1.device, dtype=work_dtype)
+        a = 0.5 * (mu + nu)
+        b = 0.5 * (mu - nu)
+
+        positions_work = positions.to(device=v1.device, dtype=work_dtype)
+        rel = positions_work[:, None, :, :] - positions_work[:, :, None, :]
+        phi = torch.einsum("bqjd,hmd->bhqjm", rel, a)
+        psi = torch.einsum("bqkd,hmd->bhqkm", rel, b)
+        cos_phi = torch.cos(phi)
+        sin_phi = torch.sin(phi)
+        cos_psi = torch.cos(psi)
+        sin_psi = torch.sin(psi)
+
+        v1_r = v1_r.unsqueeze(2)
+        v1_i = v1_i.unsqueeze(2)
+        v2_r = v2_r.unsqueeze(2)
+        v2_i = v2_i.unsqueeze(2)
+        a_r = v1_r * cos_phi - v1_i * sin_phi
+        a_i = v1_r * sin_phi + v1_i * cos_phi
+        b_r = v2_r * cos_psi - v2_i * sin_psi
+        b_i = v2_r * sin_psi + v2_i * cos_psi
+
+        left = torch.empty(batch_size, num_heads, num_tokens, num_tokens, value_rank, device=v1.device, dtype=work_dtype)
+        right = torch.empty_like(left)
+        left[..., 0::4] = a_r
+        right[..., 0::4] = b_r
+        left[..., 1::4] = a_i
+        right[..., 1::4] = b_i
+        left[..., 2::4] = a_r
+        right[..., 2::4] = b_i
+        left[..., 3::4] = a_i
+        right[..., 3::4] = b_r
+        if position_query_mask is not None:
+            left = left * position_query_mask.to(device=v1.device, dtype=work_dtype)[:, None, :, None, None]
+
+        basis = self.value_carrier_basis.to(device=v1.device, dtype=work_dtype)
+        basis = basis * self.value_log_scale.to(device=v1.device, dtype=work_dtype).exp()
+        return (
+            SimplicialLowRankMessageResidual(left=left.contiguous(), right=right.contiguous()),
+            basis.contiguous(),
+        )
+
+
+def _merge_angle_residuals(
+    *residuals: SimplicialLowRankAngleResidual | None,
+) -> SimplicialLowRankAngleResidual | None:
+    active = [residual for residual in residuals if residual is not None]
+    if not active:
+        return None
+    if len(active) == 1:
+        return active[0]
+
+    total_rank = sum(residual.rank for residual in active)
+    common_dtype = active[0].left.dtype
+    for residual in active:
+        common_dtype = torch.promote_types(common_dtype, residual.left.dtype)
+        common_dtype = torch.promote_types(common_dtype, residual.right.dtype)
+        common_dtype = torch.promote_types(common_dtype, residual.gate.dtype)
+
+    left_parts = []
+    right_parts = []
+    for residual in active:
+        scale = math.sqrt(total_rank / residual.rank)
+        left = residual.left.to(dtype=common_dtype)
+        right = residual.right.to(dtype=common_dtype)
+        gate = residual.gate.to(dtype=common_dtype)
+        left_parts.append(
+            left
+            * gate.unsqueeze(-1).unsqueeze(-1)
+            * scale
+        )
+        right_parts.append(right)
+    gate = torch.ones_like(active[0].gate, dtype=common_dtype)
+    return SimplicialLowRankAngleResidual(
+        left=torch.cat(left_parts, dim=-1).contiguous(),
+        right=torch.cat(right_parts, dim=-1).contiguous(),
+        gate=gate,
+    )
+
+
+def _merge_message_residuals(
+    *branches: tuple[SimplicialLowRankMessageResidual, torch.Tensor] | None,
+) -> tuple[SimplicialLowRankMessageResidual | None, torch.Tensor | None]:
+    active = [branch for branch in branches if branch is not None]
+    if not active:
+        return None, None
+    if len(active) == 1:
+        return active[0]
+
+    batch_size, num_heads, num_tokens, _, _ = active[0][0].left.shape
+    head_dim = active[0][1].shape[-1]
+    total_rank = sum(residual.rank for residual, _ in active)
+    common_dtype = active[0][0].left.dtype
+    for residual, basis in active:
+        residual.validate(batch_size=batch_size, num_heads=num_heads, num_tokens=num_tokens)
+        if basis.shape != (num_heads, residual.rank, head_dim):
+            raise ValueError(
+                f"message basis must have shape {(num_heads, residual.rank, head_dim)}, "
+                f"got {tuple(basis.shape)}"
+            )
+        common_dtype = torch.promote_types(common_dtype, residual.left.dtype)
+        common_dtype = torch.promote_types(common_dtype, residual.right.dtype)
+        common_dtype = torch.promote_types(common_dtype, basis.dtype)
+
+    left_parts = []
+    right_parts = []
+    basis_parts = []
+    for residual, basis in active:
+        scale = math.sqrt(total_rank / residual.rank)
+        left_parts.append(residual.left.to(dtype=common_dtype) * scale)
+        right_parts.append(residual.right.to(dtype=common_dtype))
+        basis_parts.append(basis.to(dtype=common_dtype))
+    return (
+        SimplicialLowRankMessageResidual(
+            left=torch.cat(left_parts, dim=-1).contiguous(),
+            right=torch.cat(right_parts, dim=-1).contiguous(),
+        ),
+        torch.cat(basis_parts, dim=1).contiguous(),
+    )
 
 
 def _materialize_chunk_logits(
@@ -740,6 +1216,16 @@ class TwoSimplicialAttention(nn.Module):
         precision: str = "bf16_tc",
         message_mode: str = "none",
         message_rank: int = 16,
+        position_mode: str = "none",
+        rope_key_mode: str = "constant",
+        rope_n_freqs: int = 16,
+        rope_freq_sigma: float = 1.0,
+        rope_learned_freqs: bool = False,
+        rope_gate: str = "none",
+        rope_value_n_freqs: int | None = None,
+        rope_value_scale_init: float = 1.0,
+        rope_on_values: str = "none",
+        content_logits: str = "on",
         debug_torch_backward: bool = False,
     ) -> None:
         super().__init__()
@@ -763,6 +1249,14 @@ class TwoSimplicialAttention(nn.Module):
         message_rank = int(message_rank)
         if message_mode == "low_rank" and message_rank <= 0:
             raise ValueError("simplicial_message_rank must be positive when message_mode='low_rank'")
+        position_mode = _canonicalize_simplicial_position_mode(position_mode)
+        rope_key_mode = str(rope_key_mode).lower().replace("-", "_")
+        if rope_key_mode != "constant":
+            raise ValueError("Only simplicial_rope_key_mode='constant' is implemented in the first closed-RoPE version")
+        rope_on_values = _canonicalize_simplicial_rope_on_values(rope_on_values)
+        if rope_on_values == "carrier" and position_mode != "closed_rope":
+            raise ValueError("simplicial_rope_on_values='carrier' requires simplicial_position_mode='closed_rope'")
+        content_logits = _canonicalize_simplicial_content_logits(content_logits)
 
         self.dim = int(dim)
         self.num_heads = int(num_heads)
@@ -774,6 +1268,10 @@ class TwoSimplicialAttention(nn.Module):
         self.precision = normalize_simplicial_precision(precision)
         self.message_mode = message_mode
         self.message_rank = message_rank
+        self.position_mode = position_mode
+        self.rope_key_mode = rope_key_mode
+        self.rope_on_values = rope_on_values
+        self.content_logits = content_logits
         self.debug_torch_backward = bool(debug_torch_backward)
         self.scale = self.head_dim**-0.5
         self._last_impl_used = "torch"
@@ -789,6 +1287,26 @@ class TwoSimplicialAttention(nn.Module):
             nn.init.normal_(self.message_basis, mean=0.0, std=self.head_dim**-0.5)
         else:
             self.message_basis = None
+        self.content_logit_log_scale = (
+            nn.Parameter(torch.zeros((1, self.num_heads, 1, 1), dtype=torch.float32))
+            if self.content_logits == "learned"
+            else None
+        )
+        self.closed_rope = (
+            SimplicialClosedRoPE(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                n_freqs=rope_n_freqs,
+                freq_sigma=rope_freq_sigma,
+                learned_freqs=rope_learned_freqs,
+                gate=rope_gate,
+                value_n_freqs=rope_value_n_freqs,
+                value_scale_init=rope_value_scale_init,
+                enable_value_carrier=rope_on_values == "carrier",
+            )
+            if self.position_mode == "closed_rope"
+            else None
+        )
 
     @staticmethod
     def _split_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
@@ -812,6 +1330,14 @@ class TwoSimplicialAttention(nn.Module):
         v2 = self._split_heads(v2, self.num_heads, self.head_dim)
         return q, k1, v1, k2, v2
 
+    def _content_query(self, q: torch.Tensor) -> torch.Tensor:
+        if self.content_logits == "on":
+            return q
+        if self.content_logits == "off":
+            return torch.zeros_like(q)
+        assert self.content_logit_log_scale is not None
+        return q * self.content_logit_log_scale.to(device=q.device, dtype=q.dtype).exp()
+
     def _triton_unavailable_reason(
         self,
         *,
@@ -819,6 +1345,7 @@ class TwoSimplicialAttention(nn.Module):
         factorized_bias: SimplicialFactorizedBias | None,
         angle_residual: SimplicialLowRankAngleResidual | None,
         message_residual: SimplicialLowRankMessageResidual | None,
+        message_basis: torch.Tensor | None,
         logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None,
         return_attn: bool,
     ) -> str | None:
@@ -855,14 +1382,21 @@ class TwoSimplicialAttention(nn.Module):
             if angle_residual.rank > 64:
                 return f"the Triton backend only supports low-rank angle residual rank <= 64, got {angle_residual.rank}"
         if message_residual is not None:
-            if self.message_basis is None:
-                return "message residual tensors require simplicial_message_mode='low_rank'"
+            if message_basis is None:
+                return "message residual tensors require a message_basis"
             if message_residual.left.device != x.device or message_residual.right.device != x.device:
                 return "message residual tensors must be on the same CUDA device as the attention input"
-            if self.message_basis.device != x.device:
+            if message_basis.device != x.device:
                 return "message basis tensor must be on the same CUDA device as the attention input"
+            if message_basis.shape != (self.num_heads, message_residual.rank, self.head_dim):
+                return (
+                    "message basis tensor must have shape "
+                    f"{(self.num_heads, message_residual.rank, self.head_dim)}, got {tuple(message_basis.shape)}"
+                )
             if message_residual.rank > 64:
                 return f"the Triton backend only supports low-rank message residual rank <= 64, got {message_residual.rank}"
+        elif message_basis is not None:
+            return "message_basis must be None when message_residual is None"
         return None
 
     def _triton_compute_dtype(self) -> torch.dtype:
@@ -909,6 +1443,7 @@ class TwoSimplicialAttention(nn.Module):
         factorized_bias: SimplicialFactorizedBias | None,
         angle_residual: SimplicialLowRankAngleResidual | None,
         message_residual: SimplicialLowRankMessageResidual | None,
+        message_basis: torch.Tensor | None,
     ) -> torch.Tensor:
         attention_mask = _coerce_attention_mask(
             attention_mask,
@@ -952,20 +1487,21 @@ class TwoSimplicialAttention(nn.Module):
         if message_residual is None:
             message_left = message_right = message_basis = empty_float
         else:
-            if self.message_basis is None:
+            if message_basis is None:
                 raise RuntimeError("message_residual requires message_basis")
             message_residual.validate(
                 batch_size=q.shape[0],
                 num_heads=q.shape[1],
                 num_tokens=q.shape[2],
             )
-            if message_residual.rank != self.message_rank:
+            expected_basis_shape = (q.shape[1], message_residual.rank, q.shape[-1])
+            if message_basis.shape != expected_basis_shape:
                 raise ValueError(
-                    f"message_residual rank {message_residual.rank} does not match attention message_rank {self.message_rank}"
+                    f"message_basis must have shape {expected_basis_shape}, got {tuple(message_basis.shape)}"
                 )
             message_left = message_residual.left
             message_right = message_residual.right
-            message_basis = self.message_basis.to(device=q.device, dtype=torch.float32)
+            message_basis = message_basis.to(device=q.device, dtype=torch.float32)
 
         return _TritonTwoSimplicialAttentionFunction.apply(
             q.contiguous(),
@@ -1001,6 +1537,9 @@ class TwoSimplicialAttention(nn.Module):
         angle_residual: SimplicialLowRankAngleResidual | None = None,
         message_residual: SimplicialLowRankMessageResidual | None = None,
         logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
+        positions: torch.Tensor | None = None,
+        position_query_mask: torch.Tensor | None = None,
+        sigma: torch.Tensor | None = None,
         return_attn: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 3:
@@ -1038,12 +1577,51 @@ class TwoSimplicialAttention(nn.Module):
                 raise ValueError(
                     f"message_residual rank {message_residual.rank} does not match attention message_rank {self.message_rank}"
                 )
+        external_message_residual = message_residual
+        external_message_basis = self.message_basis if external_message_residual is not None else None
+
+        q, k1, v1, k2, v2 = self._project_inputs(x)
+        rope_angle_residual = None
+        carrier_message_residual = None
+        carrier_message_basis = None
+        if self.closed_rope is not None:
+            if positions is None:
+                raise ValueError("positions must be provided when simplicial_position_mode='closed_rope'")
+            rope_angle_residual = self.closed_rope(
+                q,
+                positions,
+                sigma=sigma,
+                position_query_mask=position_query_mask,
+            )
+            if self.rope_on_values == "carrier":
+                carrier_message_residual, carrier_message_basis = self.closed_rope.build_value_carrier(
+                    v1,
+                    v2,
+                    positions,
+                    position_query_mask=position_query_mask,
+                )
+                carrier_dim = 2 * self.closed_rope.value_n_freqs
+                v1 = v1.clone()
+                v2 = v2.clone()
+                v1[..., :carrier_dim] = 0.0
+                v2[..., :carrier_dim] = 0.0
+        angle_residual = _merge_angle_residuals(angle_residual, rope_angle_residual)
+        message_residual, message_basis = _merge_message_residuals(
+            (external_message_residual, external_message_basis)
+            if external_message_residual is not None and external_message_basis is not None
+            else None,
+            (carrier_message_residual, carrier_message_basis)
+            if carrier_message_residual is not None and carrier_message_basis is not None
+            else None,
+        )
+        q_content = self._content_query(q)
 
         reason = self._triton_unavailable_reason(
             x=x,
             factorized_bias=factorized_bias,
             angle_residual=angle_residual,
             message_residual=message_residual,
+            message_basis=message_basis,
             logit_bias_fn=logit_bias_fn,
             return_attn=return_attn,
         )
@@ -1057,11 +1635,9 @@ class TwoSimplicialAttention(nn.Module):
             impl_used = "torch"
         self._last_impl_used = impl_used
 
-        q, k1, v1, k2, v2 = self._project_inputs(x)
-
         if impl_used == "triton":
             out = self._forward_triton(
-                q,
+                q_content,
                 k1,
                 v1,
                 k2,
@@ -1070,12 +1646,13 @@ class TwoSimplicialAttention(nn.Module):
                 factorized_bias=factorized_bias,
                 angle_residual=angle_residual,
                 message_residual=message_residual,
+                message_basis=message_basis,
             )
             y = self._merge_heads(out)
             return self.out_proj(y)
 
         out = simplicial_attention_torch_from_projected(
-            q,
+            q_content,
             k1,
             v1,
             k2,
@@ -1084,7 +1661,7 @@ class TwoSimplicialAttention(nn.Module):
             factorized_bias=factorized_bias,
             angle_residual=angle_residual,
             message_residual=message_residual,
-            message_basis=self.message_basis if message_residual is not None else None,
+            message_basis=message_basis,
             logit_bias_fn=logit_bias_fn,
             dropout_p=self.dropout,
             training=self.training,

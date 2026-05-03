@@ -3,7 +3,7 @@ import torch
 
 import matterformer.models.attention as attention_module
 from matterformer.geometry import NonPeriodicGeometryAdapter
-from matterformer.models import QM9EDMModel, SimplicialGeometryBias, TwoSimplicialAttention
+from matterformer.models import QM9EDMModel, SimplicialClosedRoPE, SimplicialGeometryBias, TwoSimplicialAttention
 from matterformer.models.attention import (
     SimplicialAttentionMask,
     SimplicialFactorizedBias,
@@ -315,6 +315,326 @@ def test_torch_backend_matches_reference_with_low_rank_angle_residual():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_closed_simplicial_rope_matches_direct_constant_key_formula():
+    torch.manual_seed(0)
+    n_freqs = 3
+    module = SimplicialClosedRoPE(
+        num_heads=2,
+        head_dim=8,
+        n_freqs=n_freqs,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+    )
+    q = torch.randn(1, 2, 4, 8, requires_grad=True)
+    positions = torch.randn(1, 4, 3)
+
+    residual = module(q, positions)
+    actual = residual.chunk(0, positions.shape[1], dtype=torch.float32, device=q.device)
+
+    q_complex = q[..., : 2 * n_freqs].float().view(1, 2, 4, n_freqs, 2)
+    q_real, q_imag = q_complex.unbind(dim=-1)
+    mu = module.mu.float()
+    nu = module.nu.float()
+    a = 0.5 * (mu + nu)
+    b = 0.5 * (mu - nu)
+    rel = positions[:, None, :, :] - positions[:, :, None, :]
+    phi = torch.einsum("bqjd,hmd->bhqjm", rel, a)
+    psi = torch.einsum("bqkd,hmd->bhqkm", rel, b)
+    phase = phi.unsqueeze(4) + psi.unsqueeze(3)
+    expected = (
+        q_real[:, :, :, None, None, :] * torch.cos(phase)
+        + q_imag[:, :, :, None, None, :] * torch.sin(phase)
+    ).sum(dim=-1) * (n_freqs**-0.5)
+    expected = expected * module.logit_scale.detach().exp()
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+    actual.square().mean().backward()
+    assert q.grad is not None
+
+
+def test_closed_simplicial_rope_is_translation_invariant():
+    torch.manual_seed(0)
+    module = SimplicialClosedRoPE(
+        num_heads=2,
+        head_dim=8,
+        n_freqs=3,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+    )
+    q = torch.randn(1, 2, 4, 8)
+    positions = torch.randn(1, 4, 3)
+    shift = torch.tensor([[[10.0, -4.0, 2.5]]])
+
+    actual = module(q, positions).chunk(0, 4, dtype=torch.float32, device=q.device)
+    shifted = module(q, positions + shift).chunk(0, 4, dtype=torch.float32, device=q.device)
+
+    assert torch.allclose(actual, shifted, atol=1e-6, rtol=1e-5)
+
+
+def test_closed_simplicial_rope_position_query_mask_zeroes_non_coordinate_queries():
+    torch.manual_seed(0)
+    module = SimplicialClosedRoPE(
+        num_heads=2,
+        head_dim=8,
+        n_freqs=3,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+    )
+    q = torch.randn(1, 2, 4, 8)
+    positions = torch.randn(1, 4, 3)
+    position_query_mask = torch.tensor([[True, True, True, False]])
+
+    actual = module(q, positions, position_query_mask=position_query_mask).chunk(
+        0,
+        4,
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    assert torch.all(actual[:, :, 3] == 0)
+    assert actual[:, :, :3].abs().sum() > 0
+
+
+def test_closed_simplicial_rope_logit_only_has_no_value_carrier_parameter():
+    module = SimplicialClosedRoPE(
+        num_heads=2,
+        head_dim=8,
+        n_freqs=3,
+        value_n_freqs=2,
+        gate="none",
+    )
+
+    assert module.value_log_scale is None
+    assert "value_log_scale" not in dict(module.named_parameters())
+    with pytest.raises(ValueError, match="value carrier is not enabled"):
+        module.build_value_carrier(
+            torch.randn(1, 2, 4, 8),
+            torch.randn(1, 2, 4, 8),
+            torch.randn(1, 4, 3),
+        )
+
+
+def _materialize_message_residual_output(
+    attention_weights: torch.Tensor,
+    residual: SimplicialLowRankMessageResidual,
+    basis: torch.Tensor,
+) -> torch.Tensor:
+    coeff = torch.einsum(
+        "bhqjk,bhqjr,bhqkr->bhqr",
+        attention_weights.float(),
+        residual.left.float(),
+        residual.right.float(),
+    ) * (residual.rank**-0.5)
+    return torch.einsum("bhqr,hrd->bhqd", coeff, basis.float())
+
+
+def test_closed_simplicial_rope_value_carrier_matches_direct_complex_transport():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 2, 2, 4, 8
+    n_freqs = 3
+    value_n_freqs = 2
+    module = SimplicialClosedRoPE(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_freqs=n_freqs,
+        value_n_freqs=value_n_freqs,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+        value_scale_init=1.7,
+        enable_value_carrier=True,
+    )
+    v1 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v2 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    positions = torch.randn(batch_size, num_tokens, 3)
+    attention_weights = torch.softmax(
+        torch.randn(batch_size, num_heads, num_tokens, num_tokens, num_tokens).flatten(-2),
+        dim=-1,
+    ).view(batch_size, num_heads, num_tokens, num_tokens, num_tokens)
+
+    residual, basis = module.build_value_carrier(v1, v2, positions)
+    actual = _materialize_message_residual_output(attention_weights, residual, basis)
+
+    v1_complex = v1[..., : 2 * value_n_freqs].float().view(
+        batch_size,
+        num_heads,
+        num_tokens,
+        value_n_freqs,
+        2,
+    )
+    v2_complex = v2[..., : 2 * value_n_freqs].float().view(
+        batch_size,
+        num_heads,
+        num_tokens,
+        value_n_freqs,
+        2,
+    )
+    z1 = torch.complex(v1_complex[..., 0], v1_complex[..., 1])
+    z2 = torch.complex(v2_complex[..., 0], v2_complex[..., 1])
+    mu = module.mu[:, :value_n_freqs].float()
+    nu = module.nu[:, :value_n_freqs].float()
+    a = 0.5 * (mu + nu)
+    b = 0.5 * (mu - nu)
+    rel = positions[:, None, :, :] - positions[:, :, None, :]
+    phi = torch.einsum("bqjd,hmd->bhqjm", rel, a)
+    psi = torch.einsum("bqkd,hmd->bhqkm", rel, b)
+    phase = phi.unsqueeze(4) + psi.unsqueeze(3)
+    carrier = torch.complex(torch.cos(phase), torch.sin(phase))
+    expected_complex = (
+        attention_weights.unsqueeze(-1)
+        * z1[:, :, None, :, None, :]
+        * z2[:, :, None, None, :, :]
+        * carrier
+    ).sum(dim=(3, 4))
+    value_scale = module.value_log_scale.detach().exp().view(1, num_heads, 1, 1)
+    expected_complex = expected_complex * value_scale
+    expected = torch.zeros_like(actual)
+    expected[..., : 2 * value_n_freqs] = torch.stack(
+        (expected_complex.real, expected_complex.imag),
+        dim=-1,
+    ).reshape(batch_size, num_heads, num_tokens, 2 * value_n_freqs)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    assert torch.all(actual[..., 2 * value_n_freqs :] == 0)
+
+
+def test_closed_simplicial_rope_value_carrier_is_translation_invariant():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 1, 2, 4, 8
+    module = SimplicialClosedRoPE(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_freqs=3,
+        value_n_freqs=2,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+        enable_value_carrier=True,
+    )
+    v1 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v2 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    positions = torch.randn(batch_size, num_tokens, 3)
+    shift = torch.tensor([[[10.0, -4.0, 2.5]]])
+    attention_weights = torch.softmax(
+        torch.randn(batch_size, num_heads, num_tokens, num_tokens, num_tokens).flatten(-2),
+        dim=-1,
+    ).view(batch_size, num_heads, num_tokens, num_tokens, num_tokens)
+
+    residual, basis = module.build_value_carrier(v1, v2, positions)
+    shifted_residual, shifted_basis = module.build_value_carrier(v1, v2, positions + shift)
+    actual = _materialize_message_residual_output(attention_weights, residual, basis)
+    shifted = _materialize_message_residual_output(attention_weights, shifted_residual, shifted_basis)
+
+    assert torch.allclose(actual, shifted, atol=1e-5, rtol=1e-5)
+
+
+def test_closed_simplicial_rope_value_carrier_query_mask_zeroes_messages():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 1, 2, 4, 8
+    module = SimplicialClosedRoPE(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_freqs=3,
+        value_n_freqs=2,
+        freq_sigma=1.2,
+        learned_freqs=False,
+        gate="none",
+        enable_value_carrier=True,
+    )
+    v1 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v2 = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    positions = torch.randn(batch_size, num_tokens, 3)
+    position_query_mask = torch.tensor([[True, True, True, False]])
+    attention_weights = torch.softmax(
+        torch.randn(batch_size, num_heads, num_tokens, num_tokens, num_tokens).flatten(-2),
+        dim=-1,
+    ).view(batch_size, num_heads, num_tokens, num_tokens, num_tokens)
+
+    residual, basis = module.build_value_carrier(
+        v1,
+        v2,
+        positions,
+        position_query_mask=position_query_mask,
+    )
+    actual = _materialize_message_residual_output(attention_weights, residual, basis)
+
+    assert torch.all(actual[:, :, 3] == 0)
+    assert actual[:, :, :3].abs().sum() > 0
+
+
+def test_merge_message_residuals_preserves_branch_outputs():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 1, 2, 4, 8
+    attention_weights = torch.softmax(
+        torch.randn(batch_size, num_heads, num_tokens, num_tokens, num_tokens).flatten(-2),
+        dim=-1,
+    ).view(batch_size, num_heads, num_tokens, num_tokens, num_tokens)
+    first = SimplicialLowRankMessageResidual(
+        left=torch.randn(batch_size, num_heads, num_tokens, num_tokens, 2),
+        right=torch.randn(batch_size, num_heads, num_tokens, num_tokens, 2),
+    )
+    first_basis = torch.randn(num_heads, 2, head_dim)
+    second = SimplicialLowRankMessageResidual(
+        left=torch.randn(batch_size, num_heads, num_tokens, num_tokens, 3),
+        right=torch.randn(batch_size, num_heads, num_tokens, num_tokens, 3),
+    )
+    second_basis = torch.randn(num_heads, 3, head_dim)
+
+    expected = _materialize_message_residual_output(
+        attention_weights,
+        first,
+        first_basis,
+    ) + _materialize_message_residual_output(attention_weights, second, second_basis)
+    merged, merged_basis = attention_module._merge_message_residuals(
+        (first, first_basis),
+        (second, second_basis),
+    )
+    actual = _materialize_message_residual_output(attention_weights, merged, merged_basis)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_two_simplicial_attention_content_logits_off_matches_zero_content_query():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        chunk_size=3,
+        content_logits="off",
+    )
+    x = torch.randn(2, 5, 32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, True, True, True],
+        ]
+    )
+    q, k1, v1, k2, v2 = attn._project_inputs(x)
+    attention_mask = _mask_from_padding(
+        key_padding_mask,
+        batch_size=x.shape[0],
+        num_tokens=x.shape[1],
+        device=x.device,
+    )
+    expected_heads = simplicial_attention_torch_from_projected(
+        torch.zeros_like(q),
+        k1,
+        v1,
+        k2,
+        v2,
+        attention_mask=attention_mask,
+        chunk_size=attn.chunk_size,
+    )
+    expected = attn.out_proj(attn._merge_heads(expected_heads))
+    actual = attn(x, key_padding_mask=key_padding_mask)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_torch_backend_matches_reference_with_low_rank_message_residual():
     torch.manual_seed(0)
     attn = TwoSimplicialAttention(
@@ -364,6 +684,89 @@ def test_torch_backend_matches_reference_with_low_rank_message_residual():
         chunk_size=attn.chunk_size,
     )
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_two_simplicial_attention_closed_rope_forward_backward_and_translation_invariance():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        chunk_size=2,
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_gate="none",
+    )
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    positions = torch.randn(2, 5, 3)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, True, True, True],
+        ]
+    )
+
+    output = attn(x, positions=positions, key_padding_mask=key_padding_mask)
+    shifted = attn(
+        x,
+        positions=positions + torch.tensor([[[3.0, -2.0, 0.5]]]),
+        key_padding_mask=key_padding_mask,
+    )
+
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+    assert torch.allclose(output, shifted, atol=1e-6, rtol=1e-5)
+    output.square().mean().backward()
+    assert x.grad is not None
+
+
+def test_two_simplicial_attention_closed_rope_requires_positions():
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_gate="none",
+    )
+    with pytest.raises(ValueError, match="positions must be provided"):
+        attn(torch.randn(1, 4, 32))
+
+
+def test_two_simplicial_attention_closed_rope_value_carrier_forward_backward():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_value_n_freqs=2,
+        rope_on_values="carrier",
+        rope_gate="none",
+        content_logits="off",
+        message_mode="none",
+    )
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    positions = torch.randn(2, 5, 3)
+
+    output = attn(x, positions=positions)
+
+    assert output.shape == x.shape
+    assert attn.message_basis is None
+    output.square().mean().backward()
+    assert x.grad is not None
+    assert attn.closed_rope.value_log_scale.grad is not None
+
+
+def test_simplicial_rope_value_carrier_requires_closed_rope_position_mode():
+    with pytest.raises(ValueError, match="requires simplicial_position_mode='closed_rope'"):
+        TwoSimplicialAttention(
+            dim=32,
+            num_heads=4,
+            position_mode="none",
+            rope_on_values="carrier",
+        )
 
 
 def test_message_mode_none_creates_no_message_basis():

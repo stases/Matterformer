@@ -424,12 +424,23 @@ class AdaLNBlock(nn.Module):
         simplicial_precision: str = "bf16_tc",
         simplicial_message_mode: str = "none",
         simplicial_message_rank: int = 16,
+        simplicial_position_mode: str = "none",
+        simplicial_rope_key_mode: str = "constant",
+        simplicial_rope_n_freqs: int = 16,
+        simplicial_rope_freq_sigma: float = 1.0,
+        simplicial_rope_learned_freqs: bool = False,
+        simplicial_rope_gate: str = "none",
+        simplicial_rope_value_n_freqs: int | None = None,
+        simplicial_rope_value_scale_init: float = 1.0,
+        simplicial_rope_on_values: str = "none",
+        simplicial_content_logits: str = "on",
         mha_position_mode: str = "none",
         mha_rope_freq_sigma: float = 1.0,
         mha_rope_learned_freqs: bool = False,
         mha_rope_use_key: bool = True,
         mha_rope_on_values: bool = False,
         use_adaln_conditioning: bool = True,
+        norm_affine_when_no_adaln: bool = False,
     ) -> None:
         super().__init__()
         attn_type = attn_type.lower()
@@ -441,9 +452,10 @@ class AdaLNBlock(nn.Module):
             raise ValueError("mha_position_mode='rope' is only supported when attn_type='mha'")
         self.n_heads = int(n_heads)
         self.use_adaln_conditioning = bool(use_adaln_conditioning)
+        norm_affine = bool(norm_affine_when_no_adaln) and not self.use_adaln_conditioning
 
-        self.norm1 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine)
+        self.norm2 = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine)
         if self.use_adaln_conditioning:
             self.ada_ln = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model, bias=True))
             nn.init.zeros_(self.ada_ln[-1].weight)
@@ -482,6 +494,16 @@ class AdaLNBlock(nn.Module):
                 precision=simplicial_precision,
                 message_mode=simplicial_message_mode,
                 message_rank=simplicial_message_rank,
+                position_mode=simplicial_position_mode,
+                rope_key_mode=simplicial_rope_key_mode,
+                rope_n_freqs=simplicial_rope_n_freqs,
+                rope_freq_sigma=simplicial_rope_freq_sigma,
+                rope_learned_freqs=simplicial_rope_learned_freqs,
+                rope_gate=simplicial_rope_gate,
+                rope_value_n_freqs=simplicial_rope_value_n_freqs,
+                rope_value_scale_init=simplicial_rope_value_scale_init,
+                rope_on_values=simplicial_rope_on_values,
+                content_logits=simplicial_content_logits,
             )
         self.mlp = Mlp(d_model=d_model, mlp_ratio=mlp_ratio, dropout=dropout)
 
@@ -497,6 +519,9 @@ class AdaLNBlock(nn.Module):
         simplicial_message_residual: SimplicialLowRankMessageResidual | None = None,
         simplicial_logit_bias_fn: Callable[[int, int, torch.dtype, torch.device], torch.Tensor] | None = None,
         mha_positions: torch.Tensor | None = None,
+        simplicial_positions: torch.Tensor | None = None,
+        simplicial_position_query_mask: torch.Tensor | None = None,
+        sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_adaln_conditioning:
             if cond_emb is None:
@@ -563,6 +588,9 @@ class AdaLNBlock(nn.Module):
                 angle_residual=simplicial_angle_residual,
                 message_residual=simplicial_message_residual,
                 logit_bias_fn=simplicial_logit_bias_fn,
+                positions=simplicial_positions,
+                position_query_mask=simplicial_position_query_mask,
+                sigma=sigma,
             )
         if self.use_adaln_conditioning:
             x = x + gate_msa[:, None, :] * attn_out
@@ -1376,6 +1404,16 @@ class TransformerTrunk(nn.Module):
         simplicial_precision: str = "bf16_tc",
         simplicial_message_mode: str = "none",
         simplicial_message_rank: int = 16,
+        simplicial_position_mode: str = "none",
+        simplicial_rope_key_mode: str = "constant",
+        simplicial_rope_n_freqs: int = 16,
+        simplicial_rope_freq_sigma: float = 1.0,
+        simplicial_rope_learned_freqs: bool = False,
+        simplicial_rope_gate: str = "none",
+        simplicial_rope_value_n_freqs: int | None = None,
+        simplicial_rope_value_scale_init: float = 1.0,
+        simplicial_rope_on_values: str = "none",
+        simplicial_content_logits: str = "on",
         geometry_adapter: BaseGeometryAdapter | None = None,
         geometry_bias: GeometryBiasBuilder | None = None,
         simplicial_geometry_bias: SimplicialGeometryBias | None = None,
@@ -1385,15 +1423,24 @@ class TransformerTrunk(nn.Module):
         mha_rope_use_key: bool = True,
         mha_rope_on_values: bool = False,
         use_adaln_conditioning: bool = True,
+        norm_affine_when_no_adaln: bool = False,
+        use_final_norm: bool = True,
     ) -> None:
         super().__init__()
         attn_type = attn_type.lower()
         self.attn_type = attn_type
         self.mha_position_mode = _canonicalize_mha_position_mode(mha_position_mode)
+        self.simplicial_position_mode = str(simplicial_position_mode).lower().replace("-", "_")
+        if self.simplicial_position_mode in {"disabled", "off", "false", "no"}:
+            self.simplicial_position_mode = "none"
+        if self.simplicial_position_mode in {"center_edge_rope", "closed_simplicial_rope", "cs_rope"}:
+            self.simplicial_position_mode = "closed_rope"
         self.geometry_adapter = geometry_adapter
         self.geometry_bias = geometry_bias
         self.simplicial_geometry_bias = simplicial_geometry_bias
         self.use_adaln_conditioning = bool(use_adaln_conditioning)
+        self.use_final_norm = bool(use_final_norm)
+        norm_affine = bool(norm_affine_when_no_adaln) and not self.use_adaln_conditioning
         if self.mha_position_mode != "none" and self.attn_type != "mha":
             raise ValueError("mha_position_mode='rope' is only supported with attn_type='mha'")
         if self.geometry_bias is not None and self.attn_type != "mha":
@@ -1417,17 +1464,32 @@ class TransformerTrunk(nn.Module):
                     simplicial_precision=simplicial_precision,
                     simplicial_message_mode=simplicial_message_mode,
                     simplicial_message_rank=simplicial_message_rank,
+                    simplicial_position_mode=self.simplicial_position_mode,
+                    simplicial_rope_key_mode=simplicial_rope_key_mode,
+                    simplicial_rope_n_freqs=simplicial_rope_n_freqs,
+                    simplicial_rope_freq_sigma=simplicial_rope_freq_sigma,
+                    simplicial_rope_learned_freqs=simplicial_rope_learned_freqs,
+                    simplicial_rope_gate=simplicial_rope_gate,
+                    simplicial_rope_value_n_freqs=simplicial_rope_value_n_freqs,
+                    simplicial_rope_value_scale_init=simplicial_rope_value_scale_init,
+                    simplicial_rope_on_values=simplicial_rope_on_values,
+                    simplicial_content_logits=simplicial_content_logits,
                     mha_position_mode=self.mha_position_mode,
                     mha_rope_freq_sigma=mha_rope_freq_sigma,
                     mha_rope_learned_freqs=mha_rope_learned_freqs,
                     mha_rope_use_key=mha_rope_use_key,
                     mha_rope_on_values=mha_rope_on_values,
                     use_adaln_conditioning=self.use_adaln_conditioning,
+                    norm_affine_when_no_adaln=norm_affine_when_no_adaln,
                 )
                 for _ in range(n_layers)
             ]
         )
-        self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=False)
+        self.norm_out = (
+            nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine)
+            if self.use_final_norm
+            else nn.Identity()
+        )
 
     def compute_geometry_features(
         self,
@@ -1483,15 +1545,25 @@ class TransformerTrunk(nn.Module):
         geom_features = None
         attn_head_bias = None
         mha_positions = None
+        simplicial_positions = None
         simplicial_attention_mask = None
         simplicial_factorized_bias = None
         simplicial_angle_residual = None
         simplicial_message_residual = None
         simplicial_logit_bias_fn = None
+        simplicial_position_query_mask = None
         if self.mha_position_mode == "rope":
             if coords is None:
                 raise ValueError("coords must be provided when mha_position_mode='rope'")
             mha_positions = self._build_mha_positions(coords, seq_len=x.shape[1])
+        if self.attn_type == "simplicial" and self.simplicial_position_mode != "none":
+            if coords is None:
+                raise ValueError("coords must be provided when simplicial_position_mode='closed_rope'")
+            simplicial_positions = self._build_mha_positions(coords, seq_len=x.shape[1])
+            atom_query_mask = (torch.arange(x.shape[1], device=x.device) < coords.shape[1]).view(1, -1)
+            simplicial_position_query_mask = atom_query_mask.expand(x.shape[0], -1)
+            if pad_mask is not None:
+                simplicial_position_query_mask = simplicial_position_query_mask & ~pad_mask
         if self.geometry_adapter is not None:
             if coords is None:
                 raise ValueError("coords must be provided when geometry_adapter is configured")
@@ -1557,6 +1629,9 @@ class TransformerTrunk(nn.Module):
                 simplicial_message_residual=simplicial_message_residual,
                 simplicial_logit_bias_fn=simplicial_logit_bias_fn,
                 mha_positions=mha_positions,
+                simplicial_positions=simplicial_positions,
+                simplicial_position_query_mask=simplicial_position_query_mask,
+                sigma=sigma,
             )
         x = self.norm_out(x)
         if pad_mask is not None:

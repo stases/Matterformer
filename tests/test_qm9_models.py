@@ -252,6 +252,31 @@ def test_qm9_edm_factorized_message_low_rank_loss_smoke():
     loss.backward()
 
 
+def test_qm9_edm_simplicial_closed_rope_loss_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        simplicial_geom_mode="factorized",
+        simplicial_impl="torch",
+        simplicial_message_mode="low_rank",
+        simplicial_message_rank=3,
+        simplicial_position_mode="closed_rope",
+        simplicial_rope_n_freqs=2,
+        simplicial_rope_gate="none",
+    )
+    assert model.simplicial_position_mode == "closed_rope"
+    assert model.trunk.blocks[0].attn.closed_rope is not None
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
 def test_qm9_generation_metrics_without_rdkit_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()
