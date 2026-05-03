@@ -45,3 +45,7 @@ env/
 # Temporary local dataset builder workspace
 geomdrugs_builder/
 tmp_MOF/
+
+# Local Codex chat history exports
+.codex
+codex_history_md/

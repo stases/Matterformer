@@ -151,6 +151,8 @@ def maybe_configure_wandb(
                 "use_charges": args.use_charges,
                 "noise_conditioning": list(model.noise_conditioning),
                 "concat_sigma_condition": args.concat_sigma_condition,
+                "norm_affine_when_no_adaln": args.norm_affine_when_no_adaln,
+                "use_final_norm": args.use_final_norm,
                 "charge_feature_scale": args.charge_feature_scale,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
@@ -183,6 +185,8 @@ def maybe_configure_wandb(
                 "use_charges": args.use_charges,
                 "noise_conditioning": list(model.noise_conditioning),
                 "concat_sigma_condition": args.concat_sigma_condition,
+                "norm_affine_when_no_adaln": args.norm_affine_when_no_adaln,
+                "use_final_norm": args.use_final_norm,
                 "max_loss_weight": args.max_loss_weight,
             },
             "sampler": sampler_kwargs_from_args(args),
@@ -425,6 +429,8 @@ def main(args: argparse.Namespace) -> None:
         noise_conditioning=args.noise_conditioning,
         concat_sigma_condition=args.concat_sigma_condition,
         charge_feature_scale=args.charge_feature_scale,
+        norm_affine_when_no_adaln=args.norm_affine_when_no_adaln,
+        use_final_norm=args.use_final_norm,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
     criterion = EDMLoss(
@@ -486,6 +492,8 @@ def main(args: argparse.Namespace) -> None:
         f"charge_feature_scale={args.charge_feature_scale} "
         f"noise_conditioning={model.noise_conditioning} "
         f"legacy_concat_sigma_condition={args.concat_sigma_condition} "
+        f"norm_affine_when_no_adaln={args.norm_affine_when_no_adaln} "
+        f"use_final_norm={args.use_final_norm} "
         f"max_loss_weight={args.max_loss_weight}"
     )
     print(f"precision: bf16={args.bf16}")
@@ -1067,6 +1075,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--concat-sigma-condition", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--norm-affine-when-no-adaln",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep LayerNorm affine parameters when noise conditioning disables AdaLN.",
+    )
+    parser.add_argument(
+        "--use-final-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the transformer's final LayerNorm before prediction heads.",
+    )
     parser.add_argument("--max-loss-weight", type=float, default=1000.0)
     parser.add_argument("--disable-geometry-bias", action="store_true")
     parser.add_argument("--sample-num-steps", type=int, default=100)

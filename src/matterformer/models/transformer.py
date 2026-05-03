@@ -430,6 +430,9 @@ class AdaLNBlock(nn.Module):
         simplicial_rope_freq_sigma: float = 1.0,
         simplicial_rope_learned_freqs: bool = False,
         simplicial_rope_gate: str = "none",
+        simplicial_pair_rope_scale_init: float = 1.0,
+        simplicial_pair_rope_gate_mode: str = "none",
+        simplicial_pair_rope_zero_diag: bool = False,
         simplicial_rope_value_n_freqs: int | None = None,
         simplicial_rope_value_scale_init: float = 1.0,
         simplicial_rope_on_values: str = "none",
@@ -500,6 +503,9 @@ class AdaLNBlock(nn.Module):
                 rope_freq_sigma=simplicial_rope_freq_sigma,
                 rope_learned_freqs=simplicial_rope_learned_freqs,
                 rope_gate=simplicial_rope_gate,
+                pair_rope_scale_init=simplicial_pair_rope_scale_init,
+                pair_rope_gate_mode=simplicial_pair_rope_gate_mode,
+                pair_rope_zero_diag=simplicial_pair_rope_zero_diag,
                 rope_value_n_freqs=simplicial_rope_value_n_freqs,
                 rope_value_scale_init=simplicial_rope_value_scale_init,
                 rope_on_values=simplicial_rope_on_values,
@@ -1410,6 +1416,9 @@ class TransformerTrunk(nn.Module):
         simplicial_rope_freq_sigma: float = 1.0,
         simplicial_rope_learned_freqs: bool = False,
         simplicial_rope_gate: str = "none",
+        simplicial_pair_rope_scale_init: float = 1.0,
+        simplicial_pair_rope_gate_mode: str = "none",
+        simplicial_pair_rope_zero_diag: bool = False,
         simplicial_rope_value_n_freqs: int | None = None,
         simplicial_rope_value_scale_init: float = 1.0,
         simplicial_rope_on_values: str = "none",
@@ -1435,6 +1444,8 @@ class TransformerTrunk(nn.Module):
             self.simplicial_position_mode = "none"
         if self.simplicial_position_mode in {"center_edge_rope", "closed_simplicial_rope", "cs_rope"}:
             self.simplicial_position_mode = "closed_rope"
+        if self.simplicial_position_mode in {"pairwise_rope", "pair_rope_bias", "pairwise_rope_bias"}:
+            self.simplicial_position_mode = "pair_rope"
         self.geometry_adapter = geometry_adapter
         self.geometry_bias = geometry_bias
         self.simplicial_geometry_bias = simplicial_geometry_bias
@@ -1470,6 +1481,9 @@ class TransformerTrunk(nn.Module):
                     simplicial_rope_freq_sigma=simplicial_rope_freq_sigma,
                     simplicial_rope_learned_freqs=simplicial_rope_learned_freqs,
                     simplicial_rope_gate=simplicial_rope_gate,
+                    simplicial_pair_rope_scale_init=simplicial_pair_rope_scale_init,
+                    simplicial_pair_rope_gate_mode=simplicial_pair_rope_gate_mode,
+                    simplicial_pair_rope_zero_diag=simplicial_pair_rope_zero_diag,
                     simplicial_rope_value_n_freqs=simplicial_rope_value_n_freqs,
                     simplicial_rope_value_scale_init=simplicial_rope_value_scale_init,
                     simplicial_rope_on_values=simplicial_rope_on_values,
@@ -1558,7 +1572,7 @@ class TransformerTrunk(nn.Module):
             mha_positions = self._build_mha_positions(coords, seq_len=x.shape[1])
         if self.attn_type == "simplicial" and self.simplicial_position_mode != "none":
             if coords is None:
-                raise ValueError("coords must be provided when simplicial_position_mode='closed_rope'")
+                raise ValueError("coords must be provided when simplicial_position_mode is not 'none'")
             simplicial_positions = self._build_mha_positions(coords, seq_len=x.shape[1])
             atom_query_mask = (torch.arange(x.shape[1], device=x.device) < coords.shape[1]).view(1, -1)
             simplicial_position_query_mask = atom_query_mask.expand(x.shape[0], -1)

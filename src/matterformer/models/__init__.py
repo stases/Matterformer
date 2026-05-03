@@ -4,6 +4,7 @@ from matterformer.models.attention import (
     SimplicialFactorizedBias,
     SimplicialLowRankAngleResidual,
     SimplicialLowRankMessageResidual,
+    SimplicialPairwiseRoPEBias,
     TwoSimplicialAttention,
 )
 from matterformer.models.embeddings import (
@@ -49,6 +50,7 @@ __all__ = [
     "SimplicialGeometryBias",
     "SimplicialLowRankAngleResidual",
     "SimplicialLowRankMessageResidual",
+    "SimplicialPairwiseRoPEBias",
     "TimeEmbedder",
     "TransformerTrunk",
     "TokenEmbedder",

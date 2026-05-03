@@ -270,6 +270,9 @@ class QM9EDMModel(nn.Module):
         simplicial_rope_freq_sigma: float = 1.0,
         simplicial_rope_learned_freqs: bool = False,
         simplicial_rope_gate: str = "none",
+        simplicial_pair_rope_scale_init: float = 1.0,
+        simplicial_pair_rope_gate_mode: str = "none",
+        simplicial_pair_rope_zero_diag: bool = False,
         simplicial_rope_value_n_freqs: int | None = None,
         simplicial_rope_value_scale_init: float = 1.0,
         simplicial_rope_on_values: str = "none",
@@ -321,6 +324,8 @@ class QM9EDMModel(nn.Module):
             simplicial_position_mode = "none"
         if simplicial_position_mode in {"center_edge_rope", "closed_simplicial_rope", "cs_rope"}:
             simplicial_position_mode = "closed_rope"
+        if simplicial_position_mode in {"pairwise_rope", "pair_rope_bias", "pairwise_rope_bias"}:
+            simplicial_position_mode = "pair_rope"
         if coord_head_mode in {"relative", "pair", "pairwise"}:
             coord_head_mode = "equivariant"
         if coord_head_mode in {"non_relative", "non_equivariant", "nonrelative"}:
@@ -331,8 +336,8 @@ class QM9EDMModel(nn.Module):
             )
         if simplicial_message_mode not in {"none", "low_rank"}:
             raise ValueError("simplicial_message_mode must be one of {'none', 'low_rank'}")
-        if simplicial_position_mode not in {"none", "closed_rope"}:
-            raise ValueError("simplicial_position_mode must be one of {'none', 'closed_rope'}")
+        if simplicial_position_mode not in {"none", "closed_rope", "pair_rope"}:
+            raise ValueError("simplicial_position_mode must be one of {'none', 'closed_rope', 'pair_rope'}")
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
                 "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
@@ -431,6 +436,9 @@ class QM9EDMModel(nn.Module):
             simplicial_rope_freq_sigma=simplicial_rope_freq_sigma,
             simplicial_rope_learned_freqs=simplicial_rope_learned_freqs,
             simplicial_rope_gate=simplicial_rope_gate,
+            simplicial_pair_rope_scale_init=simplicial_pair_rope_scale_init,
+            simplicial_pair_rope_gate_mode=simplicial_pair_rope_gate_mode,
+            simplicial_pair_rope_zero_diag=simplicial_pair_rope_zero_diag,
             simplicial_rope_value_n_freqs=simplicial_rope_value_n_freqs,
             simplicial_rope_value_scale_init=simplicial_rope_value_scale_init,
             simplicial_rope_on_values=simplicial_rope_on_values,

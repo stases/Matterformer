@@ -23,6 +23,22 @@ from matterformer.data.qm9 import (
     collate_qm9,
     compute_target_stats,
 )
+from matterformer.data.synthmolforce import (
+    SYNTHMOLFORCE_ATOM_PAD_TOKEN,
+    SYNTHMOLFORCE_DATASET_INFO,
+    SYNTHMOLFORCE_LEVELS,
+    SYNTHMOLFORCE_NUM_ATOM_TYPES,
+    SYNTHMOLFORCE_PAIR_MODES,
+    SynthMolForceBatch,
+    SynthMolForceConfig,
+    SynthMolForceDataset,
+    collate_synthmolforce,
+    compute_synthmolforce_energy,
+    compute_synthmolforce_energy_batch,
+    compute_synthmolforce_labels,
+    compute_synthmolforce_labels_batch,
+    generate_synthmolforce_batch,
+)
 from matterformer.geometry.adapters import (
     BaseGeometryAdapter,
     GeometryFeatures,
@@ -48,7 +64,7 @@ from matterformer.models.transformer import (
     SimplicialGeometryBias,
     TransformerTrunk,
 )
-from matterformer.models.attention import SimplicialAttentionMask, SimplicialFactorizedBias
+from matterformer.models.attention import SimplicialAttentionMask, SimplicialClosedRoPE, SimplicialFactorizedBias
 
 __all__ = [
     "BaseGeometryAdapter",
@@ -80,10 +96,19 @@ __all__ = [
     "QM9RegressionModel",
     "QM9_DATASET_INFO",
     "QM9_TARGETS",
+    "SYNTHMOLFORCE_ATOM_PAD_TOKEN",
+    "SYNTHMOLFORCE_DATASET_INFO",
+    "SYNTHMOLFORCE_LEVELS",
+    "SYNTHMOLFORCE_NUM_ATOM_TYPES",
+    "SYNTHMOLFORCE_PAIR_MODES",
     "ScalarConditionEmbedding",
     "SimplicialAttentionMask",
+    "SimplicialClosedRoPE",
     "SimplicialFactorizedBias",
     "SimplicialGeometryBias",
+    "SynthMolForceBatch",
+    "SynthMolForceConfig",
+    "SynthMolForceDataset",
     "TimeEmbedder",
     "TransformerTrunk",
     "TokenEmbedder",
@@ -91,5 +116,11 @@ __all__ = [
     "collate_mof_stage1",
     "collate_mof_stage2",
     "collate_qm9",
+    "collate_synthmolforce",
+    "compute_synthmolforce_energy",
+    "compute_synthmolforce_energy_batch",
+    "compute_synthmolforce_labels",
+    "compute_synthmolforce_labels_batch",
     "compute_target_stats",
+    "generate_synthmolforce_batch",
 ]

@@ -3,7 +3,13 @@ import torch
 
 import matterformer.models.attention as attention_module
 from matterformer.geometry import NonPeriodicGeometryAdapter
-from matterformer.models import QM9EDMModel, SimplicialClosedRoPE, SimplicialGeometryBias, TwoSimplicialAttention
+from matterformer.models import (
+    QM9EDMModel,
+    SimplicialClosedRoPE,
+    SimplicialGeometryBias,
+    SimplicialPairwiseRoPEBias,
+    TwoSimplicialAttention,
+)
 from matterformer.models.attention import (
     SimplicialAttentionMask,
     SimplicialFactorizedBias,
@@ -759,6 +765,421 @@ def test_two_simplicial_attention_closed_rope_value_carrier_forward_backward():
     assert attn.closed_rope.value_log_scale.grad is not None
 
 
+def test_simplicial_pairwise_rope_bias_matches_direct_formula_and_translation_invariant():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 2, 3, 5, 12
+    module = SimplicialPairwiseRoPEBias(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_freqs=3,
+        learned_freqs=True,
+        scale_init=1.0,
+        zero_diag=True,
+    )
+    q = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    positions = torch.randn(batch_size, num_tokens, 3)
+    position_query_mask = torch.tensor(
+        [
+            [True, True, True, False, False],
+            [True, True, False, False, False],
+        ]
+    )
+
+    bias = module(q, positions, position_query_mask=position_query_mask)
+
+    q_pairs = q[..., : 2 * module.n_freqs].float().view(batch_size, num_heads, num_tokens, module.n_freqs, 2)
+    q_r, q_i = q_pairs.unbind(dim=-1)
+    rel = positions.float()[:, None, :, :] - positions.float()[:, :, None, :]
+    theta = torch.einsum("bqjd,hfd->bhqjf", rel, module.freqs.float())
+    expected = (
+        q_r.unsqueeze(3) * torch.cos(theta)
+        + q_i.unsqueeze(3) * torch.sin(theta)
+    ).sum(dim=-1) * (module.n_freqs**-0.5)
+    eye = torch.eye(num_tokens, dtype=torch.bool).view(1, 1, num_tokens, num_tokens)
+    expected = expected.masked_fill(eye, 0.0)
+
+    assert torch.allclose(bias.u, expected, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(bias.v, expected, atol=1e-6, rtol=1e-5)
+    assert torch.all(bias.w == 0)
+    assert torch.allclose(bias.gate, position_query_mask[:, None, :].float().expand(-1, num_heads, -1))
+
+    shift = torch.randn(batch_size, 1, 3)
+    shifted_bias = module(q, positions + shift, position_query_mask=position_query_mask)
+    assert torch.allclose(shifted_bias.u, bias.u, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(shifted_bias.v, bias.v, atol=1e-6, rtol=1e-5)
+
+
+def test_two_simplicial_attention_pair_rope_forward_backward_and_requires_positions():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        position_mode="pair_rope",
+        rope_n_freqs=3,
+        rope_learned_freqs=True,
+        content_logits="on",
+        message_mode="none",
+    )
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    positions = torch.randn(2, 5, 3, requires_grad=True)
+    output = attn(x, positions=positions)
+    assert output.shape == x.shape
+    output.square().mean().backward()
+    assert x.grad is not None
+    assert positions.grad is not None
+    assert attn.pair_rope is not None
+    assert attn.pair_rope.freqs.grad is not None
+    assert attn.pair_rope.u_log_scale.grad is not None
+    assert attn.pair_rope.v_log_scale.grad is not None
+
+    with pytest.raises(ValueError, match="positions must be provided"):
+        attn(torch.randn(1, 5, 32))
+
+
+def test_two_simplicial_attention_pair_rope_marginal_values_backward():
+    torch.manual_seed(0)
+    attn = TwoSimplicialAttention(
+        dim=32,
+        num_heads=4,
+        impl="torch",
+        position_mode="pair_rope",
+        rope_on_values="marginal",
+        rope_n_freqs=3,
+        rope_learned_freqs=True,
+        content_logits="on",
+        message_mode="none",
+    )
+    x = torch.randn(2, 5, 32, requires_grad=True)
+    positions = torch.randn(2, 5, 3, requires_grad=True)
+    output = attn(x, positions=positions)
+    assert output.shape == x.shape
+    output.square().mean().backward()
+    assert x.grad is not None
+    assert positions.grad is not None
+    assert attn.pair_rope is not None
+    assert attn.pair_rope.value_log_scale is not None
+    assert attn.pair_rope.value_log_scale.grad is not None
+
+
+def test_compact_closed_rope_reference_builders_match_module_materialization():
+    torch.manual_seed(0)
+    batch_size, num_heads, num_tokens, head_dim = 2, 3, 5, 12
+    rope = SimplicialClosedRoPE(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_freqs=3,
+        value_n_freqs=2,
+        enable_value_carrier=True,
+        learned_freqs=True,
+    )
+    q = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v1 = torch.randn_like(q)
+    v2 = torch.randn_like(q)
+    positions = torch.randn(batch_size, num_tokens, 3)
+    position_query_mask = torch.tensor(
+        [
+            [True, True, True, False, False],
+            [True, True, False, False, False],
+        ]
+    )
+
+    expected_angle = rope(q, positions, position_query_mask=position_query_mask)
+    actual_angle = attention_module._closed_rope_angle_residual_from_compact(
+        q,
+        positions,
+        rope.mu,
+        rope.nu,
+        rope.logit_scale.exp().view(num_heads),
+        position_query_mask=position_query_mask,
+    )
+    assert torch.allclose(actual_angle.left, expected_angle.left, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual_angle.right, expected_angle.right, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual_angle.gate, expected_angle.gate, atol=1e-6, rtol=1e-5)
+
+    expected_message, expected_basis = rope.build_value_carrier(
+        v1,
+        v2,
+        positions,
+        position_query_mask=position_query_mask,
+    )
+    actual_message, actual_basis = attention_module._closed_rope_value_carrier_from_compact(
+        v1,
+        v2,
+        positions,
+        rope.mu,
+        rope.nu,
+        value_n_freqs=rope.value_n_freqs,
+        value_scale=rope.value_log_scale.exp().view(num_heads),
+        position_query_mask=position_query_mask,
+    )
+    assert torch.allclose(actual_message.left, expected_message.left, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual_message.right, expected_message.right, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual_basis, expected_basis, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_native_triton_closed_rope_no_carrier_native_backward_matches_torch():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    torch_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="torch",
+        precision="ieee_fp32",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_on_values="none",
+        rope_gate="none",
+        rope_learned_freqs=True,
+        content_logits="on",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="triton",
+        precision="ieee_fp32",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_on_values="none",
+        rope_gate="none",
+        rope_learned_freqs=True,
+        content_logits="on",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn.load_state_dict(torch_attn.state_dict())
+
+    x = torch.randn(2, 5, 16, device=device, dtype=torch.float32)
+    positions = torch.randn(2, 5, 3, device=device, dtype=torch.float32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, False, True, True],
+        ],
+        device=device,
+    )
+
+    x_torch = x.detach().clone().requires_grad_(True)
+    pos_torch = positions.detach().clone().requires_grad_(True)
+    x_triton = x.detach().clone().requires_grad_(True)
+    pos_triton = positions.detach().clone().requires_grad_(True)
+
+    torch_out = torch_attn(x_torch, positions=pos_torch, key_padding_mask=key_padding_mask)
+    triton_out = triton_attn(x_triton, positions=pos_triton, key_padding_mask=key_padding_mask)
+    assert triton_attn._last_impl_used == "triton_native_rope"
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+
+    torch_out.square().mean().backward()
+    triton_out.square().mean().backward()
+    assert torch.allclose(x_triton.grad, x_torch.grad, atol=3e-4, rtol=3e-4)
+    assert torch.allclose(pos_triton.grad, pos_torch.grad, atol=3e-4, rtol=3e-4)
+    assert torch.allclose(
+        triton_attn.closed_rope.mu.grad,
+        torch_attn.closed_rope.mu.grad,
+        atol=3e-4,
+        rtol=3e-4,
+    )
+    assert torch.allclose(
+        triton_attn.closed_rope.nu.grad,
+        torch_attn.closed_rope.nu.grad,
+        atol=3e-4,
+        rtol=3e-4,
+    )
+    assert torch.allclose(
+        triton_attn.closed_rope.logit_scale.grad,
+        torch_attn.closed_rope.logit_scale.grad,
+        atol=3e-4,
+        rtol=3e-4,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+def test_native_triton_closed_rope_matches_materialized_torch_forward_backward():
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    torch_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="torch",
+        precision="ieee_fp32",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_value_n_freqs=2,
+        rope_on_values="carrier",
+        rope_gate="none",
+        rope_learned_freqs=True,
+        content_logits="off",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="triton",
+        precision="ieee_fp32",
+        position_mode="closed_rope",
+        rope_n_freqs=2,
+        rope_value_n_freqs=2,
+        rope_on_values="carrier",
+        rope_gate="none",
+        rope_learned_freqs=True,
+        content_logits="off",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn.load_state_dict(torch_attn.state_dict())
+
+    x = torch.randn(2, 5, 16, device=device, dtype=torch.float32)
+    positions = torch.randn(2, 5, 3, device=device, dtype=torch.float32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, False, True, True],
+        ],
+        device=device,
+    )
+
+    x_torch = x.detach().clone().requires_grad_(True)
+    pos_torch = positions.detach().clone().requires_grad_(True)
+    x_triton = x.detach().clone().requires_grad_(True)
+    pos_triton = positions.detach().clone().requires_grad_(True)
+
+    torch_out = torch_attn(x_torch, positions=pos_torch, key_padding_mask=key_padding_mask)
+    triton_out = triton_attn(x_triton, positions=pos_triton, key_padding_mask=key_padding_mask)
+    assert triton_attn._last_impl_used == "triton_native_rope"
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+
+    torch_out.square().mean().backward()
+    triton_out.square().mean().backward()
+    assert torch.allclose(x_triton.grad, x_torch.grad, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(pos_triton.grad, pos_torch.grad, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(
+        triton_attn.closed_rope.mu.grad,
+        torch_attn.closed_rope.mu.grad,
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    assert torch.allclose(
+        triton_attn.closed_rope.nu.grad,
+        torch_attn.closed_rope.nu.grad,
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    assert torch.allclose(
+        triton_attn.closed_rope.logit_scale.grad,
+        torch_attn.closed_rope.logit_scale.grad,
+        atol=2e-4,
+        rtol=2e-4,
+    )
+    assert torch.allclose(
+        triton_attn.closed_rope.value_log_scale.grad,
+        torch_attn.closed_rope.value_log_scale.grad,
+        atol=2e-4,
+        rtol=2e-4,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton parity tests")
+@pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton is not installed")
+@pytest.mark.parametrize("rope_on_values", ["none", "marginal"])
+def test_triton_pair_rope_matches_torch_with_factorized_bias(rope_on_values):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    torch_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="torch",
+        precision="ieee_fp32",
+        position_mode="pair_rope",
+        rope_on_values=rope_on_values,
+        rope_n_freqs=2,
+        rope_learned_freqs=True,
+        rope_value_scale_init=0.5,
+        content_logits="on",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn = TwoSimplicialAttention(
+        dim=16,
+        num_heads=2,
+        impl="triton",
+        precision="ieee_fp32",
+        position_mode="pair_rope",
+        rope_on_values=rope_on_values,
+        rope_n_freqs=2,
+        rope_learned_freqs=True,
+        rope_value_scale_init=0.5,
+        content_logits="on",
+        message_mode="none",
+        chunk_size=2,
+    ).to(device=device, dtype=torch.float32)
+    triton_attn.load_state_dict(torch_attn.state_dict())
+
+    batch_size, num_heads, num_tokens = 2, 2, 5
+    x = torch.randn(batch_size, num_tokens, 16, device=device, dtype=torch.float32)
+    positions = torch.randn(batch_size, num_tokens, 3, device=device, dtype=torch.float32)
+    key_padding_mask = torch.tensor(
+        [
+            [False, False, False, False, True],
+            [False, False, False, True, True],
+        ],
+        device=device,
+    )
+    base_u = torch.randn(batch_size, num_heads, num_tokens, num_tokens, device=device, dtype=torch.float32) * 0.01
+    base_v = torch.randn_like(base_u) * 0.01
+    base_w = torch.randn_like(base_u) * 0.01
+    base_gate = torch.sigmoid(torch.randn(batch_size, num_heads, num_tokens, device=device, dtype=torch.float32))
+
+    def clone_bias():
+        u = base_u.detach().clone().requires_grad_(True)
+        v = base_v.detach().clone().requires_grad_(True)
+        w = base_w.detach().clone().requires_grad_(True)
+        gate = base_gate.detach().clone().requires_grad_(True)
+        return SimplicialFactorizedBias(u=u, v=v, w=w, gate=gate), (u, v, w, gate)
+
+    torch_bias, torch_bias_tensors = clone_bias()
+    triton_bias, triton_bias_tensors = clone_bias()
+    x_torch = x.detach().clone().requires_grad_(True)
+    pos_torch = positions.detach().clone().requires_grad_(True)
+    x_triton = x.detach().clone().requires_grad_(True)
+    pos_triton = positions.detach().clone().requires_grad_(True)
+
+    torch_out = torch_attn(
+        x_torch,
+        positions=pos_torch,
+        key_padding_mask=key_padding_mask,
+        factorized_bias=torch_bias,
+    )
+    triton_out = triton_attn(
+        x_triton,
+        positions=pos_triton,
+        key_padding_mask=key_padding_mask,
+        factorized_bias=triton_bias,
+    )
+    assert triton_attn._last_impl_used == "triton"
+    assert torch.allclose(triton_out, torch_out, atol=1e-4, rtol=1e-4)
+
+    torch_out.square().mean().backward()
+    triton_out.square().mean().backward()
+    assert torch.allclose(x_triton.grad, x_torch.grad, atol=8e-4, rtol=8e-4)
+    assert torch.allclose(pos_triton.grad, pos_torch.grad, atol=8e-4, rtol=8e-4)
+    for triton_tensor, torch_tensor in zip(triton_bias_tensors, torch_bias_tensors):
+        assert torch.allclose(triton_tensor.grad, torch_tensor.grad, atol=8e-4, rtol=8e-4)
+    for (name_t, param_t), (name_ref, param_ref) in zip(
+        triton_attn.named_parameters(),
+        torch_attn.named_parameters(),
+    ):
+        assert name_t == name_ref
+        assert param_t.grad is not None
+        assert param_ref.grad is not None
+        assert torch.allclose(param_t.grad, param_ref.grad, atol=8e-4, rtol=8e-4), name_t
+
+
 def test_simplicial_rope_value_carrier_requires_closed_rope_position_mode():
     with pytest.raises(ValueError, match="requires simplicial_position_mode='closed_rope'"):
         TwoSimplicialAttention(
@@ -766,6 +1187,16 @@ def test_simplicial_rope_value_carrier_requires_closed_rope_position_mode():
             num_heads=4,
             position_mode="none",
             rope_on_values="carrier",
+        )
+
+
+def test_simplicial_rope_marginal_values_require_pair_rope_position_mode():
+    with pytest.raises(ValueError, match="requires simplicial_position_mode='pair_rope'"):
+        TwoSimplicialAttention(
+            dim=32,
+            num_heads=4,
+            position_mode="none",
+            rope_on_values="marginal",
         )
 
 
@@ -1115,12 +1546,19 @@ def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
             "need_dv_bias",
             "need_dw",
             "need_dgate",
+            "need_du_extra",
+            "need_dv_bias_extra",
+            "need_dw_extra",
+            "need_dgate_extra",
             "need_dangle_left",
             "need_dangle_right",
             "need_dangle_gate",
             "need_dmessage_left",
             "need_dmessage_right",
             "need_dmessage_basis",
+            "need_dpair_value_positions",
+            "need_dpair_value_freqs",
+            "need_dpair_value_scale",
         ):
             captured[name] = bool(kwargs[name])
         zeros = [torch.zeros_like(tensor) for tensor in (q, k1, v1, k2, v2)]
@@ -1133,11 +1571,18 @@ def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             torch.zeros_like(angle_left),
             None,
             torch.zeros_like(angle_gate),
             None,
             torch.zeros_like(message_right),
+            None,
+            None,
+            None,
             None,
         )
 
@@ -1156,6 +1601,7 @@ def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
     v = torch.randn_like(u)
     w = torch.randn_like(u)
     gate = torch.randn(1, 2, 3)
+    empty = torch.empty(0)
     angle_left = torch.randn(1, 2, 3, 3, 2, requires_grad=True)
     angle_right = torch.randn(1, 2, 3, 3, 2)
     angle_gate = torch.randn(1, 2, 3, requires_grad=True)
@@ -1176,12 +1622,20 @@ def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
         v,
         w,
         gate,
+        empty,
+        empty,
+        empty,
+        empty,
         angle_left,
         angle_right,
         angle_gate,
         message_left,
         message_right,
         message_basis,
+        empty,
+        empty,
+        empty,
+        torch.empty(0, dtype=torch.bool),
         "ieee_fp32",
         128,
         False,
@@ -1193,12 +1647,19 @@ def test_triton_autograd_passes_optional_gradient_flags(monkeypatch):
         "need_dv_bias": False,
         "need_dw": False,
         "need_dgate": False,
+        "need_du_extra": False,
+        "need_dv_bias_extra": False,
+        "need_dw_extra": False,
+        "need_dgate_extra": False,
         "need_dangle_left": True,
         "need_dangle_right": False,
         "need_dangle_gate": True,
         "need_dmessage_left": False,
         "need_dmessage_right": True,
         "need_dmessage_basis": False,
+        "need_dpair_value_positions": False,
+        "need_dpair_value_freqs": False,
+        "need_dpair_value_scale": False,
     }
 
 
@@ -1258,6 +1719,14 @@ def test_triton_no_bias_forward_backward_matches_torch_cuda():
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "ieee_fp32",
         2,
         False,
@@ -1341,6 +1810,14 @@ def test_triton_forward_backward_ieee_matches_torch_cuda():
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "ieee_fp32",
         2,
         True,
@@ -1421,12 +1898,20 @@ def test_triton_low_rank_angle_forward_backward_matches_torch_cuda():
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
         angle_triton.left,
         angle_triton.right,
         angle_triton.gate,
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "ieee_fp32",
         2,
         False,
@@ -1519,9 +2004,17 @@ def test_triton_low_rank_message_forward_backward_matches_torch_cuda():
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
         message_triton.left,
         message_triton.right,
         message_basis_triton,
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "ieee_fp32",
         2,
         False,
@@ -1644,12 +2137,20 @@ def test_triton_factorized_angle_and_message_mismatched_ranks_cuda():
         factorized_triton.v,
         factorized_triton.w,
         factorized_triton.gate,
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
         angle_triton.left,
         angle_triton.right,
         angle_triton.gate,
         message_triton.left,
         message_triton.right,
         message_basis_triton,
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "ieee_fp32",
         3,
         False,
@@ -1743,6 +2244,14 @@ def test_triton_bf16_forward_backward_within_tolerance():
         q_triton.new_empty(0),
         q_triton.new_empty(0),
         q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        q_triton.new_empty(0),
+        torch.empty(0, device=device, dtype=torch.bool),
         "bf16_tc",
         4,
         False,
