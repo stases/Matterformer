@@ -64,7 +64,7 @@ from matterformer.models.transformer import (
     SimplicialGeometryBias,
     TransformerTrunk,
 )
-from matterformer.models.attention import SimplicialAttentionMask, SimplicialClosedRoPE, SimplicialFactorizedBias
+from matterformer.models.attention import SimplicialAttention, SimplicialAttentionMask, SimplicialFactorizedBias
 
 __all__ = [
     "BaseGeometryAdapter",
@@ -102,8 +102,8 @@ __all__ = [
     "SYNTHMOLFORCE_NUM_ATOM_TYPES",
     "SYNTHMOLFORCE_PAIR_MODES",
     "ScalarConditionEmbedding",
+    "SimplicialAttention",
     "SimplicialAttentionMask",
-    "SimplicialClosedRoPE",
     "SimplicialFactorizedBias",
     "SimplicialGeometryBias",
     "SynthMolForceBatch",

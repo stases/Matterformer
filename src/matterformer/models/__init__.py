@@ -1,10 +1,9 @@
 from matterformer.models.attention import (
+    SimplicialAttention,
     SimplicialAttentionMask,
-    SimplicialClosedRoPE,
     SimplicialFactorizedBias,
     SimplicialLowRankAngleResidual,
     SimplicialLowRankMessageResidual,
-    SimplicialPairwiseRoPEBias,
     TwoSimplicialAttention,
 )
 from matterformer.models.embeddings import (
@@ -18,12 +17,15 @@ from matterformer.models.heads import CrystalHeads
 from matterformer.models.geom_drugs import GeomDrugsEDMModel
 from matterformer.models.mof_stage1 import MOFStage1EDMModel
 from matterformer.models.qm9 import QM9EDMModel, QM9RegressionModel
+from matterformer.models.regular_attention import (
+    RegularAttention,
+    RotaryMultiheadAttention,
+    RotaryPositionEmbedding3D,
+)
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     LearnedNullConditioning,
     MhaFactorizedGeometryBias,
-    RotaryMultiheadAttention,
-    RotaryPositionEmbedding3D,
     ScalarConditionEmbedding,
     SimplicialGeometryBias,
     TransformerTrunk,
@@ -41,16 +43,16 @@ __all__ = [
     "MhaFactorizedGeometryBias",
     "QM9EDMModel",
     "QM9RegressionModel",
+    "RegularAttention",
     "RotaryMultiheadAttention",
     "RotaryPositionEmbedding3D",
     "ScalarConditionEmbedding",
+    "SimplicialAttention",
     "SimplicialAttentionMask",
-    "SimplicialClosedRoPE",
     "SimplicialFactorizedBias",
     "SimplicialGeometryBias",
     "SimplicialLowRankAngleResidual",
     "SimplicialLowRankMessageResidual",
-    "SimplicialPairwiseRoPEBias",
     "TimeEmbedder",
     "TransformerTrunk",
     "TokenEmbedder",

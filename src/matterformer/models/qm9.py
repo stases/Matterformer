@@ -264,18 +264,6 @@ class QM9EDMModel(nn.Module):
         simplicial_angle_rank: int = 16,
         simplicial_message_mode: str = "none",
         simplicial_message_rank: int = 16,
-        simplicial_position_mode: str = "none",
-        simplicial_rope_key_mode: str = "constant",
-        simplicial_rope_n_freqs: int = 16,
-        simplicial_rope_freq_sigma: float = 1.0,
-        simplicial_rope_learned_freqs: bool = False,
-        simplicial_rope_gate: str = "none",
-        simplicial_pair_rope_scale_init: float = 1.0,
-        simplicial_pair_rope_gate_mode: str = "none",
-        simplicial_pair_rope_zero_diag: bool = False,
-        simplicial_rope_value_n_freqs: int | None = None,
-        simplicial_rope_value_scale_init: float = 1.0,
-        simplicial_rope_on_values: str = "none",
         simplicial_content_logits: str = "on",
         mha_geom_bias_mode: str = "standard",
         mha_position_mode: str = "none",
@@ -304,7 +292,6 @@ class QM9EDMModel(nn.Module):
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
         simplicial_geom_mode = simplicial_geom_mode.lower()
         simplicial_message_mode = simplicial_message_mode.lower()
-        simplicial_position_mode = str(simplicial_position_mode).lower().replace("-", "_")
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
         mha_position_mode = mha_position_mode.lower().replace("-", "_")
         coord_embed_mode = coord_embed_mode.lower().replace("-", "_")
@@ -320,12 +307,6 @@ class QM9EDMModel(nn.Module):
             mha_position_mode = "none"
         if mha_position_mode in {"rotary", "mha_rope", "rotary_position_embedding"}:
             mha_position_mode = "rope"
-        if simplicial_position_mode in {"disabled", "off", "false", "no"}:
-            simplicial_position_mode = "none"
-        if simplicial_position_mode in {"center_edge_rope", "closed_simplicial_rope", "cs_rope"}:
-            simplicial_position_mode = "closed_rope"
-        if simplicial_position_mode in {"pairwise_rope", "pair_rope_bias", "pairwise_rope_bias"}:
-            simplicial_position_mode = "pair_rope"
         if coord_head_mode in {"relative", "pair", "pairwise"}:
             coord_head_mode = "equivariant"
         if coord_head_mode in {"non_relative", "non_equivariant", "nonrelative"}:
@@ -336,8 +317,6 @@ class QM9EDMModel(nn.Module):
             )
         if simplicial_message_mode not in {"none", "low_rank"}:
             raise ValueError("simplicial_message_mode must be one of {'none', 'low_rank'}")
-        if simplicial_position_mode not in {"none", "closed_rope", "pair_rope"}:
-            raise ValueError("simplicial_position_mode must be one of {'none', 'closed_rope', 'pair_rope'}")
         if mha_geom_bias_mode not in {"standard", "factorized_marginal"}:
             raise ValueError(
                 "mha_geom_bias_mode must be one of {'standard', 'factorized_marginal'}"
@@ -393,7 +372,6 @@ class QM9EDMModel(nn.Module):
         self.geometry_adapter = geometry_adapter
         self.coord_embed_mode = coord_embed_mode
         self.mha_position_mode = mha_position_mode
-        self.simplicial_position_mode = simplicial_position_mode
         self.simplicial_content_logits = str(simplicial_content_logits).lower().replace("-", "_")
         self.coord_embed_normalize = bool(coord_embed_normalize)
         self.coord_head_mode = coord_head_mode
@@ -430,18 +408,6 @@ class QM9EDMModel(nn.Module):
             simplicial_precision=simplicial_precision,
             simplicial_message_mode=effective_message_mode,
             simplicial_message_rank=simplicial_message_rank,
-            simplicial_position_mode=simplicial_position_mode,
-            simplicial_rope_key_mode=simplicial_rope_key_mode,
-            simplicial_rope_n_freqs=simplicial_rope_n_freqs,
-            simplicial_rope_freq_sigma=simplicial_rope_freq_sigma,
-            simplicial_rope_learned_freqs=simplicial_rope_learned_freqs,
-            simplicial_rope_gate=simplicial_rope_gate,
-            simplicial_pair_rope_scale_init=simplicial_pair_rope_scale_init,
-            simplicial_pair_rope_gate_mode=simplicial_pair_rope_gate_mode,
-            simplicial_pair_rope_zero_diag=simplicial_pair_rope_zero_diag,
-            simplicial_rope_value_n_freqs=simplicial_rope_value_n_freqs,
-            simplicial_rope_value_scale_init=simplicial_rope_value_scale_init,
-            simplicial_rope_on_values=simplicial_rope_on_values,
             simplicial_content_logits=simplicial_content_logits,
             geometry_adapter=geometry_adapter,
             geometry_bias=geometry_bias,

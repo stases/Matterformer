@@ -2,10 +2,10 @@ import torch
 import pytest
 
 from matterformer.geometry import NonPeriodicGeometryAdapter, PeriodicGeometryAdapter
+from matterformer.models.regular_attention import RegularAttention, RotaryMultiheadAttention
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     MhaFactorizedGeometryBias,
-    RotaryMultiheadAttention,
     SimplicialGeometryBias,
     TransformerTrunk,
     _build_simplicial_attention_mask,
@@ -47,7 +47,8 @@ def test_transformer_trunk_default_mha_keeps_torch_multihead_attention():
         attn_type="mha",
     )
     assert trunk.mha_position_mode == "none"
-    assert isinstance(trunk.blocks[0].attn, torch.nn.MultiheadAttention)
+    assert isinstance(trunk.blocks[0].attn, RegularAttention)
+    assert isinstance(trunk.blocks[0].attn.attn, torch.nn.MultiheadAttention)
 
 
 def test_transformer_trunk_mha_rope_forward_with_geometry_bias_and_extra_token():
@@ -161,50 +162,6 @@ def test_transformer_trunk_periodic_simplicial_forward():
     output = trunk(x, cond, coords=coords, lattice=lattice)
     assert output.shape == (1, 4, 32)
     assert torch.isfinite(output).all()
-
-
-def test_transformer_trunk_simplicial_closed_rope_forward_with_factorized_bias():
-    torch.manual_seed(0)
-    adapter = NonPeriodicGeometryAdapter()
-    simplicial_bias = SimplicialGeometryBias(n_heads=4, mode="factorized", use_noise_gate=True)
-    trunk = TransformerTrunk(
-        d_model=32,
-        n_heads=4,
-        n_layers=2,
-        geometry_adapter=adapter,
-        simplicial_geometry_bias=simplicial_bias,
-        attn_type="simplicial",
-        simplicial_impl="torch",
-        simplicial_position_mode="closed_rope",
-        simplicial_rope_n_freqs=2,
-        simplicial_rope_gate="none",
-    )
-
-    x = torch.randn(2, 5, 32, requires_grad=True)
-    cond = torch.randn(2, 32)
-    coords = torch.randn(2, 5, 3)
-    pad_mask = torch.tensor(
-        [
-            [False, False, False, False, True],
-            [False, False, True, True, True],
-        ]
-    )
-    sigma = torch.tensor([0.1, 1.0])
-    output = trunk(x, cond, pad_mask=pad_mask, coords=coords, sigma=sigma)
-    shifted = trunk(
-        x,
-        cond,
-        pad_mask=pad_mask,
-        coords=coords + torch.tensor([[[2.0, -3.0, 4.0]]]),
-        sigma=sigma,
-    )
-
-    assert output.shape == (2, 5, 32)
-    assert torch.isfinite(output).all()
-    assert torch.allclose(output[pad_mask], torch.zeros_like(output[pad_mask]))
-    assert torch.allclose(output, shifted, atol=1e-6, rtol=1e-5)
-    output.square().mean().backward()
-    assert x.grad is not None
 
 
 def test_simplicial_mask_can_include_periodic_global_tokens_as_pair_keys():
