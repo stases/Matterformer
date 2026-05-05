@@ -396,6 +396,8 @@ def _generate_range_gpu_batched(
                         ):
                             stats["attempts"] = int(attempts[index])
                             stats["rejection_reasons"] = dict(rejections[index])
+                            sample["accepted_attempts"] = int(attempts[index])
+                            sample["global_sample_id"] = int(index)
                             accepted[index] = (sample, stats)
                             progress.update(1)
                         else:
@@ -504,6 +506,8 @@ def _generate_range_gpu_full(
                                 stats["attempts"] = int(attempts[index])
                                 stats["rejection_reasons"] = dict(rejections[index])
                                 stats["backend"] = "gpu-full"
+                                sample["accepted_attempts"] = int(attempts[index])
+                                sample["global_sample_id"] = int(index)
                                 accepted[index] = (sample, stats)
                                 progress.update(1)
                             else:
@@ -640,6 +644,10 @@ def _label_candidates_on_device(
             "original_primary_triple": torch.as_tensor(metadata["original_primary_triple"], dtype=torch.long),
             "has_heldout_type_combo": bool(metadata["has_heldout_type_combo"]),
             "heldout_repair_count": int(metadata["heldout_repair_count"]),
+            "proposal_seed": int(metadata.get("proposal_seed", -1)),
+            "accepted_attempts": 1,
+            "global_sample_id": int(index),
+            "shard_id": -1,
             "motif_labels": torch.as_tensor(metadata["motif_labels"], dtype=torch.long),
             "split": split,
         }
