@@ -23,6 +23,7 @@ from matterformer.data import (
     compute_synomol_transfer_labels,
     compute_synomol_transfer_labels_batch_dense,
     compute_synomol_transfer_labels_batch_local,
+    compute_synomol_transfer_multilevel_labels_batch_local,
     langevin_coords_batch,
     materialize_synomol_transfer_split,
     pack_synomol_transfer_samples,
@@ -371,6 +372,41 @@ def test_batched_local_rejects_invalid_valid_atom_types_but_ignores_padding():
     bad_mask = torch.tensor([[True, True, True]])
     with pytest.raises(ValueError, match="valid atom_types"):
         compute_synomol_transfer_energy_batch_local(atom_types, coords, bad_mask, config, k_label=2)
+
+
+def test_multilevel_labels_match_full_local_and_component_force_sum(tmp_path):
+    config = _small_config(length=2)
+    dataset = SynOMolTransferDataset(tmp_path, config=config, mode="online")
+    samples = [dataset[index] for index in range(2)]
+    batch = collate_synomol_transfer(samples)
+    mask = ~batch.pad_mask
+    energy, forces, _, stats = compute_synomol_transfer_labels_batch_local(
+        batch.atom_types,
+        batch.coords.double(),
+        mask,
+        config,
+        k_label=batch.atom_types.shape[1],
+        return_stats=True,
+    )
+    level_energies, level_forces, component_energies, component_forces, level_stats = (
+        compute_synomol_transfer_multilevel_labels_batch_local(
+            batch.atom_types,
+            batch.coords.double(),
+            mask,
+            config,
+            k_label=batch.atom_types.shape[1],
+            return_stats=True,
+        )
+    )
+
+    assert stats["neighbor_cap_hit_fraction"] == 0.0
+    assert level_stats["neighbor_cap_hit_fraction"] == 0.0
+    assert torch.allclose(level_energies["full_local"], energy, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(level_forces["full_local"], forces, atol=1e-7, rtol=1e-6)
+    summed_energy = sum(component_energies[name] for name in SYNOMOL_TRANSFER_COMPONENT_NAMES)
+    summed_forces = sum(component_forces[name] for name in SYNOMOL_TRANSFER_COMPONENT_NAMES)
+    assert torch.allclose(level_energies["full_local"], summed_energy, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(level_forces["full_local"], summed_forces, atol=1e-7, rtol=1e-6)
 
 
 def test_langevin_batch_noise_is_per_sample_seeded_independent_of_batch_composition():

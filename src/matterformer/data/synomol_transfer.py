@@ -25,6 +25,13 @@ SYNOMOL_TRANSFER_SPLITS = (
     "test_perturb",
 )
 SYNOMOL_TRANSFER_COMPONENT_NAMES = ("pair", "angle", "motif", "many_body")
+SYNOMOL_TRANSFER_GEOMETRY_LEVELS: dict[str, tuple[str, ...]] = {
+    "pair_only": ("pair",),
+    "pair_angle": ("pair", "angle"),
+    "pair_angle_motif": ("pair", "angle", "motif"),
+    "full_local": SYNOMOL_TRANSFER_COMPONENT_NAMES,
+}
+SYNOMOL_TRANSFER_GEOMETRY_LEVEL_NAMES = tuple(SYNOMOL_TRANSFER_GEOMETRY_LEVELS)
 SYNOMOL_TRANSFER_SAMPLE_KINDS = (
     "relaxed",
     "relaxation",
@@ -61,6 +68,7 @@ SYNOMOL_TRANSFER_DATASET_INFO = {
     "atom_pad_token": SYNOMOL_TRANSFER_ATOM_PAD_TOKEN,
     "splits": SYNOMOL_TRANSFER_SPLITS,
     "components": SYNOMOL_TRANSFER_COMPONENT_NAMES,
+    "geometry_levels": SYNOMOL_TRANSFER_GEOMETRY_LEVEL_NAMES,
     "sample_kinds": SYNOMOL_TRANSFER_SAMPLE_KINDS,
     "motifs": SYNOMOL_TRANSFER_MOTIFS,
     "alias_pairs": SYNOMOL_TRANSFER_ALIAS_PAIRS,
@@ -410,6 +418,24 @@ class SynOMolTransferDataset(Dataset):
             "shard_id": int(self._fixed["shard_ids"][index].item()),
             "motif_labels": self._fixed["motif_labels"][start:end].clone(),
             "split": str(self._fixed["splits"][index]),
+            **(
+                {
+                    "component_forces": {
+                        name: self._fixed["component_forces"][name][start:end].clone()
+                        for name in self._fixed["component_forces"]
+                    },
+                    "level_energies": {
+                        name: self._fixed["level_energies"][name][index].clone()
+                        for name in self._fixed["level_energies"]
+                    },
+                    "level_forces": {
+                        name: self._fixed["level_forces"][name][start:end].clone()
+                        for name in self._fixed["level_forces"]
+                    },
+                }
+                if "component_forces" in self._fixed
+                else {}
+            ),
         }
 
 
@@ -570,6 +596,87 @@ def compute_synomol_transfer_labels_batch_local(
         energy.detach(),
         forces.detach(),
         {name: value.detach() for name, value in components.items()},
+    )
+    if return_stats:
+        return (*result, stats)
+    return result
+
+
+def compute_synomol_transfer_multilevel_labels_batch_local(
+    atom_types: torch.Tensor,
+    coords: torch.Tensor,
+    mask: torch.Tensor,
+    config: SynOMolTransferConfig,
+    *,
+    levels: tuple[str, ...] | list[str] | None = None,
+    k_label: int = 64,
+    return_stats: bool = False,
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+] | tuple[
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, float],
+]:
+    """Compute component and cumulative geometry-level labels in one graph.
+
+    Returns ``level_energies``, ``level_forces``, ``component_energies``, and
+    ``component_forces``. The default levels are cumulative local-geometry
+    targets sharing the same input coordinates.
+    """
+    requested_levels = tuple(levels or SYNOMOL_TRANSFER_GEOMETRY_LEVEL_NAMES)
+    unknown = sorted(set(requested_levels) - set(SYNOMOL_TRANSFER_GEOMETRY_LEVELS))
+    if unknown:
+        raise ValueError(f"unknown SynOMol-Transfer geometry levels: {unknown}")
+    coords_for_grad = coords.detach().clone().requires_grad_(True)
+    output = compute_synomol_transfer_energy_batch_local(
+        atom_types,
+        coords_for_grad,
+        mask,
+        config,
+        k_label=k_label,
+        return_stats=return_stats,
+    )
+    if return_stats:
+        _, components, stats = output
+    else:
+        _, components = output
+        stats = {}
+    mask = mask.to(device=coords_for_grad.device, dtype=torch.bool)
+    component_forces: dict[str, torch.Tensor] = {}
+    differentiable_names = [name for name in SYNOMOL_TRANSFER_COMPONENT_NAMES if components[name].requires_grad]
+    for grad_index, name in enumerate(differentiable_names):
+        (grad_coords,) = torch.autograd.grad(
+            components[name].sum(),
+            coords_for_grad,
+            retain_graph=grad_index < len(differentiable_names) - 1,
+            create_graph=False,
+            allow_unused=True,
+        )
+        if grad_coords is None:
+            grad_coords = torch.zeros_like(coords_for_grad)
+        component_forces[name] = -grad_coords.masked_fill(~mask[..., None], 0.0)
+    for name in SYNOMOL_TRANSFER_COMPONENT_NAMES:
+        if name not in component_forces:
+            component_forces[name] = torch.zeros_like(coords_for_grad)
+
+    level_energies: dict[str, torch.Tensor] = {}
+    level_forces: dict[str, torch.Tensor] = {}
+    for level in requested_levels:
+        component_names = SYNOMOL_TRANSFER_GEOMETRY_LEVELS[level]
+        level_energies[level] = sum(components[name] for name in component_names)
+        level_forces[level] = sum(component_forces[name] for name in component_names)
+
+    result = (
+        {name: value.detach() for name, value in level_energies.items()},
+        {name: value.detach() for name, value in level_forces.items()},
+        {name: value.detach() for name, value in components.items()},
+        {name: value.detach() for name, value in component_forces.items()},
     )
     if return_stats:
         return (*result, stats)
@@ -1071,7 +1178,7 @@ def pack_synomol_transfer_samples(
     num_atoms = torch.tensor([int(sample["num_atoms"]) for sample in samples], dtype=torch.long)
     ptr = torch.zeros(len(samples) + 1, dtype=torch.long)
     ptr[1:] = torch.cumsum(num_atoms, dim=0)
-    return {
+    packed = {
         "config": asdict(config),
         "split": _normalize_split(split),
         "metadata": dict(metadata or {}),
@@ -1128,6 +1235,40 @@ def pack_synomol_transfer_samples(
         "motif_labels": torch.cat([torch.as_tensor(sample["motif_labels"], dtype=torch.long) for sample in samples], dim=0),
         "splits": [str(sample.get("split", split)) for sample in samples],
     }
+    if all("component_forces" in sample for sample in samples):
+        packed["component_forces"] = {
+            name: torch.cat(
+                [
+                    torch.as_tensor(sample["component_forces"][name], dtype=torch.float32)
+                    for sample in samples
+                ],
+                dim=0,
+            )
+            for name in SYNOMOL_TRANSFER_COMPONENT_NAMES
+        }
+    if all("level_energies" in sample and "level_forces" in sample for sample in samples):
+        level_names = tuple(samples[0]["level_energies"].keys())
+        packed["geometry_levels"] = list(level_names)
+        packed["level_energies"] = {
+            name: torch.stack(
+                [
+                    torch.as_tensor(sample["level_energies"][name], dtype=torch.float32).reshape(())
+                    for sample in samples
+                ]
+            )
+            for name in level_names
+        }
+        packed["level_forces"] = {
+            name: torch.cat(
+                [
+                    torch.as_tensor(sample["level_forces"][name], dtype=torch.float32)
+                    for sample in samples
+                ],
+                dim=0,
+            )
+            for name in level_names
+        }
+    return packed
 
 
 def summarize_synomol_transfer_samples(
@@ -1456,6 +1597,40 @@ def _merge_packed_splits(shards: list[dict[str, Any]]) -> dict[str, Any]:
         "motif_labels": torch.cat([torch.as_tensor(shard["motif_labels"], dtype=torch.long) for shard in shards], dim=0),
         "splits": [value for shard in shards for value in list(shard.get("splits", [shard.get("split", "")] * len(shard["energy"])))],
     }
+    if all("component_forces" in shard for shard in shards):
+        merged["component_forces"] = {
+            name: torch.cat(
+                [
+                    torch.as_tensor(shard["component_forces"][name], dtype=torch.float32)
+                    for shard in shards
+                ],
+                dim=0,
+            )
+            for name in SYNOMOL_TRANSFER_COMPONENT_NAMES
+        }
+    if all("level_energies" in shard and "level_forces" in shard for shard in shards):
+        level_names = tuple(shards[0].get("geometry_levels", shards[0]["level_energies"].keys()))
+        merged["geometry_levels"] = list(level_names)
+        merged["level_energies"] = {
+            name: torch.cat(
+                [
+                    torch.as_tensor(shard["level_energies"][name], dtype=torch.float32)
+                    for shard in shards
+                ],
+                dim=0,
+            )
+            for name in level_names
+        }
+        merged["level_forces"] = {
+            name: torch.cat(
+                [
+                    torch.as_tensor(shard["level_forces"][name], dtype=torch.float32)
+                    for shard in shards
+                ],
+                dim=0,
+            )
+            for name in level_names
+        }
     return merged
 
 
@@ -1474,7 +1649,7 @@ def _normalize_fixed_split(loaded: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise KeyError(f"SynOMol-Transfer fixed split is missing keys: {missing}")
     size = int(torch.as_tensor(loaded["energy"]).shape[0])
-    return {
+    normalized = {
         "atom_types": torch.as_tensor(loaded["atom_types"], dtype=torch.long),
         "coords": torch.as_tensor(loaded["coords"], dtype=torch.float32),
         "forces": torch.as_tensor(loaded["forces"], dtype=torch.float32),
@@ -1503,6 +1678,23 @@ def _normalize_fixed_split(loaded: dict[str, Any]) -> dict[str, Any]:
         "motif_labels": torch.as_tensor(loaded["motif_labels"], dtype=torch.long),
         "splits": list(loaded.get("splits", [loaded.get("split", "")] * size)),
     }
+    if "component_forces" in loaded:
+        normalized["component_forces"] = {
+            name: torch.as_tensor(loaded["component_forces"][name], dtype=torch.float32)
+            for name in loaded["component_forces"]
+        }
+    if "level_energies" in loaded and "level_forces" in loaded:
+        level_names = tuple(loaded.get("geometry_levels", loaded["level_energies"].keys()))
+        normalized["geometry_levels"] = list(level_names)
+        normalized["level_energies"] = {
+            name: torch.as_tensor(loaded["level_energies"][name], dtype=torch.float32)
+            for name in level_names
+        }
+        normalized["level_forces"] = {
+            name: torch.as_tensor(loaded["level_forces"][name], dtype=torch.float32)
+            for name in level_names
+        }
+    return normalized
 
 
 def propose_synomol_transfer_inputs(

@@ -36,6 +36,7 @@ from matterformer.data.synomol_transfer import (
     compute_synomol_transfer_labels,
     compute_synomol_transfer_labels_batch_dense,
     compute_synomol_transfer_labels_batch_local,
+    compute_synomol_transfer_multilevel_labels_batch_local,
     generate_synomol_transfer_sample,
 )
 from matterformer.geometry.adapters import (
@@ -119,6 +120,7 @@ __all__ = [
     "compute_synomol_transfer_labels",
     "compute_synomol_transfer_labels_batch_dense",
     "compute_synomol_transfer_labels_batch_local",
+    "compute_synomol_transfer_multilevel_labels_batch_local",
     "compute_target_stats",
     "generate_synomol_transfer_sample",
 ]
