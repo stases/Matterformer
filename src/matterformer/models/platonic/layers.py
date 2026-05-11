@@ -10,6 +10,11 @@ from matterformer.models.platonic.groups import PLATONIC_GROUPS
 from matterformer.models.platonic.linear import PlatonicLinear
 from matterformer.models.platonic.rope import PlatonicRoPE
 
+try:
+    from flash_attn import flash_attn_varlen_func  # type: ignore[import-not-found]
+except (ImportError, OSError):
+    flash_attn_varlen_func = None
+
 
 class GroupLayerNorm(nn.Module):
     def __init__(self, group_order: int, channels_per_group: int, eps: float = 1e-6) -> None:
@@ -82,6 +87,98 @@ class PlatonicAttention(nn.Module):
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.group_order, self.heads_per_frame, self.head_dim)
 
+    def _sdpa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pad_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        attn_mask = None
+        if pad_mask is not None:
+            attn_mask = torch.zeros_like(pad_mask, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(pad_mask, torch.finfo(q.dtype).min)[:, None, None, :]
+        if q.is_cuda:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True,
+                enable_math=True,
+                enable_mem_efficient=True,
+                enable_cudnn=False,
+            ):
+                return F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                )
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+
+    def _flash_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pad_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if flash_attn_varlen_func is None or not q.is_cuda:
+            return self._sdpa_attention(q, k, v, pad_mask)
+
+        batch_size, _, num_tokens, _ = q.shape
+        orig_dtype = q.dtype
+        q_bnhd = q.transpose(1, 2).contiguous()
+        k_bnhd = k.transpose(1, 2).contiguous()
+        v_bnhd = v.transpose(1, 2).contiguous()
+
+        if pad_mask is None:
+            counts = torch.full(
+                (batch_size,),
+                num_tokens,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            q_unpad = q_bnhd.reshape(batch_size * num_tokens, self.num_heads, self.head_dim)
+            k_unpad = k_bnhd.reshape(batch_size * num_tokens, self.num_heads, self.head_dim)
+            v_unpad = v_bnhd.reshape(batch_size * num_tokens, self.num_heads, self.head_dim)
+            valid = None
+        else:
+            valid = ~pad_mask
+            counts = valid.sum(dim=1, dtype=torch.int32)
+            q_unpad = q_bnhd[valid]
+            k_unpad = k_bnhd[valid]
+            v_unpad = v_bnhd[valid]
+
+        max_seqlen = int(counts.max().item()) if counts.numel() > 0 else 0
+        if max_seqlen == 0:
+            return torch.zeros_like(q)
+
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=q.device)
+        cu_seqlens[1:] = torch.cumsum(counts, dim=0)
+        out_unpad = flash_attn_varlen_func(
+            q_unpad.to(torch.bfloat16),
+            k_unpad.to(torch.bfloat16),
+            v_unpad.to(torch.bfloat16),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=self.dropout if self.training else 0.0,
+            causal=False,
+        ).to(orig_dtype)
+
+        if valid is None:
+            out_bnhd = out_unpad.view(batch_size, num_tokens, self.num_heads, self.head_dim)
+        else:
+            out_bnhd = torch.zeros_like(q_bnhd)
+            out_bnhd[valid] = out_unpad
+        return out_bnhd.transpose(1, 2).contiguous()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -100,26 +197,10 @@ class PlatonicAttention(nn.Module):
         q = q.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        attn_mask = None
-        if pad_mask is not None:
-            if self.attention_backend == "flash":
-                attn_mask = (~pad_mask)[:, None, None, :]
-            else:
-                attn_mask = torch.zeros_like(pad_mask, dtype=q.dtype)
-                attn_mask = attn_mask.masked_fill(pad_mask, torch.finfo(q.dtype).min)[:, None, None, :]
-        orig_dtype = q.dtype
         if self.attention_backend == "flash":
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
-        out = out.to(orig_dtype)
+            out = self._flash_attention(q, k, v, pad_mask)
+        else:
+            out = self._sdpa_attention(q, k, v, pad_mask)
         out = out.transpose(1, 2).contiguous().view(
             batch_size,
             num_tokens,
