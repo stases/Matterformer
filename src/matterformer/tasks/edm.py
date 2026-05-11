@@ -178,7 +178,7 @@ def edm_sampler(
     s_max: float = float("inf"),
     s_noise: float = 1.003,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    device = net.model.atom_proj.weight.device
+    device = next(net.model.parameters()).device
     num_atoms = num_atoms.to(device=device, dtype=torch.long)
     pad_mask = build_pad_mask(num_atoms).to(device)
     batch_size, max_atoms = pad_mask.shape
