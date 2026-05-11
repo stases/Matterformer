@@ -46,6 +46,15 @@ def load_hybrid_config(value: str | None) -> dict | None:
     return config
 
 
+def collect_sg_diagnostics(net: EDMPreconditioner) -> dict[str, float]:
+    model = getattr(net, "model", None)
+    trunk = getattr(model, "trunk", None)
+    collector = getattr(trunk, "collect_sg_diagnostics", None)
+    if not callable(collector):
+        return {}
+    return collector()
+
+
 def evaluate_loss(
     net: EDMPreconditioner,
     criterion: EDMLoss,
@@ -757,29 +766,28 @@ def main(args: argparse.Namespace) -> None:
             lr = optimizer.param_groups[0]["lr"]
 
             if run is not None and args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
-                run.log(
-                    {
-                        "trainer/global_step": global_step,
-                        "trainer/epoch": epoch_float,
-                        "train/loss": loss_value,
-                        "train/atom_loss": diagnostics["atom_loss"].mean().item(),
-                        "train/coord_loss": diagnostics["coord_loss"].mean().item(),
-                        "noise/sigma_mean": diagnostics["sigma"].mean().item(),
-                        "noise/sigma_std": diagnostics["sigma"].std(unbiased=False).item(),
-                        "noise/log_sigma_over_4_mean": diagnostics["log_sigma_over_4"].mean().item(),
-                        "noise/log_sigma_over_4_std": diagnostics["log_sigma_over_4"].std(unbiased=False).item(),
-                        "noise/loss_weight_mean": diagnostics["loss_weight"].mean().item(),
-                        "noise/loss_weight_clamped_frac": diagnostics["loss_weight_clamped"].mean().item(),
-                        "optim/grad_norm": grad_norm_value,
-                        "optim/lr": lr,
-                        "train/skipped_updates": skipped_updates,
-                        "train/skipped_nonfinite_loss": skipped_nonfinite_loss,
-                        "train/skipped_loss_threshold": skipped_loss_threshold,
-                        "train/skipped_nonfinite_grad": skipped_nonfinite_grad,
-                        "train/skipped_grad_threshold": skipped_grad_threshold,
-                    },
-                    step=global_step,
-                )
+                log_payload = {
+                    "trainer/global_step": global_step,
+                    "trainer/epoch": epoch_float,
+                    "train/loss": loss_value,
+                    "train/atom_loss": diagnostics["atom_loss"].mean().item(),
+                    "train/coord_loss": diagnostics["coord_loss"].mean().item(),
+                    "noise/sigma_mean": diagnostics["sigma"].mean().item(),
+                    "noise/sigma_std": diagnostics["sigma"].std(unbiased=False).item(),
+                    "noise/log_sigma_over_4_mean": diagnostics["log_sigma_over_4"].mean().item(),
+                    "noise/log_sigma_over_4_std": diagnostics["log_sigma_over_4"].std(unbiased=False).item(),
+                    "noise/loss_weight_mean": diagnostics["loss_weight"].mean().item(),
+                    "noise/loss_weight_clamped_frac": diagnostics["loss_weight_clamped"].mean().item(),
+                    "optim/grad_norm": grad_norm_value,
+                    "optim/lr": lr,
+                    "train/skipped_updates": skipped_updates,
+                    "train/skipped_nonfinite_loss": skipped_nonfinite_loss,
+                    "train/skipped_loss_threshold": skipped_loss_threshold,
+                    "train/skipped_nonfinite_grad": skipped_nonfinite_grad,
+                    "train/skipped_grad_threshold": skipped_grad_threshold,
+                }
+                log_payload.update(collect_sg_diagnostics(net))
+                run.log(log_payload, step=global_step)
 
             if (
                 run is not None

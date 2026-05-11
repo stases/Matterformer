@@ -400,7 +400,7 @@ def test_grouped_compact_simplicial_reference_matches_folded_reference():
 def test_grouped_compact_simplicial_triton_cuda_forward_backward_matches_reference():
     torch.manual_seed(17)
     device = torch.device("cuda")
-    batch_size, group_order, num_heads, num_tokens, k_neighbors, head_dim, rank = 2, 3, 2, 7, 4, 16, 16
+    batch_size, group_order, num_heads, num_tokens, k_neighbors, head_dim, rank = 2, 3, 2, 7, 4, 32, 16
     kwargs = {"device": device, "dtype": torch.float32, "requires_grad": True}
     tensors = [torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
     base_idx = torch.arange(num_tokens, device=device)[:, None]
@@ -630,6 +630,31 @@ def _small_geom(coords: torch.Tensor, pad_mask: torch.Tensor, k_neighbors: int =
     )
 
 
+def test_compact_simplicial_geometry_bias_gate_init_and_message_gate():
+    torch.manual_seed(0)
+    coords = torch.randn(2, 5, 3)
+    pad_mask = torch.zeros(2, 5, dtype=torch.bool)
+    geom = _small_geom(coords, pad_mask, k_neighbors=3)
+    bias_module = CompactSimplicialGeometryBias(
+        num_heads=2,
+        rank=8,
+        rbf_dim=8,
+        gate_init=0.05,
+        message_enabled=True,
+        message_rank=8,
+        head_dim=4,
+    )
+    bias = bias_module(geom, dtype=torch.float32)
+    assert bias.gate is not None
+    assert bias.angle_gate is not None
+    assert bias.message_left is not None
+    assert bias.message_right is not None
+    assert torch.allclose(bias_module.gate, torch.full_like(bias_module.gate, 0.05))
+    assert torch.allclose(bias_module.angle_gate, torch.full_like(bias_module.angle_gate, 0.05))
+    assert torch.allclose(bias_module.message_gate, torch.full_like(bias_module.message_gate, 0.05))
+    assert bias.message_left.abs().max() > 0
+
+
 def test_group_framewise_simplicial_layer_shape_mask_and_equivariance():
     torch.manual_seed(0)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -655,6 +680,8 @@ def test_group_framewise_simplicial_layer_shape_mask_and_equivariance():
     assert out is not None
     assert out.shape == group_features.shape
     assert torch.all(out[pad_mask] == 0)
+    assert "attn_delta_rms" in layer.last_diagnostics
+    assert "radial_gate_mean" in layer.last_diagnostics
 
     permutation = group.cayley_table[3]
     state_perm = ModelState(
@@ -667,6 +694,44 @@ def test_group_framewise_simplicial_layer_shape_mask_and_equivariance():
     out_perm = layer(state_perm).group
     assert out_perm is not None
     assert torch.allclose(out_perm, out[:, :, permutation], atol=1e-5, rtol=1e-5)
+
+
+def test_hybrid_tetra_local_moment_lift_and_sg_diagnostics():
+    torch.manual_seed(0)
+    trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        input_dim=5,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [1, 0, 0],
+            "tetra_dim_per_frame": 2,
+            "simplicial": {
+                "k_neighbors": 3,
+                "num_heads": 1,
+                "head_dim": 4,
+                "bias": {"angle_rank": 8, "radial_basis_dim": 8, "gate_init": 0.05},
+                "message": {"enabled": True, "rank": 8, "gate_init": 0.05},
+                "kernel": {"backend": "torch"},
+            },
+            "input_lift": {"kind": "local_moment_lift", "hidden_dim": 16, "scale_init": 0.1},
+            "readout": {"kind": "platonic_ffn"},
+        },
+        geometry_adapter=NonPeriodicGeometryAdapter(),
+        use_final_norm=False,
+    )
+    x = torch.randn(2, 5, 5)
+    coords = torch.randn(2, 5, 3)
+    pad_mask = torch.tensor([[False, False, False, True, True], [False, False, False, False, True]])
+    out = trunk(x, None, pad_mask=pad_mask, coords=coords, return_output=True)
+    assert isinstance(out, tuple) is False
+    assert out.group is not None
+    assert out.group.shape == (2, 5, 12, 2)
+    diagnostics = trunk.collect_sg_diagnostics()
+    assert diagnostics["sg/layers_logged"] == 1.0
+    assert "sg/mean/message_gate_mean" in diagnostics
 
 
 def test_group_vector_readout_is_tetra_equivariant():

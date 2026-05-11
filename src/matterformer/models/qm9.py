@@ -370,6 +370,8 @@ class QM9EDMModel(nn.Module):
         )
         if input_lift_kind in {"platonic", "platonic_scalar", "platonic_copy"}:
             input_lift_kind = "platonic_linear"
+        if input_lift_kind in {"local_moment", "moment_lift", "platonic_local_moment"}:
+            input_lift_kind = "local_moment_lift"
         self.use_platonic_qm9_readout = (
             attn_type == "hybrid"
             and effective_hybrid_config is not None
@@ -377,8 +379,11 @@ class QM9EDMModel(nn.Module):
             and readout_kind == "platonic_ffn"
         )
         if self.use_platonic_qm9_readout:
-            if input_lift_kind != "platonic_linear":
-                raise ValueError("readout.kind='platonic_ffn' requires input_lift.kind='platonic_linear'")
+            if input_lift_kind not in {"platonic_linear", "local_moment_lift"}:
+                raise ValueError(
+                    "readout.kind='platonic_ffn' requires input_lift.kind='platonic_linear' "
+                    "or 'local_moment_lift'"
+                )
             if coord_head_mode != "group_vector":
                 raise ValueError("readout.kind='platonic_ffn' for QM9 EDM requires coord_head_mode='group_vector'")
             if coord_embed_mode != "none":

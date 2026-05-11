@@ -219,6 +219,14 @@ class HybridTrunkOutput:
     stream_type: Literal["scalar", "tetra"]
 
 
+def _diag_rms(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().float().pow(2).mean().sqrt()
+
+
+def _diag_std(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().float().std(unbiased=False)
+
+
 def _gather_neighbor_values(values: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
     batch_size, num_atoms, _, channels = values.shape
     _, _, num_neighbors = neighbor_idx.shape
@@ -550,9 +558,14 @@ class CompactSimplicialGeometryBias(nn.Module):
         hidden_dim: int = 128,
         use_radial_uv: bool = True,
         use_angle: bool = True,
+        gate_init: float = 0.0,
+        radial_gate_init: float | None = None,
+        angle_gate_init: float | None = None,
         message_enabled: bool = False,
         message_rank: int = 16,
         message_channels_by_l: dict[int, int] | None = None,
+        message_hidden_dim: int | None = None,
+        message_gate_init: float | None = None,
         head_dim: int = 64,
     ) -> None:
         super().__init__()
@@ -563,13 +576,18 @@ class CompactSimplicialGeometryBias(nn.Module):
         self.use_angle = bool(use_angle)
         self.message_enabled = bool(message_enabled)
         self.message_rank = int(message_rank)
+        gate_init = float(gate_init)
+        radial_gate_init = gate_init if radial_gate_init is None else float(radial_gate_init)
+        angle_gate_init = gate_init if angle_gate_init is None else float(angle_gate_init)
+        message_gate_init = gate_init if message_gate_init is None else float(message_gate_init)
+        message_hidden_dim = int(message_hidden_dim or hidden_dim)
         self.channels_by_l = _normalize_channels_by_l(self.rank, channels_by_l)
         self.num_coefficients = _num_spherical_coefficients(self.channels_by_l)
         edge_dim = self.rbf_dim
         if self.use_radial_uv:
             self.u_mlp = nn.Sequential(nn.Linear(edge_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, self.num_heads))
             self.v_mlp = nn.Sequential(nn.Linear(edge_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, self.num_heads))
-            self.gate = nn.Parameter(torch.zeros(1, self.num_heads, 1))
+            self.gate = nn.Parameter(torch.full((1, self.num_heads, 1), radial_gate_init))
         else:
             self.u_mlp = None
             self.v_mlp = None
@@ -585,7 +603,7 @@ class CompactSimplicialGeometryBias(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, self.num_heads * self.num_coefficients),
             )
-            self.angle_gate = nn.Parameter(torch.zeros(1, self.num_heads, 1))
+            self.angle_gate = nn.Parameter(torch.full((1, self.num_heads, 1), angle_gate_init))
         else:
             self.left_mlp = None
             self.right_mlp = None
@@ -594,16 +612,17 @@ class CompactSimplicialGeometryBias(nn.Module):
             self.message_channels_by_l = _normalize_channels_by_l(self.message_rank, message_channels_by_l)
             self.num_message_coefficients = _num_spherical_coefficients(self.message_channels_by_l)
             self.message_left_mlp = nn.Sequential(
-                nn.Linear(edge_dim, hidden_dim),
+                nn.Linear(edge_dim, message_hidden_dim),
                 nn.SiLU(),
-                nn.Linear(hidden_dim, self.num_heads * self.num_message_coefficients),
+                nn.Linear(message_hidden_dim, self.num_heads * self.num_message_coefficients),
             )
             self.message_right_mlp = nn.Sequential(
-                nn.Linear(edge_dim, hidden_dim),
+                nn.Linear(edge_dim, message_hidden_dim),
                 nn.SiLU(),
-                nn.Linear(hidden_dim, self.num_heads * self.num_message_coefficients),
+                nn.Linear(message_hidden_dim, self.num_heads * self.num_message_coefficients),
             )
             self.message_basis = nn.Parameter(torch.empty(self.num_heads, self.message_rank, int(head_dim)))
+            self.message_gate = nn.Parameter(torch.full((1, self.num_heads, 1), message_gate_init))
             nn.init.normal_(self.message_basis, mean=0.0, std=float(head_dim) ** -0.5)
         else:
             self.message_channels_by_l = {}
@@ -611,6 +630,7 @@ class CompactSimplicialGeometryBias(nn.Module):
             self.message_left_mlp = None
             self.message_right_mlp = None
             self.register_parameter("message_basis", None)
+            self.register_parameter("message_gate", None)
 
     def forward(self, geom: GeometryCache, *, dtype: torch.dtype) -> CompactSimplicialBias:
         edge_features = geom.rbf
@@ -649,7 +669,13 @@ class CompactSimplicialGeometryBias(nn.Module):
             angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         message_left = message_right = message_basis = None
         if self.message_enabled:
-            assert self.message_left_mlp is not None and self.message_right_mlp is not None and self.message_basis is not None and basis is not None
+            assert (
+                self.message_left_mlp is not None
+                and self.message_right_mlp is not None
+                and self.message_basis is not None
+                and self.message_gate is not None
+                and basis is not None
+            )
             message_left_coeff = self.message_left_mlp(edge_features).view(
                 batch_size,
                 num_atoms,
@@ -676,6 +702,8 @@ class CompactSimplicialGeometryBias(nn.Module):
             ).to(dtype=dtype)
             message_left = message_left.masked_fill(~edge_mask, 0.0)
             message_right = message_right.masked_fill(~edge_mask, 0.0)
+            message_gate = self.message_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
+            message_left = message_left * message_gate[:, :, :, None, None]
             message_basis = self.message_basis.to(dtype=dtype)
         return CompactSimplicialBias(
             u=u,
@@ -737,11 +765,31 @@ class CompactSimplicialAttention(nn.Module):
             rank=int(bias_config.get("angle_rank", 32)),
             rbf_dim=int(bias_config.get("radial_basis_dim", 32)),
             channels_by_l=bias_config.get("channels_by_l"),
+            hidden_dim=int(bias_config.get("hidden_dim", 128)),
             use_radial_uv=bool(bias_config.get("use_radial_uv", bias_config.get("use_radial_bias", True))),
             use_angle=bool(bias_config.get("use_angle", bias_config.get("use_angle_bias", True))),
+            gate_init=float(bias_config.get("gate_init", 0.0)),
+            radial_gate_init=(
+                float(bias_config["radial_gate_init"]) if "radial_gate_init" in bias_config else None
+            ),
+            angle_gate_init=(
+                float(bias_config["angle_gate_init"]) if "angle_gate_init" in bias_config else None
+            ),
             message_enabled=bool(message_config.get("enabled", False)),
             message_rank=int(message_config.get("rank", 16)),
             message_channels_by_l=message_config.get("channels_by_l"),
+            message_hidden_dim=int(
+                message_config.get(
+                    "hidden_dim",
+                    bias_config.get("message_hidden_dim", bias_config.get("hidden_dim", 128)),
+                )
+            ),
+            message_gate_init=float(
+                message_config.get(
+                    "gate_init",
+                    bias_config.get("message_gate_init", bias_config.get("gate_init", 0.0)),
+                )
+            ),
             head_dim=self.head_dim,
         )
 
@@ -897,13 +945,34 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             rank=int(bias_config.get("angle_rank", 32)),
             rbf_dim=int(bias_config.get("radial_basis_dim", 32)),
             channels_by_l=bias_config.get("channels_by_l"),
+            hidden_dim=int(bias_config.get("hidden_dim", 128)),
             use_radial_uv=bool(bias_config.get("use_radial_uv", bias_config.get("use_radial_bias", True))),
             use_angle=bool(bias_config.get("use_angle", bias_config.get("use_angle_bias", True))),
+            gate_init=float(bias_config.get("gate_init", 0.0)),
+            radial_gate_init=(
+                float(bias_config["radial_gate_init"]) if "radial_gate_init" in bias_config else None
+            ),
+            angle_gate_init=(
+                float(bias_config["angle_gate_init"]) if "angle_gate_init" in bias_config else None
+            ),
             message_enabled=bool(message_config.get("enabled", False)),
             message_rank=int(message_config.get("rank", 16)),
             message_channels_by_l=message_config.get("channels_by_l"),
+            message_hidden_dim=int(
+                message_config.get(
+                    "hidden_dim",
+                    bias_config.get("message_hidden_dim", bias_config.get("hidden_dim", 128)),
+                )
+            ),
+            message_gate_init=float(
+                message_config.get(
+                    "gate_init",
+                    bias_config.get("message_gate_init", bias_config.get("gate_init", 0.0)),
+                )
+            ),
             head_dim=self.head_dim,
         )
+        self.last_diagnostics: dict[str, torch.Tensor] = {}
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
@@ -931,6 +1000,51 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             out = self.out_proj(out_group.reshape(batch_size, num_atoms, self.group_order * self.inner_dim))
             return out.view(batch_size, num_atoms, self.group_order, self.dim_per_frame)
         return self.out_proj(out_group)
+
+    def _record_diagnostics(
+        self,
+        *,
+        q_g: torch.Tensor,
+        k1_g: torch.Tensor,
+        v1_g: torch.Tensor,
+        k2_g: torch.Tensor,
+        v2_g: torch.Tensor,
+        bias: CompactSimplicialBias,
+        out_g: torch.Tensor,
+    ) -> None:
+        diagnostics: dict[str, torch.Tensor] = {
+            "q_std": _diag_std(q_g),
+            "k1_std": _diag_std(k1_g),
+            "k2_std": _diag_std(k2_g),
+            "v1_std": _diag_std(v1_g),
+            "v2_std": _diag_std(v2_g),
+            "attn_out_rms": _diag_rms(out_g),
+        }
+        if bias.u is not None:
+            diagnostics["radial_u_std"] = _diag_std(bias.u)
+        if bias.v is not None:
+            diagnostics["radial_v_std"] = _diag_std(bias.v)
+        if bias.gate is not None:
+            diagnostics["radial_gate_mean"] = bias.gate.detach().float().mean()
+            diagnostics["radial_gate_abs_mean"] = bias.gate.detach().float().abs().mean()
+        if bias.angle_left is not None:
+            diagnostics["angle_left_std"] = _diag_std(bias.angle_left)
+        if bias.angle_right is not None:
+            diagnostics["angle_right_std"] = _diag_std(bias.angle_right)
+        if bias.angle_gate is not None:
+            diagnostics["angle_gate_mean"] = bias.angle_gate.detach().float().mean()
+            diagnostics["angle_gate_abs_mean"] = bias.angle_gate.detach().float().abs().mean()
+        message_gate = getattr(self.bias, "message_gate", None)
+        if message_gate is not None:
+            diagnostics["message_gate_mean"] = message_gate.detach().float().mean()
+            diagnostics["message_gate_abs_mean"] = message_gate.detach().float().abs().mean()
+        if bias.message_left is not None:
+            diagnostics["message_left_std"] = _diag_std(bias.message_left)
+        if bias.message_right is not None:
+            diagnostics["message_right_std"] = _diag_std(bias.message_right)
+        if bias.message_basis is not None:
+            diagnostics["message_basis_rms"] = _diag_rms(bias.message_basis)
+        self.last_diagnostics = diagnostics
 
     def forward(self, x_group_atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
         batch_size, num_atoms, group_order, _ = x_group_atoms.shape
@@ -1025,6 +1139,15 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             )
             out_g = out_flat.view(batch_size, group_order, self.num_heads, num_atoms, self.head_dim)
 
+        self._record_diagnostics(
+            q_g=q_g,
+            k1_g=k1_g,
+            v1_g=v1_g,
+            k2_g=k2_g,
+            v2_g=v2_g,
+            bias=bias,
+            out_g=out_g,
+        )
         out = out_g.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, num_atoms, group_order, self.inner_dim)
         return self._project_out(out)
 
@@ -1072,6 +1195,7 @@ class GroupFramewiseSimplicialLayer(nn.Module):
             PlatonicLinear(hidden, d_group, solid=solid),
         )
         self.dropout = nn.Dropout(dropout)
+        self.last_diagnostics: dict[str, torch.Tensor] = {}
 
     def forward(self, state: ModelState) -> ModelState:
         if state.group is None:
@@ -1081,11 +1205,29 @@ class GroupFramewiseSimplicialLayer(nn.Module):
         coords_len = state.geom.coords_len
         group = state.group
         atoms = group[:, :coords_len, :, :]
+        atoms_before = atoms
         atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
         attn_in = self.norm1(atoms_flat).view_as(atoms)
-        atoms = atoms + self.dropout(self.attn(attn_in, state.geom))
+        attn_delta = self.dropout(self.attn(attn_in, state.geom))
+        atoms = atoms + attn_delta
         atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
-        atoms = atoms + self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+        mlp_delta = self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+        atoms = atoms + mlp_delta
+        input_rms = _diag_rms(atoms_before)
+        attn_delta_rms = _diag_rms(attn_delta)
+        mlp_delta_rms = _diag_rms(mlp_delta)
+        diagnostics = dict(self.attn.last_diagnostics)
+        diagnostics.update(
+            {
+                "input_rms": input_rms,
+                "attn_delta_rms": attn_delta_rms,
+                "mlp_delta_rms": mlp_delta_rms,
+                "output_rms": _diag_rms(atoms),
+                "attn_delta_ratio": attn_delta_rms / input_rms.clamp_min(1e-12),
+                "mlp_delta_ratio": mlp_delta_rms / input_rms.clamp_min(1e-12),
+            }
+        )
+        self.last_diagnostics = diagnostics
         if group.shape[1] == coords_len:
             group = atoms
         else:
@@ -1294,9 +1436,15 @@ class HybridTransformerTrunk(nn.Module):
         self.input_lift_kind = str(self.config.input_lift.get("kind", "scalar_copy")).lower().replace("-", "_")
         if self.input_lift_kind in {"platonic", "platonic_scalar", "platonic_copy"}:
             self.input_lift_kind = "platonic_linear"
+        if self.input_lift_kind in {"local_moment", "moment_lift", "platonic_local_moment"}:
+            self.input_lift_kind = "local_moment_lift"
         self.readout_kind = str(self.config.readout.get("kind", "group_mean")).lower().replace("-", "_")
         if self.readout_kind in {"platonic", "platonic_readout"}:
             self.readout_kind = "platonic_ffn"
+        self.k_neighbors = int(self.config.simplicial.get("k_neighbors", 32))
+        bias_cfg = dict(self.config.simplicial.get("bias", {}))
+        self.rbf_dim = int(bias_cfg.get("radial_basis_dim", 32))
+        self.rbf_cutoff = bias_cfg.get("radial_cutoff")
         schedule = expand_hybrid_schedule(
             self.config.num_blocks,
             self.config.block_mix,
@@ -1304,13 +1452,13 @@ class HybridTransformerTrunk(nn.Module):
             self.config.explicit_orders,
         )
         validate_hybrid_schedule(schedule, self.stream_type)
-        if self.stream_type == "tetra" and self.input_lift_kind not in {"scalar_copy", "platonic_linear"}:
+        if self.stream_type == "tetra" and self.input_lift_kind not in {"scalar_copy", "platonic_linear", "local_moment_lift"}:
             raise NotImplementedError(
-                "Only tetra input_lift kinds 'scalar_copy' and 'platonic_linear' are implemented"
+                "Only tetra input_lift kinds 'scalar_copy', 'platonic_linear', and 'local_moment_lift' are implemented"
             )
         if self.stream_type == "tetra" and self.readout_kind not in {"group_mean", "platonic_ffn"}:
             raise NotImplementedError("Only tetra readout kinds 'group_mean' and 'platonic_ffn' are implemented")
-        if self.stream_type == "tetra" and self.input_lift_kind == "platonic_linear":
+        if self.stream_type == "tetra" and self.input_lift_kind in {"platonic_linear", "local_moment_lift"}:
             self.group_input_proj = PlatonicLinear(
                 self.group_order * self.input_dim,
                 self.group_order * self.group_dim_per_frame,
@@ -1321,15 +1469,31 @@ class HybridTransformerTrunk(nn.Module):
             self.group_input_proj = (
                 nn.Linear(self.input_dim, self.group_dim_per_frame) if self.stream_type == "tetra" else None
             )
+        self.local_moment_enabled = self.stream_type == "tetra" and self.input_lift_kind == "local_moment_lift"
+        if self.local_moment_enabled:
+            lift_cfg = dict(self.config.input_lift)
+            moment_hidden_dim = int(lift_cfg.get("hidden_dim", 128))
+            self.local_moment_mlp = nn.Sequential(
+                nn.Linear(self.rbf_dim, moment_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(moment_hidden_dim, 1),
+            )
+            self.local_moment_proj = nn.Linear(3, self.group_dim_per_frame, bias=False)
+            self.local_moment_scale = nn.Parameter(torch.tensor(float(lift_cfg.get("scale_init", 0.1))))
+            self.register_buffer(
+                "_local_moment_rotations",
+                PLATONIC_GROUPS[self.tetra_solid].elements,
+                persistent=False,
+            )
+        else:
+            self.local_moment_mlp = None
+            self.local_moment_proj = None
+            self.register_parameter("local_moment_scale", None)
         self.group_readout_proj = (
             nn.Linear(self.group_dim_per_frame, d_model)
             if self.stream_type == "tetra" and self.readout_kind == "group_mean"
             else None
         )
-        self.k_neighbors = int(self.config.simplicial.get("k_neighbors", 32))
-        bias_cfg = dict(self.config.simplicial.get("bias", {}))
-        self.rbf_dim = int(bias_cfg.get("radial_basis_dim", 32))
-        self.rbf_cutoff = bias_cfg.get("radial_cutoff")
 
         blocks: list[HybridBlock] = []
         for block_order in schedule:
@@ -1413,12 +1577,28 @@ class HybridTransformerTrunk(nn.Module):
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
-    def _lift_tetra_input(self, x: torch.Tensor, pad_mask: torch.Tensor | None) -> torch.Tensor:
+    def _local_moment_lift_features(self, geom: GeometryCache, *, dtype: torch.dtype) -> torch.Tensor:
+        if self.local_moment_mlp is None or self.local_moment_proj is None or self.local_moment_scale is None:
+            raise RuntimeError("local moment input lift is not configured")
+        weights = self.local_moment_mlp(geom.rbf).squeeze(-1)
+        weights = weights.masked_fill(~geom.neighbor_mask, 0.0)
+        moment = (weights[..., None] * geom.unit).sum(dim=2)
+        rotations = self._local_moment_rotations.to(device=moment.device, dtype=moment.dtype)
+        local_moment = torch.einsum("gji,bnj->bngi", rotations, moment)
+        features = self.local_moment_proj(local_moment.to(dtype=dtype))
+        return self.local_moment_scale.to(device=features.device, dtype=features.dtype) * features
+
+    def _lift_tetra_input(
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor | None,
+        geom: GeometryCache | None = None,
+    ) -> torch.Tensor:
         if self.group_input_proj is None:
             raise RuntimeError("group_input_proj is not configured for tetra stream")
         if x.shape[-1] != self.input_dim:
             raise ValueError(f"Expected tetra trunk input dim {self.input_dim}, got {x.shape[-1]}")
-        if self.input_lift_kind == "platonic_linear":
+        if self.input_lift_kind in {"platonic_linear", "local_moment_lift"}:
             lifted = x.unsqueeze(2).expand(-1, -1, self.group_order, -1).reshape(
                 *x.shape[:-1],
                 self.group_order * self.input_dim,
@@ -1426,6 +1606,12 @@ class HybridTransformerTrunk(nn.Module):
             group = self.group_input_proj(lifted).view(*x.shape[:-1], self.group_order, self.group_dim_per_frame)
         else:
             group = self.group_input_proj(x).unsqueeze(2).expand(-1, -1, self.group_order, -1).contiguous()
+        if self.input_lift_kind == "local_moment_lift":
+            if geom is None:
+                raise RuntimeError("input_lift.kind='local_moment_lift' requires geometry cache")
+            moment_features = self._local_moment_lift_features(geom, dtype=group.dtype)
+            group = group.clone()
+            group[:, : moment_features.shape[1], :, :] = group[:, : moment_features.shape[1], :, :] + moment_features
         if pad_mask is not None:
             group = group.masked_fill(pad_mask[..., None, None], 0.0)
         return group
@@ -1462,6 +1648,28 @@ class HybridTransformerTrunk(nn.Module):
             cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
         )
 
+    def collect_sg_diagnostics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        aggregate: dict[str, list[float]] = {}
+        sg_idx = 0
+        for block in self.blocks:
+            for layer in block.sublayers:
+                diagnostics = getattr(layer, "last_diagnostics", None)
+                if not diagnostics:
+                    continue
+                layer_prefix = f"sg/layer_{sg_idx}"
+                for key, value in diagnostics.items():
+                    scalar = float(value.detach().float().item()) if torch.is_tensor(value) else float(value)
+                    metrics[f"{layer_prefix}/{key}"] = scalar
+                    aggregate.setdefault(key, []).append(scalar)
+                sg_idx += 1
+        if sg_idx == 0:
+            return metrics
+        metrics["sg/layers_logged"] = float(sg_idx)
+        for key, values in aggregate.items():
+            metrics[f"sg/mean/{key}"] = sum(values) / len(values)
+        return metrics
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1483,7 +1691,7 @@ class HybridTransformerTrunk(nn.Module):
         scalar = x if self.stream_type == "scalar" else None
         group = None
         if self.stream_type == "tetra":
-            group = self._lift_tetra_input(x, pad_mask)
+            group = self._lift_tetra_input(x, pad_mask, geom)
         state = ModelState(
             pos=coords if coords is not None else x.new_zeros(x.shape[0], x.shape[1], 3),
             mask=pad_mask,

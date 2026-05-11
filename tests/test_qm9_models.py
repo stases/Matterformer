@@ -263,6 +263,43 @@ def test_qm9_edm_tetra_platonic_readout_smoke():
     loss.backward()
 
 
+def test_qm9_edm_tetra_platonic_readout_local_moment_lift_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        attn_type="hybrid",
+        noise_conditioning="concat",
+        coord_head_mode="group_vector",
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [1, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "simplicial": {
+                "k_neighbors": 3,
+                "num_heads": 1,
+                "head_dim": 4,
+                "bias": {"angle_rank": 8, "radial_basis_dim": 8, "gate_init": 0.05},
+                "message": {"enabled": True, "rank": 8, "gate_init": 0.05},
+                "kernel": {"backend": "torch"},
+            },
+            "input_lift": {"kind": "local_moment_lift", "hidden_dim": 16, "scale_init": 0.1},
+            "readout": {"kind": "platonic_ffn", "ffn": True},
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 4.0},
+        },
+    )
+    assert model.use_platonic_qm9_readout
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
 def test_qm9_edm_factorized_message_low_rank_loss_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()
