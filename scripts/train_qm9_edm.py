@@ -29,6 +29,15 @@ from matterformer.utils import (
 )
 
 
+def configure_torch_runtime(args: argparse.Namespace) -> None:
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cudnn.benchmark = True
+    if args.float32_matmul_precision is not None:
+        torch.set_float32_matmul_precision(args.float32_matmul_precision)
+
+
 def make_autocast_context(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -235,15 +244,22 @@ def maybe_configure_wandb(
     run.summary["model/num_trainable_parameters"] = num_trainable_parameters
 
 
-def apply_rotation_augmentation(batch, enabled: bool):
+def apply_rotation_augmentation(batch, enabled: bool, *, mode: str = "per_sample"):
     if not enabled:
         return batch
-    rotations = random_rotation_matrices(
-        batch.coords.shape[0],
-        device=batch.coords.device,
-        dtype=batch.coords.dtype,
-    )
-    batch.coords = torch.einsum("bij,bnj->bni", rotations, batch.coords)
+    mode = str(mode).lower().replace("-", "_")
+    if mode == "batch":
+        rotation = random_rotation_matrices(1, device=batch.coords.device, dtype=batch.coords.dtype)[0]
+        batch.coords = torch.einsum("ij,bnj->bni", rotation, batch.coords)
+    elif mode == "per_sample":
+        rotations = random_rotation_matrices(
+            batch.coords.shape[0],
+            device=batch.coords.device,
+            dtype=batch.coords.dtype,
+        )
+        batch.coords = torch.einsum("bij,bnj->bni", rotations, batch.coords)
+    else:
+        raise ValueError("rotation augmentation mode must be one of {'per_sample', 'batch'}")
     batch.coords = batch.coords.masked_fill(batch.pad_mask[..., None], 0.0)
     return batch
 
@@ -391,6 +407,7 @@ def log_sampling_metrics(
 
 
 def main(args: argparse.Namespace) -> None:
+    configure_torch_runtime(args)
     seed_everything(args.seed)
     device = default_device()
     args.hybrid_config = load_hybrid_config(args.hybrid_config_json)
@@ -468,6 +485,7 @@ def main(args: argparse.Namespace) -> None:
         charge_feature_scale=args.charge_feature_scale,
         use_charges=args.use_charges,
         max_weight=args.max_loss_weight,
+        loss_reduction=args.edm_loss_reduction,
         p_mean=args.p_mean,
         p_std=args.p_std,
     )
@@ -523,9 +541,10 @@ def main(args: argparse.Namespace) -> None:
         f"legacy_concat_sigma_condition={args.concat_sigma_condition} "
         f"norm_affine_when_no_adaln={args.norm_affine_when_no_adaln} "
         f"use_final_norm={args.use_final_norm} "
-        f"max_loss_weight={args.max_loss_weight}"
+        f"max_loss_weight={args.max_loss_weight} "
+        f"loss_reduction={args.edm_loss_reduction}"
     )
-    print(f"precision: bf16={args.bf16}")
+    print(f"precision: bf16={args.bf16} float32_matmul_precision={args.float32_matmul_precision}")
     if args.hybrid_config is not None:
         print(f"hybrid_config: {args.hybrid_config}")
     print(
@@ -653,7 +672,11 @@ def main(args: argparse.Namespace) -> None:
             if global_step >= args.max_steps:
                 break
             batch = batch.to(device)
-            batch = apply_rotation_augmentation(batch, enabled=args.train_augm)
+            batch = apply_rotation_augmentation(
+                batch,
+                enabled=args.train_augm,
+                mode=args.rotation_augmentation_mode,
+            )
             epoch_float = (epoch - 1) + batch_idx / max(batches_per_epoch, 1)
             with make_autocast_context(device, args.bf16):
                 loss, diagnostics = criterion(net, batch)
@@ -1215,6 +1238,13 @@ if __name__ == "__main__":
         help="Use the current pair-vector coordinate head or a direct non-equivariant xyz head.",
     )
     parser.add_argument("--train-augm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--rotation-augmentation-mode",
+        type=str,
+        default="per_sample",
+        choices=["per_sample", "per-sample", "batch"],
+        help="Use independent per-sample rotations or one public-Platoformer-style rotation for the whole batch.",
+    )
     parser.add_argument("--sigma-data", type=float, default=1.0)
     parser.add_argument("--p-mean", type=float, default=-1.2)
     parser.add_argument("--p-std", type=float, default=1.2)
@@ -1244,6 +1274,13 @@ if __name__ == "__main__":
         help="Apply the transformer's final LayerNorm before prediction heads.",
     )
     parser.add_argument("--max-loss-weight", type=float, default=1000.0)
+    parser.add_argument(
+        "--edm-loss-reduction",
+        type=str,
+        default="sample_mean",
+        choices=["sample_mean", "sample-mean", "node_mean", "node-mean"],
+        help="sample_mean keeps Matterformer per-molecule averaging; node_mean matches the public Platoformer QM9 EDM loss.",
+    )
     parser.add_argument("--disable-geometry-bias", action="store_true")
     parser.add_argument("--sample-num-steps", type=int, default=100)
     parser.add_argument("--sample-sigma-min", type=float, default=0.002)
@@ -1257,6 +1294,13 @@ if __name__ == "__main__":
     parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--ema-use-for-sampling", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--float32-matmul-precision",
+        type=str,
+        default=None,
+        choices=["highest", "high", "medium"],
+        help="Optional torch.set_float32_matmul_precision setting; public Platoformer QM9 uses medium.",
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument(
         "--skip-loss-threshold",

@@ -1266,8 +1266,10 @@ class TetraPlatonicGlobalLayer(nn.Module):
             layer_norm_eps=eps,
             rope_sigma=float(config.get("rope_sigma", 0.5)),
             learned_freqs=bool(config.get("learned_freqs", True)),
+            freq_init=str(config.get("freq_init", "spiral")),
             use_key=bool(config.get("use_key", False)),
             rope_on_values=bool(config.get("rope_on_values", True)),
+            attention_backend=str(config.get("attention_backend", "sdpa")),
         )
 
     @staticmethod

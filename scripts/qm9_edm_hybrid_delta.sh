@@ -31,6 +31,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-1e-6}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 SEED="${SEED:-42}"
 TRAIN_AUGM="${TRAIN_AUGM:-1}"
+ROTATION_AUGMENTATION_MODE="${ROTATION_AUGMENTATION_MODE:-per_sample}"
 
 SIGMA_DATA="${SIGMA_DATA:-1.0}"
 P_MEAN="${P_MEAN:--1.2}"
@@ -38,6 +39,7 @@ P_STD="${P_STD:-1.2}"
 ATOM_FEATURE_SCALE="${ATOM_FEATURE_SCALE:-4.0}"
 CHARGE_FEATURE_SCALE="${CHARGE_FEATURE_SCALE:-8.0}"
 MAX_LOSS_WEIGHT="${MAX_LOSS_WEIGHT:-1000.0}"
+EDM_LOSS_REDUCTION="${EDM_LOSS_REDUCTION:-sample_mean}"
 NOISE_CONDITIONING="${NOISE_CONDITIONING:-concat}"
 COORD_HEAD_MODE="${COORD_HEAD_MODE:-equivariant}"
 USE_CHARGES="${USE_CHARGES:-1}"
@@ -66,6 +68,7 @@ PRECISE_METRICS_NUM_MOLECULES="${PRECISE_METRICS_NUM_MOLECULES:-10000}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
 EMA_USE_FOR_SAMPLING="${EMA_USE_FOR_SAMPLING:-1}"
 BF16="${BF16:-0}"
+FLOAT32_MATMUL_PRECISION="${FLOAT32_MATMUL_PRECISION:-}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0.5}"
 SKIP_LOSS_THRESHOLD="${SKIP_LOSS_THRESHOLD:-20.0}"
 SKIP_GRAD_NORM_THRESHOLD="${SKIP_GRAD_NORM_THRESHOLD:-5000.0}"
@@ -154,6 +157,7 @@ EXTRA_ARGS=()
 [ "$USE_FINAL_NORM" = "1" ] && EXTRA_ARGS+=(--use-final-norm) || EXTRA_ARGS+=(--no-use-final-norm)
 [ "$EMA_USE_FOR_SAMPLING" = "1" ] && EXTRA_ARGS+=(--ema-use-for-sampling) || EXTRA_ARGS+=(--no-ema-use-for-sampling)
 [ "$BF16" = "1" ] && EXTRA_ARGS+=(--bf16) || EXTRA_ARGS+=(--no-bf16)
+[ -n "$FLOAT32_MATMUL_PRECISION" ] && EXTRA_ARGS+=(--float32-matmul-precision "$FLOAT32_MATMUL_PRECISION")
 [ "$SAVE_CHECKPOINT" = "1" ] && EXTRA_ARGS+=(--save-checkpoint) || EXTRA_ARGS+=(--no-save-checkpoint)
 
 echo "============================================================"
@@ -178,6 +182,9 @@ echo "sample_num_steps:       $SAMPLE_NUM_STEPS"
 echo "sample_sigma_max:       $SAMPLE_SIGMA_MAX"
 echo "sample_s_churn:         $SAMPLE_S_CHURN"
 echo "bf16:                   $BF16"
+echo "float32_matmul_prec:    ${FLOAT32_MATMUL_PRECISION:-<torch-default>}"
+echo "rotation_aug_mode:      $ROTATION_AUGMENTATION_MODE"
+echo "edm_loss_reduction:     $EDM_LOSS_REDUCTION"
 echo "skip_loss_threshold:    $SKIP_LOSS_THRESHOLD"
 echo "skip_grad_norm_thresh:  $SKIP_GRAD_NORM_THRESHOLD"
 echo "output_dir:             $OUTPUT_DIR"
@@ -211,9 +218,11 @@ echo "============================================================"
   --atom-feature-scale "$ATOM_FEATURE_SCALE" \
   --charge-feature-scale "$CHARGE_FEATURE_SCALE" \
   --max-loss-weight "$MAX_LOSS_WEIGHT" \
+  --edm-loss-reduction "$EDM_LOSS_REDUCTION" \
   --noise-conditioning "$NOISE_CONDITIONING" \
   --coord-embed-mode none \
   --coord-head-mode "$COORD_HEAD_MODE" \
+  --rotation-augmentation-mode "$ROTATION_AUGMENTATION_MODE" \
   --sample-num-steps "$SAMPLE_NUM_STEPS" \
   --sample-sigma-min "$SAMPLE_SIGMA_MIN" \
   --sample-sigma-max "$SAMPLE_SIGMA_MAX" \

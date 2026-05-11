@@ -35,8 +35,10 @@ class PlatonicAttention(nn.Module):
         dropout: float = 0.0,
         rope_sigma: float = 0.5,
         learned_freqs: bool = True,
+        freq_init: str = "spiral",
         use_key: bool = False,
         rope_on_values: bool = True,
+        attention_backend: str = "sdpa",
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -58,6 +60,11 @@ class PlatonicAttention(nn.Module):
         self.dropout = float(dropout)
         self.use_key = bool(use_key)
         self.rope_on_values = bool(rope_on_values)
+        self.attention_backend = str(attention_backend).lower()
+        if self.attention_backend == "default":
+            self.attention_backend = "sdpa"
+        if self.attention_backend not in {"sdpa", "flash"}:
+            raise ValueError("attention_backend must be one of {'sdpa', 'flash'}")
         self.q_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name)
         self.v_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name)
         self.k_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name) if self.use_key else None
@@ -69,6 +76,7 @@ class PlatonicAttention(nn.Module):
             head_dim=self.head_dim,
             freq_sigma=rope_sigma,
             learned_freqs=learned_freqs,
+            freq_init=freq_init,
         )
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
@@ -94,8 +102,16 @@ class PlatonicAttention(nn.Module):
         v = v.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         attn_mask = None
         if pad_mask is not None:
-            attn_mask = torch.zeros_like(pad_mask, dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(pad_mask, torch.finfo(q.dtype).min)[:, None, None, :]
+            if self.attention_backend == "flash":
+                attn_mask = (~pad_mask)[:, None, None, :]
+            else:
+                attn_mask = torch.zeros_like(pad_mask, dtype=q.dtype)
+                attn_mask = attn_mask.masked_fill(pad_mask, torch.finfo(q.dtype).min)[:, None, None, :]
+        orig_dtype = q.dtype
+        if self.attention_backend == "flash":
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -103,6 +119,7 @@ class PlatonicAttention(nn.Module):
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
+        out = out.to(orig_dtype)
         out = out.transpose(1, 2).contiguous().view(
             batch_size,
             num_tokens,
@@ -128,8 +145,10 @@ class PlatonicBlock(nn.Module):
         layer_norm_eps: float = 1e-6,
         rope_sigma: float = 0.5,
         learned_freqs: bool = True,
+        freq_init: str = "spiral",
         use_key: bool = False,
         rope_on_values: bool = True,
+        attention_backend: str = "sdpa",
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -147,8 +166,10 @@ class PlatonicBlock(nn.Module):
             dropout=dropout,
             rope_sigma=rope_sigma,
             learned_freqs=learned_freqs,
+            freq_init=freq_init,
             use_key=use_key,
             rope_on_values=rope_on_values,
+            attention_backend=attention_backend,
         )
         self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
         self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name)

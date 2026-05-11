@@ -11,8 +11,10 @@
     "heads_per_frame": 6,
     "rope_sigma": 4.0,
     "learned_freqs": true,
+    "freq_init": "spiral",
     "use_key": false,
     "rope_on_values": true,
+    "attention_backend": "flash",
     "ffn_mult": 4
   },
   "input_lift": {

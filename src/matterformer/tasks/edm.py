@@ -92,6 +92,7 @@ class EDMLoss:
         charge_feature_scale: float = 8.0,
         use_charges: bool = True,
         max_weight: float | None = 1000.0,
+        loss_reduction: str = "sample_mean",
     ) -> None:
         self.p_mean = float(p_mean)
         self.p_std = float(p_std)
@@ -100,6 +101,9 @@ class EDMLoss:
         self.charge_feature_scale = float(charge_feature_scale)
         self.use_charges = bool(use_charges)
         self.max_weight = None if max_weight is None else float(max_weight)
+        self.loss_reduction = str(loss_reduction).lower().replace("-", "_")
+        if self.loss_reduction not in {"sample_mean", "node_mean"}:
+            raise ValueError("loss_reduction must be one of {'sample_mean', 'node_mean'}")
 
     def __call__(self, net: EDMPreconditioner, batch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         atom_clean = batch.atom_onehot().float() / self.atom_feature_scale
@@ -138,7 +142,16 @@ class EDMLoss:
         )
         atom_loss = _masked_sample_mse(atom_denoised, atom_clean, batch.pad_mask)
         coord_loss = _masked_sample_mse(coords_denoised, coords_clean, batch.pad_mask)
-        loss = (weight * atom_loss).mean() + (weight * coord_loss).mean()
+        if self.loss_reduction == "node_mean":
+            valid = (~batch.pad_mask).to(dtype=atom_clean.dtype)
+            atom_error = (atom_denoised - atom_clean).square() * valid[..., None]
+            coord_error = (coords_denoised - coords_clean).square() * valid[..., None]
+            atom_denom = (valid.sum() * atom_error.shape[-1]).clamp_min(1.0)
+            coord_denom = (valid.sum() * coord_error.shape[-1]).clamp_min(1.0)
+            loss = (weight[:, None, None] * atom_error).sum() / atom_denom
+            loss = loss + (weight[:, None, None] * coord_error).sum() / coord_denom
+        else:
+            loss = (weight * atom_loss).mean() + (weight * coord_loss).mean()
         log_sigma_over_4 = torch.log(sigma.clamp_min(1e-8)) / 4.0
         return loss, {
             "sigma": sigma,

@@ -21,6 +21,7 @@ class PlatonicRoPE(nn.Module):
         spatial_dims: int = 3,
         freq_sigma: float = 1.0,
         learned_freqs: bool = True,
+        freq_init: str = "spiral",
     ) -> None:
         super().__init__()
         if spatial_dims != 3:
@@ -38,7 +39,13 @@ class PlatonicRoPE(nn.Module):
             raise ValueError("embed_dim must be divisible by group order")
         self.num_pairs = self.head_dim // 2
         self.register_buffer("group_elements", group.elements, persistent=False)
-        freqs = self._spiral_frequencies(self.num_heads, self.num_pairs, float(freq_sigma))
+        freq_init = str(freq_init).lower()
+        if freq_init == "spiral":
+            freqs = self._spiral_frequencies(self.num_heads, self.num_pairs, float(freq_sigma))
+        elif freq_init == "random":
+            freqs = torch.randn(self.num_heads, self.num_pairs, spatial_dims, dtype=torch.float32) * float(freq_sigma)
+        else:
+            raise ValueError("freq_init must be one of {'spiral', 'random'}")
         if learned_freqs:
             self.freqs = nn.Parameter(freqs)
         else:
