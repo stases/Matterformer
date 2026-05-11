@@ -13,6 +13,7 @@
     "projection_mode": "group_linear",
     "bias": {
       "kind": "spherical_low_rank",
+      "representation": "compact",
       "angle_rank": 16,
       "channels_by_l": {"0": 2, "1": 3, "2": 1},
       "radial_basis_dim": 32,

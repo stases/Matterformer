@@ -387,9 +387,43 @@ class CompactSimplicialBias:
     angle_left: torch.Tensor | None = None
     angle_right: torch.Tensor | None = None
     angle_gate: torch.Tensor | None = None
+    angle_left_coeff: torch.Tensor | None = None
+    angle_right_coeff: torch.Tensor | None = None
+    angle_channels_by_l: tuple[int, int, int] | None = None
+    angle_rank: int | None = None
     message_left: torch.Tensor | None = None
     message_right: torch.Tensor | None = None
     message_basis: torch.Tensor | None = None
+
+
+def _expand_compact_angle_bias_if_needed(bias: CompactSimplicialBias, geom: GeometryCache) -> CompactSimplicialBias:
+    if bias.angle_left_coeff is None or bias.angle_right_coeff is None:
+        return bias
+    if bias.angle_channels_by_l is None:
+        raise RuntimeError("Compact spherical angle coefficients require angle_channels_by_l")
+    channels_by_l = {idx: int(count) for idx, count in enumerate(bias.angle_channels_by_l)}
+    basis = _spherical_basis_lmax2(geom.unit)
+    left = _expand_spherical_coefficients(
+        bias.angle_left_coeff.permute(0, 2, 3, 1, 4).contiguous(),
+        basis=basis,
+        channels_by_l=channels_by_l,
+    ).to(dtype=bias.angle_left_coeff.dtype)
+    right = _expand_spherical_coefficients(
+        bias.angle_right_coeff.permute(0, 2, 3, 1, 4).contiguous(),
+        basis=basis,
+        channels_by_l=channels_by_l,
+    ).to(dtype=bias.angle_right_coeff.dtype)
+    return CompactSimplicialBias(
+        u=bias.u,
+        v=bias.v,
+        gate=bias.gate,
+        angle_left=left,
+        angle_right=right,
+        angle_gate=bias.angle_gate,
+        message_left=bias.message_left,
+        message_right=bias.message_right,
+        message_basis=bias.message_basis,
+    )
 
 
 def compact_simplicial_attention_torch(
@@ -556,11 +590,15 @@ class CompactSimplicialGeometryBias(nn.Module):
         message_hidden_dim: int | None = None,
         message_gate_init: float | None = None,
         head_dim: int = 64,
+        representation: str = "expanded",
     ) -> None:
         super().__init__()
         self.num_heads = int(num_heads)
         self.rank = int(rank)
         self.rbf_dim = int(rbf_dim)
+        self.representation = str(representation).lower()
+        if self.representation not in {"expanded", "compact"}:
+            raise ValueError("spherical low-rank bias representation must be one of {'expanded', 'compact'}")
         self.use_radial_uv = bool(use_radial_uv)
         self.use_angle = bool(use_angle)
         self.message_enabled = bool(message_enabled)
@@ -624,7 +662,8 @@ class CompactSimplicialGeometryBias(nn.Module):
     def forward(self, geom: GeometryCache, *, dtype: torch.dtype) -> CompactSimplicialBias:
         edge_features = geom.rbf
         batch_size, num_atoms, num_neighbors, _ = edge_features.shape
-        basis = _spherical_basis_lmax2(geom.unit) if self.use_angle or self.message_enabled else None
+        needs_basis = (self.use_angle and self.representation == "expanded") or self.message_enabled
+        basis = _spherical_basis_lmax2(geom.unit) if needs_basis else None
         u = v = gate = None
         if self.use_radial_uv:
             assert self.u_mlp is not None and self.v_mlp is not None and self.gate is not None
@@ -633,10 +672,10 @@ class CompactSimplicialGeometryBias(nn.Module):
             u = u.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
             v = v.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
             gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
-        left = right = angle_gate = None
+        left = right = angle_gate = left_compact = right_compact = None
         edge_mask = geom.neighbor_mask[:, None, :, :, None]
         if self.use_angle:
-            assert self.left_mlp is not None and self.right_mlp is not None and self.angle_gate is not None and basis is not None
+            assert self.left_mlp is not None and self.right_mlp is not None and self.angle_gate is not None
             left_coeff = self.left_mlp(edge_features).view(
                 batch_size,
                 num_atoms,
@@ -651,10 +690,17 @@ class CompactSimplicialGeometryBias(nn.Module):
                 self.num_heads,
                 self.num_coefficients,
             )
-            left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-            right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-            left = left.masked_fill(~edge_mask, 0.0)
-            right = right.masked_fill(~edge_mask, 0.0)
+            if self.representation == "compact":
+                left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                left_compact = left_compact.masked_fill(~edge_mask, 0.0)
+                right_compact = right_compact.masked_fill(~edge_mask, 0.0)
+            else:
+                assert basis is not None
+                left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
+                right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
+                left = left.masked_fill(~edge_mask, 0.0)
+                right = right.masked_fill(~edge_mask, 0.0)
             angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         message_left = message_right = message_basis = None
         if self.message_enabled:
@@ -701,6 +747,16 @@ class CompactSimplicialGeometryBias(nn.Module):
             angle_left=left,
             angle_right=right,
             angle_gate=angle_gate,
+            angle_left_coeff=left_compact,
+            angle_right_coeff=right_compact,
+            angle_channels_by_l=(
+                int(self.channels_by_l.get(0, 0)),
+                int(self.channels_by_l.get(1, 0)),
+                int(self.channels_by_l.get(2, 0)),
+            )
+            if left_compact is not None
+            else None,
+            angle_rank=self.rank if left_compact is not None else None,
             message_left=message_left,
             message_right=message_right,
             message_basis=message_basis,
@@ -755,6 +811,7 @@ class CompactSimplicialAttention(nn.Module):
             rbf_dim=int(bias_config.get("radial_basis_dim", 32)),
             channels_by_l=bias_config.get("channels_by_l"),
             hidden_dim=int(bias_config.get("hidden_dim", 128)),
+            representation=str(bias_config.get("representation", "expanded")),
             use_radial_uv=bool(bias_config.get("use_radial_uv", bias_config.get("use_radial_bias", True))),
             use_angle=bool(bias_config.get("use_angle", bias_config.get("use_angle_bias", True))),
             gate_init=float(bias_config.get("gate_init", 0.0)),
@@ -796,6 +853,8 @@ class CompactSimplicialAttention(nn.Module):
         k2 = self._split(k2)
         v2 = self._split(v2)
         bias = self.bias(geom, dtype=x_atoms.dtype)
+        if bias.angle_left_coeff is not None:
+            bias = _expand_compact_angle_bias_if_needed(bias, geom)
         if self.backend in {"triton", "triton_knn"}:
             out = compact_simplicial_attention_triton(
                 q,
@@ -937,6 +996,7 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             rbf_dim=int(bias_config.get("radial_basis_dim", 32)),
             channels_by_l=bias_config.get("channels_by_l"),
             hidden_dim=int(bias_config.get("hidden_dim", 128)),
+            representation=str(bias_config.get("representation", "expanded")),
             use_radial_uv=bool(bias_config.get("use_radial_uv", bias_config.get("use_radial_bias", True))),
             use_angle=bool(bias_config.get("use_angle", bias_config.get("use_angle_bias", True))),
             gate_init=float(bias_config.get("gate_init", 0.0)),
@@ -1022,6 +1082,10 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             diagnostics["angle_left_std"] = _diag_std(bias.angle_left)
         if bias.angle_right is not None:
             diagnostics["angle_right_std"] = _diag_std(bias.angle_right)
+        if bias.angle_left_coeff is not None:
+            diagnostics["angle_left_coeff_std"] = _diag_std(bias.angle_left_coeff)
+        if bias.angle_right_coeff is not None:
+            diagnostics["angle_right_coeff_std"] = _diag_std(bias.angle_right_coeff)
         if bias.angle_gate is not None:
             diagnostics["angle_gate_mean"] = bias.angle_gate.detach().float().mean()
             diagnostics["angle_gate_abs_mean"] = bias.angle_gate.detach().float().abs().mean()
@@ -1073,6 +1137,11 @@ class GroupFramewiseSimplicialAttention(nn.Module):
                 gate=bias.gate,
                 angle_left=bias.angle_left,
                 angle_right=bias.angle_right,
+                unit=geom.unit,
+                angle_left_coeff=bias.angle_left_coeff,
+                angle_right_coeff=bias.angle_right_coeff,
+                angle_channels_by_l=bias.angle_channels_by_l,
+                angle_rank=bias.angle_rank,
                 angle_gate=bias.angle_gate,
                 message_left=bias.message_left,
                 message_right=bias.message_right,
@@ -1091,6 +1160,8 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
             geom_group = _repeat_geometry_cache_for_group(geom, group_order)
             bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            if bias.angle_left_coeff is not None:
+                bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
             out_flat = compact_simplicial_attention_triton(
                 q_flat,
                 k1_flat,
@@ -1116,6 +1187,8 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
             geom_group = _repeat_geometry_cache_for_group(geom, group_order)
             bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            if bias.angle_left_coeff is not None:
+                bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
             out_flat = compact_simplicial_attention_torch(
                 q_flat,
                 k1_flat,
