@@ -14,12 +14,12 @@ from matterformer.models.embeddings import (
     TokenEmbedder,
 )
 from matterformer.models.heads import CrystalHeads
+from matterformer.geometry.cache import GeometryCache
 from matterformer.models.geom_drugs import GeomDrugsEDMModel
 from matterformer.models.hybrid import (
     CompactSimplicialBias,
     CompactSimplicialAttention,
     CompactSimplicialGeometryBias,
-    GeometryCache,
     GroupFramewiseSimplicialAttention,
     GroupFramewiseSimplicialLayer,
     HybridBlock,

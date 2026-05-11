@@ -26,6 +26,10 @@
       "enabled": false,
       "rank": 16
     },
+    "geometry": {
+      "builder": "triton_nonperiodic",
+      "strict": true
+    },
     "kernel": {
       "backend": "triton_grouped",
       "precision": "tf32",

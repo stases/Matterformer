@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
+from matterformer.geometry.cache import GeometryCache
+from matterformer.geometry.triton_nonperiodic_knn import build_triton_nonperiodic_knn_geometry_cache
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.platonic.layers import GroupLayerNorm
 from matterformer.models.transformer import AdaLNBlock, GeometryBiasBuilder, _canonicalize_mha_position_mode
@@ -161,6 +163,7 @@ class HybridConfig:
             "bias": {"kind": "spherical_low_rank", "angle_rank": 32, "radial_basis_dim": 32},
             "message": {"enabled": False, "rank": 16},
             "kernel": {"backend": "triton_knn"},
+            "geometry": {"builder": "dense", "strict": False},
             "projection_mode": "group_linear",
             **dict(cfg.simplicial),
         }
@@ -185,20 +188,6 @@ class HybridConfig:
         cfg.readout = {"kind": "group_mean", **dict(cfg.readout)}
         cfg.d_model_total = cfg.d_model_total or (cfg.scalar_dim if cfg.stream_type == "scalar" else 12 * cfg.tetra_dim_per_frame)
         return cfg
-
-
-@dataclass
-class GeometryCache:
-    features: GeometryFeatures
-    coords_len: int
-    seq_len: int
-    neighbor_idx: torch.Tensor
-    neighbor_mask: torch.Tensor
-    rel: torch.Tensor
-    dist: torch.Tensor
-    unit: torch.Tensor
-    rbf: torch.Tensor
-    pair_mask: torch.Tensor
 
 
 @dataclass
@@ -1381,7 +1370,9 @@ class TrivialGlobalLayer(nn.Module):
         if state.scalar is None:
             return state
         attn_bias = None
-        if self.geometry_bias is not None and state.geom is not None:
+        if self.geometry_bias is not None:
+            if state.geom is None or state.geom.features is None:
+                raise RuntimeError("Dense geometry features are required for scalar geometry bias")
             attn_bias = self.geometry_bias.forward_from_features(
                 geom_features=state.geom.features,
                 coords_len=state.geom.coords_len,
@@ -1451,6 +1442,15 @@ class HybridTransformerTrunk(nn.Module):
         if self.readout_kind in {"platonic", "platonic_readout"}:
             self.readout_kind = "platonic_ffn"
         self.k_neighbors = int(self.config.simplicial.get("k_neighbors", 32))
+        simplicial_geometry_cfg = dict(self.config.simplicial.get("geometry", {}))
+        self.geometry_builder = str(simplicial_geometry_cfg.get("builder", "dense")).lower().replace("-", "_")
+        if self.geometry_builder in {"torch", "pytorch", "dense_pytorch"}:
+            self.geometry_builder = "dense"
+        if self.geometry_builder in {"triton", "triton_knn", "compact_triton", "triton_nonperiodic_knn"}:
+            self.geometry_builder = "triton_nonperiodic"
+        if self.geometry_builder not in {"dense", "triton_nonperiodic"}:
+            raise ValueError("simplicial.geometry.builder must be one of {'dense', 'triton_nonperiodic'}")
+        self.geometry_builder_strict = bool(simplicial_geometry_cfg.get("strict", False))
         bias_cfg = dict(self.config.simplicial.get("bias", {}))
         self.rbf_dim = int(bias_cfg.get("radial_basis_dim", 32))
         self.rbf_cutoff = bias_cfg.get("radial_cutoff")
@@ -1583,14 +1583,17 @@ class HybridTransformerTrunk(nn.Module):
                     )
             blocks.append(HybridBlock(sublayers))
         self.blocks = nn.ModuleList(blocks)
-        self.requires_geometry_cache = (
-            self.input_lift_kind == "local_moment_lift"
-            or any(
-                bool(getattr(layer, "requires_geometry_cache", False))
-                for block in self.blocks
-                for layer in block.sublayers
-            )
+        self.needs_compact_geometry = self.local_moment_enabled or any(
+            isinstance(layer, (SimplicialLocalLayer, GroupFramewiseSimplicialLayer))
+            for block in self.blocks
+            for layer in block.sublayers
         )
+        self.needs_dense_geometry = any(
+            isinstance(layer, TrivialGlobalLayer) and bool(getattr(layer, "requires_geometry_cache", False))
+            for block in self.blocks
+            for layer in block.sublayers
+        )
+        self.requires_geometry_cache = self.needs_compact_geometry or self.needs_dense_geometry
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
@@ -1654,6 +1657,25 @@ class HybridTransformerTrunk(nn.Module):
     ) -> GeometryCache | None:
         if self.geometry_adapter is None:
             return None
+        if (
+            self.geometry_builder == "triton_nonperiodic"
+            and self.geometry_adapter.geometry_kind == "nonperiodic"
+            and self.needs_compact_geometry
+            and not self.needs_dense_geometry
+            and lattice is None
+        ):
+            atom_pad_mask = pad_mask[:, : coords.shape[1]] if pad_mask is not None else None
+            return build_triton_nonperiodic_knn_geometry_cache(
+                coords,
+                pad_mask=atom_pad_mask,
+                k_neighbors=self.k_neighbors,
+                rbf_dim=self.rbf_dim,
+                cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
+                seq_len=seq_len,
+                strict=self.geometry_builder_strict,
+            )
+        if self.geometry_builder == "triton_nonperiodic" and self.geometry_builder_strict:
+            raise RuntimeError("triton_nonperiodic geometry can only be used for nonperiodic compact-only geometry")
         geom = self.compute_geometry_features(coords=coords, pad_mask=pad_mask, lattice=lattice)
         return build_geometry_cache(
             geom,
