@@ -27,7 +27,7 @@
       "channels_by_l": {"0": 5, "1": 4, "2": 3}
     },
     "kernel": {
-      "backend": "triton_knn",
+      "backend": "triton_grouped",
       "precision": "bf16_tc",
       "strict": true
     }

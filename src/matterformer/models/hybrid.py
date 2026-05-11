@@ -16,6 +16,10 @@ from matterformer.models.triton_compact_simplicial_attention import (
     TRITON_COMPACT_SIMPLICIAL_AVAILABLE,
     triton_compact_simplicial_attention,
 )
+from matterformer.models.triton_grouped_compact_simplicial_attention import (
+    TRITON_GROUPED_COMPACT_SIMPLICIAL_AVAILABLE,
+    triton_grouped_compact_simplicial_attention,
+)
 
 LayerType = Literal["simplicial", "tetra", "trivial"]
 
@@ -932,23 +936,62 @@ class GroupFramewiseSimplicialAttention(nn.Module):
         batch_size, num_atoms, group_order, _ = x_group_atoms.shape
         q, k1, v1, k2, v2 = self._project_in(x_group_atoms)
 
-        def fold(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.permute(0, 2, 1, 3).reshape(batch_size * group_order, num_atoms, self.inner_dim)
+        def split_group(tensor: torch.Tensor) -> torch.Tensor:
+            return (
+                tensor.reshape(batch_size, num_atoms, group_order, self.num_heads, self.head_dim)
+                .permute(0, 2, 3, 1, 4)
+                .contiguous()
+            )
 
-        q = self._split(fold(q)) * self.scale
-        k1 = self._split(fold(k1))
-        v1 = self._split(fold(v1))
-        k2 = self._split(fold(k2))
-        v2 = self._split(fold(v2))
-        geom_group = _repeat_geometry_cache_for_group(geom, group_order)
-        bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
-        if self.backend in {"triton", "triton_knn"}:
-            out = compact_simplicial_attention_triton(
-                q,
-                k1,
-                v1,
-                k2,
-                v2,
+        q_g = split_group(q) * self.scale
+        k1_g = split_group(k1)
+        v1_g = split_group(v1)
+        k2_g = split_group(k2)
+        v2_g = split_group(v2)
+
+        if self.backend in {"triton_grouped", "triton_sg"}:
+            # Geometry is invariant across tetra frames.  Compute it once per real
+            # batch item and let the grouped Triton kernel map each program id to
+            # (batch, group, head, atom), reusing the same neighbor/bias rows for
+            # all group frames.  This avoids the old [B * G, H, N, K, R] materialization.
+            bias = self.bias(geom, dtype=x_group_atoms.dtype)
+            out_g = triton_grouped_compact_simplicial_attention(
+                q_g,
+                k1_g,
+                v1_g,
+                k2_g,
+                v2_g,
+                neighbor_idx=geom.neighbor_idx,
+                neighbor_mask=geom.neighbor_mask,
+                u=bias.u,
+                v_bias=bias.v,
+                gate=bias.gate,
+                angle_left=bias.angle_left,
+                angle_right=bias.angle_right,
+                angle_gate=bias.angle_gate,
+                message_left=bias.message_left,
+                message_right=bias.message_right,
+                message_basis=bias.message_basis,
+                dropout_p=self.dropout,
+                training=self.training,
+                precision=self.precision,
+                debug_torch_backward=self.debug_torch_backward,
+                strict=self.strict_triton,
+            )
+        elif self.backend in {"triton", "triton_knn"}:
+            q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            geom_group = _repeat_geometry_cache_for_group(geom, group_order)
+            bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            out_flat = compact_simplicial_attention_triton(
+                q_flat,
+                k1_flat,
+                v1_flat,
+                k2_flat,
+                v2_flat,
                 neighbor_idx=geom_group.neighbor_idx,
                 neighbor_mask=geom_group.neighbor_mask,
                 bias=bias,
@@ -958,20 +1001,31 @@ class GroupFramewiseSimplicialAttention(nn.Module):
                 debug_torch_backward=self.debug_torch_backward,
                 strict=self.strict_triton,
             )
+            out_g = out_flat.view(batch_size, group_order, self.num_heads, num_atoms, self.head_dim)
         else:
-            out = compact_simplicial_attention_torch(
-                q,
-                k1,
-                v1,
-                k2,
-                v2,
+            # Reference path keeps the pre-existing fold-B*G behavior.
+            q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+            geom_group = _repeat_geometry_cache_for_group(geom, group_order)
+            bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            out_flat = compact_simplicial_attention_torch(
+                q_flat,
+                k1_flat,
+                v1_flat,
+                k2_flat,
+                v2_flat,
                 neighbor_idx=geom_group.neighbor_idx,
                 neighbor_mask=geom_group.neighbor_mask,
                 bias=bias,
                 dropout_p=self.dropout,
                 training=self.training,
             )
-        out = self._merge(out).view(batch_size, group_order, num_atoms, self.inner_dim).permute(0, 2, 1, 3).contiguous()
+            out_g = out_flat.view(batch_size, group_order, self.num_heads, num_atoms, self.head_dim)
+
+        out = out_g.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, num_atoms, group_order, self.inner_dim)
         return self._project_out(out)
 
 

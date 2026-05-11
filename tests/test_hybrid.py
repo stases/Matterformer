@@ -21,6 +21,11 @@ from matterformer.models import (
 )
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.triton_compact_simplicial_attention import TRITON_COMPACT_SIMPLICIAL_AVAILABLE
+from matterformer.models.triton_grouped_compact_simplicial_attention import (
+    TRITON_GROUPED_COMPACT_SIMPLICIAL_AVAILABLE,
+    grouped_compact_simplicial_attention_torch_reference,
+    triton_grouped_compact_simplicial_attention,
+)
 
 
 @pytest.mark.parametrize(
@@ -287,6 +292,148 @@ def _bias_grad_tensors(bias: CompactSimplicialBias) -> list[torch.Tensor]:
         bias.message_basis,
     ]
     return [tensor for tensor in tensors if tensor is not None]
+
+
+def _repeat_group_for_test(tensor: torch.Tensor, group_order: int) -> torch.Tensor:
+    return tensor[:, None].expand(-1, group_order, *tensor.shape[1:]).reshape(
+        tensor.shape[0] * group_order, *tensor.shape[1:]
+    )
+
+
+def test_grouped_compact_simplicial_reference_matches_folded_reference():
+    torch.manual_seed(7)
+    batch_size, group_order, num_heads, num_tokens, k_neighbors, head_dim, rank = 2, 3, 2, 5, 3, 4, 8
+    kwargs = {"requires_grad": True}
+    q = torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs)
+    k1 = torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs)
+    v1 = torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs)
+    k2 = torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs)
+    v2 = torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs)
+    base_idx = torch.arange(num_tokens)[:, None]
+    offsets = torch.arange(k_neighbors)[None, :]
+    neighbor_idx = ((base_idx + offsets) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = torch.ones(batch_size, num_tokens, k_neighbors, dtype=torch.bool)
+    u = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs)
+    v_bias = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs)
+    gate = torch.randn(batch_size, num_heads, num_tokens, **kwargs)
+    angle_left = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs)
+    angle_right = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs)
+    angle_gate = torch.randn(batch_size, num_heads, num_tokens, **kwargs)
+    message_left = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs)
+    message_right = torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs)
+    message_basis = torch.randn(num_heads, rank, head_dim, **kwargs)
+
+    grouped = grouped_compact_simplicial_attention_torch_reference(
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        u=u,
+        v_bias=v_bias,
+        gate=gate,
+        angle_left=angle_left,
+        angle_right=angle_right,
+        angle_gate=angle_gate,
+        message_left=message_left,
+        message_right=message_right,
+        message_basis=message_basis,
+    )
+    folded = compact_simplicial_attention_torch(
+        q.reshape(batch_size * group_order, num_heads, num_tokens, head_dim),
+        k1.reshape(batch_size * group_order, num_heads, num_tokens, head_dim),
+        v1.reshape(batch_size * group_order, num_heads, num_tokens, head_dim),
+        k2.reshape(batch_size * group_order, num_heads, num_tokens, head_dim),
+        v2.reshape(batch_size * group_order, num_heads, num_tokens, head_dim),
+        neighbor_idx=_repeat_group_for_test(neighbor_idx, group_order),
+        neighbor_mask=_repeat_group_for_test(neighbor_mask, group_order),
+        bias=CompactSimplicialBias(
+            u=_repeat_group_for_test(u, group_order),
+            v=_repeat_group_for_test(v_bias, group_order),
+            gate=_repeat_group_for_test(gate, group_order),
+            angle_left=_repeat_group_for_test(angle_left, group_order),
+            angle_right=_repeat_group_for_test(angle_right, group_order),
+            angle_gate=_repeat_group_for_test(angle_gate, group_order),
+            message_left=_repeat_group_for_test(message_left, group_order),
+            message_right=_repeat_group_for_test(message_right, group_order),
+            message_basis=message_basis,
+        ),
+    ).view(batch_size, group_order, num_heads, num_tokens, head_dim)
+    assert torch.allclose(grouped, folded, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and TRITON_GROUPED_COMPACT_SIMPLICIAL_AVAILABLE),
+    reason="grouped compact Triton simplicial parity requires CUDA and Triton",
+)
+def test_grouped_compact_simplicial_triton_cuda_forward_backward_matches_reference():
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    batch_size, group_order, num_heads, num_tokens, k_neighbors, head_dim, rank = 2, 3, 2, 7, 4, 16, 16
+    kwargs = {"device": device, "dtype": torch.float32, "requires_grad": True}
+    tensors = [torch.randn(batch_size, group_order, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+    base_idx = torch.arange(num_tokens, device=device)[:, None]
+    offsets = torch.arange(k_neighbors, device=device)[None, :]
+    neighbor_idx = ((base_idx + offsets) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.1).contiguous()
+    neighbor_mask[..., 0] = True
+    bias_tensors = [
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        torch.randn(num_heads, rank, head_dim, **kwargs),
+    ]
+    ref_tensors = [_clone_leaf(t) for t in tensors]
+    tri_tensors = [_clone_leaf(t) for t in tensors]
+    ref_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    tri_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+
+    ref = grouped_compact_simplicial_attention_torch_reference(
+        *ref_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        u=ref_bias_tensors[0],
+        v_bias=ref_bias_tensors[1],
+        gate=ref_bias_tensors[2],
+        angle_left=ref_bias_tensors[3],
+        angle_right=ref_bias_tensors[4],
+        angle_gate=ref_bias_tensors[5],
+        message_left=ref_bias_tensors[6],
+        message_right=ref_bias_tensors[7],
+        message_basis=ref_bias_tensors[8],
+    )
+    actual = triton_grouped_compact_simplicial_attention(
+        *tri_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        u=tri_bias_tensors[0],
+        v_bias=tri_bias_tensors[1],
+        gate=tri_bias_tensors[2],
+        angle_left=tri_bias_tensors[3],
+        angle_right=tri_bias_tensors[4],
+        angle_gate=tri_bias_tensors[5],
+        message_left=tri_bias_tensors[6],
+        message_right=tri_bias_tensors[7],
+        message_basis=tri_bias_tensors[8],
+        precision="ieee_fp32",
+        strict=True,
+    )
+    assert torch.allclose(actual, ref, atol=5e-4, rtol=5e-4)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    actual.backward(grad)
+    for actual_tensor, ref_tensor in zip(tri_tensors + tri_bias_tensors, ref_tensors + ref_bias_tensors):
+        assert actual_tensor.grad is not None
+        assert ref_tensor.grad is not None
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(
