@@ -7,7 +7,7 @@ from matterformer.data.qm9 import QM9_ATOM_PAD_TOKEN, QM9_NUM_ATOM_TYPES
 from matterformer.geometry.adapters import BaseGeometryAdapter, NonPeriodicGeometryAdapter
 from matterformer.models.embeddings import FourierCoordEmbedder, TimeEmbedder
 from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk, HybridTrunkOutput
-from matterformer.models.platonic import PLATONIC_GROUPS
+from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicLinear
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     LearnedNullConditioning,
@@ -356,6 +356,33 @@ class QM9EDMModel(nn.Module):
         if coord_head_mode == "group_vector":
             if effective_hybrid_config is None or effective_hybrid_config.stream_type != "tetra":
                 raise ValueError("coord_head_mode='group_vector' requires attn_type='hybrid' with stream_type='tetra'")
+        readout_kind = (
+            str(effective_hybrid_config.readout.get("kind", "group_mean")).lower().replace("-", "_")
+            if effective_hybrid_config is not None
+            else "group_mean"
+        )
+        if readout_kind in {"platonic", "platonic_readout"}:
+            readout_kind = "platonic_ffn"
+        input_lift_kind = (
+            str(effective_hybrid_config.input_lift.get("kind", "scalar_copy")).lower().replace("-", "_")
+            if effective_hybrid_config is not None
+            else "scalar_copy"
+        )
+        if input_lift_kind in {"platonic", "platonic_scalar", "platonic_copy"}:
+            input_lift_kind = "platonic_linear"
+        self.use_platonic_qm9_readout = (
+            attn_type == "hybrid"
+            and effective_hybrid_config is not None
+            and effective_hybrid_config.stream_type == "tetra"
+            and readout_kind == "platonic_ffn"
+        )
+        if self.use_platonic_qm9_readout:
+            if input_lift_kind != "platonic_linear":
+                raise ValueError("readout.kind='platonic_ffn' requires input_lift.kind='platonic_linear'")
+            if coord_head_mode != "group_vector":
+                raise ValueError("readout.kind='platonic_ffn' for QM9 EDM requires coord_head_mode='group_vector'")
+            if coord_embed_mode != "none":
+                raise ValueError("readout.kind='platonic_ffn' matches Platoformer and does not support coord_embed_mode")
         geometry_bias = None
         simplicial_geometry_bias = None
         effective_message_mode = (
@@ -419,7 +446,7 @@ class QM9EDMModel(nn.Module):
         self.use_adaln_conditioning = "adaln" in self.noise_conditioning
         self.charge_feature_scale = float(charge_feature_scale)
         atom_input_channels = self.atom_channels + (1 if self.concat_sigma_condition else 0)
-        self.atom_proj = nn.Linear(atom_input_channels, d_model)
+        self.atom_proj = nn.Identity() if self.use_platonic_qm9_readout else nn.Linear(atom_input_channels, d_model)
         self.coord_embedding = (
             FourierCoordEmbedder(
                 d_model=d_model,
@@ -437,6 +464,7 @@ class QM9EDMModel(nn.Module):
                 d_model=d_model,
                 n_heads=n_heads,
                 n_layers=n_layers,
+                input_dim=atom_input_channels if self.use_platonic_qm9_readout else d_model,
                 hybrid_config=effective_hybrid_config,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
@@ -472,11 +500,15 @@ class QM9EDMModel(nn.Module):
                 norm_affine_when_no_adaln=norm_affine_when_no_adaln,
                 use_final_norm=use_final_norm,
             )
-        self.atom_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, atom_channels),
+        self.atom_head = (
+            nn.Identity()
+            if self.use_platonic_qm9_readout
+            else nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, atom_channels),
+            )
         )
         if self.coord_head_mode == "equivariant":
             self.pair_head = nn.Sequential(
@@ -498,16 +530,34 @@ class QM9EDMModel(nn.Module):
         else:
             assert effective_hybrid_config is not None
             group = PLATONIC_GROUPS[str(effective_hybrid_config.tetra.get("group", "tetrahedron")).lower()]
-            self.group_vector_head = nn.Sequential(
-                nn.LayerNorm(int(effective_hybrid_config.tetra_dim_per_frame)),
-                nn.Linear(int(effective_hybrid_config.tetra_dim_per_frame), d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, 3),
-            )
-            nn.init.zeros_(self.group_vector_head[-1].weight)
-            nn.init.zeros_(self.group_vector_head[-1].bias)
-            self.group_vector_scale = nn.Parameter(torch.tensor(1.0))
-            self.register_buffer("_group_vector_rotations", group.elements, persistent=False)
+            if self.use_platonic_qm9_readout:
+                readout_ffn = bool(effective_hybrid_config.readout.get("ffn", True))
+                if readout_ffn:
+                    self.platonic_scalar_readout = nn.Sequential(
+                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        nn.GELU(),
+                        PlatonicLinear(d_model, group.G * atom_channels, solid=group.name),
+                    )
+                    self.platonic_vector_readout = nn.Sequential(
+                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        nn.GELU(),
+                        PlatonicLinear(d_model, group.G * 3, solid=group.name),
+                    )
+                else:
+                    self.platonic_scalar_readout = PlatonicLinear(d_model, group.G * atom_channels, solid=group.name)
+                    self.platonic_vector_readout = PlatonicLinear(d_model, group.G * 3, solid=group.name)
+                self.register_buffer("_platonic_readout_rotations", group.elements, persistent=False)
+            else:
+                self.group_vector_head = nn.Sequential(
+                    nn.LayerNorm(int(effective_hybrid_config.tetra_dim_per_frame)),
+                    nn.Linear(int(effective_hybrid_config.tetra_dim_per_frame), d_model),
+                    nn.SiLU(),
+                    nn.Linear(d_model, 3),
+                )
+                nn.init.zeros_(self.group_vector_head[-1].weight)
+                nn.init.zeros_(self.group_vector_head[-1].bias)
+                self.group_vector_scale = nn.Parameter(torch.tensor(1.0))
+                self.register_buffer("_group_vector_rotations", group.elements, persistent=False)
 
         self.register_buffer(
             "_pair_rbf_centers",
@@ -579,6 +629,19 @@ class QM9EDMModel(nn.Module):
         coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
         return coord_delta.masked_fill(pad_mask[..., None], 0.0)
 
+    def _platonic_qm9_readout(self, group_out: torch.Tensor, pad_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_atoms, group_order, channels = group_out.shape
+        hidden = group_out.reshape(batch_size, num_atoms, group_order * channels)
+        scalar_raw = self.platonic_scalar_readout(hidden).view(batch_size, num_atoms, group_order, self.atom_channels)
+        atom_delta = scalar_raw.mean(dim=2).masked_fill(pad_mask[..., None], 0.0)
+
+        local_vectors = self.platonic_vector_readout(hidden).view(batch_size, num_atoms, group_order, 3)
+        rotations = self._platonic_readout_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+        coord_delta = torch.einsum("gij,bngj->bni", rotations, local_vectors) / float(group_order)
+        coord_delta = coord_delta.masked_fill(pad_mask[..., None], 0.0)
+        coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
+        return atom_delta, coord_delta.masked_fill(pad_mask[..., None], 0.0)
+
     def forward(
         self,
         atom_noisy: torch.Tensor,
@@ -615,7 +678,7 @@ class QM9EDMModel(nn.Module):
             if self.conditioning is not None
             else None
         )
-        if self.attn_type == "hybrid" and self.coord_head_mode == "group_vector":
+        if self.attn_type == "hybrid" and (self.coord_head_mode == "group_vector" or self.use_platonic_qm9_readout):
             trunk_result = self.trunk(
                 token_features,
                 cond_emb,
@@ -638,6 +701,10 @@ class QM9EDMModel(nn.Module):
                 sigma=sigma,
             )
             trunk_group = None
+        if self.use_platonic_qm9_readout:
+            if trunk_group is None:
+                raise RuntimeError("Platonic QM9 readout requires tetra group trunk output")
+            return self._platonic_qm9_readout(trunk_group[:, : coords_noisy.shape[1]], pad_mask)
         atom_delta = self.atom_head(trunk_out)
         atom_delta = atom_delta.masked_fill(pad_mask[..., None], 0.0)
 

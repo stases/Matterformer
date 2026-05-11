@@ -233,6 +233,36 @@ def test_qm9_edm_direct_coord_head_smoke():
     loss.backward()
 
 
+def test_qm9_edm_tetra_platonic_readout_smoke():
+    torch.manual_seed(0)
+    batch = _dummy_batch()
+    model = QM9EDMModel(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        attn_type="hybrid",
+        noise_conditioning="concat",
+        coord_head_mode="group_vector",
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [0, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "input_lift": {"kind": "platonic_linear"},
+            "readout": {"kind": "platonic_ffn", "ffn": True},
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 4.0},
+        },
+    )
+    assert model.use_platonic_qm9_readout
+    assert isinstance(model.atom_proj, torch.nn.Identity)
+    net = EDMPreconditioner(model, sigma_data=1.0)
+    criterion = EDMLoss(sigma_data=1.0)
+    loss, diagnostics = criterion(net, batch)
+    assert loss.ndim == 0
+    assert diagnostics["sigma"].shape == (2,)
+    loss.backward()
+
+
 def test_qm9_edm_factorized_message_low_rank_loss_smoke():
     torch.manual_seed(0)
     batch = _dummy_batch()

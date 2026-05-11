@@ -43,9 +43,10 @@
     "ffn_mult": 4
   },
   "input_lift": {
-    "kind": "scalar_copy"
+    "kind": "platonic_linear"
   },
   "readout": {
-    "kind": "group_mean"
+    "kind": "platonic_ffn",
+    "ffn": true
   }
 }

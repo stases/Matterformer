@@ -1270,6 +1270,7 @@ class HybridTransformerTrunk(nn.Module):
         n_heads: int,
         n_layers: int,
         *,
+        input_dim: int | None = None,
         hybrid_config: dict[str, Any] | HybridConfig | None = None,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -1284,10 +1285,18 @@ class HybridTransformerTrunk(nn.Module):
         self.config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.geometry_adapter = geometry_adapter
         self.use_final_norm = bool(use_final_norm)
+        self.d_model = int(d_model)
+        self.input_dim = int(input_dim or d_model)
         self.stream_type: Literal["scalar", "tetra"] = self.config.stream_type  # type: ignore[assignment]
         self.group_order = int(self.config.tetra.get("group_order", 12))
         self.group_dim_per_frame = int(self.config.tetra_dim_per_frame or 0)
         self.tetra_solid = str(self.config.tetra.get("group", "tetrahedron")).lower()
+        self.input_lift_kind = str(self.config.input_lift.get("kind", "scalar_copy")).lower().replace("-", "_")
+        if self.input_lift_kind in {"platonic", "platonic_scalar", "platonic_copy"}:
+            self.input_lift_kind = "platonic_linear"
+        self.readout_kind = str(self.config.readout.get("kind", "group_mean")).lower().replace("-", "_")
+        if self.readout_kind in {"platonic", "platonic_readout"}:
+            self.readout_kind = "platonic_ffn"
         schedule = expand_hybrid_schedule(
             self.config.num_blocks,
             self.config.block_mix,
@@ -1295,11 +1304,28 @@ class HybridTransformerTrunk(nn.Module):
             self.config.explicit_orders,
         )
         validate_hybrid_schedule(schedule, self.stream_type)
-        input_lift_kind = str(self.config.input_lift.get("kind", "scalar_copy")).lower()
-        if self.stream_type == "tetra" and input_lift_kind != "scalar_copy":
-            raise NotImplementedError("Only tetra input_lift kind 'scalar_copy' is implemented")
-        self.group_input_proj = nn.Linear(d_model, self.group_dim_per_frame) if self.stream_type == "tetra" else None
-        self.group_readout_proj = nn.Linear(self.group_dim_per_frame, d_model) if self.stream_type == "tetra" else None
+        if self.stream_type == "tetra" and self.input_lift_kind not in {"scalar_copy", "platonic_linear"}:
+            raise NotImplementedError(
+                "Only tetra input_lift kinds 'scalar_copy' and 'platonic_linear' are implemented"
+            )
+        if self.stream_type == "tetra" and self.readout_kind not in {"group_mean", "platonic_ffn"}:
+            raise NotImplementedError("Only tetra readout kinds 'group_mean' and 'platonic_ffn' are implemented")
+        if self.stream_type == "tetra" and self.input_lift_kind == "platonic_linear":
+            self.group_input_proj = PlatonicLinear(
+                self.group_order * self.input_dim,
+                self.group_order * self.group_dim_per_frame,
+                solid=self.tetra_solid,
+                bias=False,
+            )
+        else:
+            self.group_input_proj = (
+                nn.Linear(self.input_dim, self.group_dim_per_frame) if self.stream_type == "tetra" else None
+            )
+        self.group_readout_proj = (
+            nn.Linear(self.group_dim_per_frame, d_model)
+            if self.stream_type == "tetra" and self.readout_kind == "group_mean"
+            else None
+        )
         self.k_neighbors = int(self.config.simplicial.get("k_neighbors", 32))
         bias_cfg = dict(self.config.simplicial.get("bias", {}))
         self.rbf_dim = int(bias_cfg.get("radial_basis_dim", 32))
@@ -1387,6 +1413,23 @@ class HybridTransformerTrunk(nn.Module):
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
+    def _lift_tetra_input(self, x: torch.Tensor, pad_mask: torch.Tensor | None) -> torch.Tensor:
+        if self.group_input_proj is None:
+            raise RuntimeError("group_input_proj is not configured for tetra stream")
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected tetra trunk input dim {self.input_dim}, got {x.shape[-1]}")
+        if self.input_lift_kind == "platonic_linear":
+            lifted = x.unsqueeze(2).expand(-1, -1, self.group_order, -1).reshape(
+                *x.shape[:-1],
+                self.group_order * self.input_dim,
+            )
+            group = self.group_input_proj(lifted).view(*x.shape[:-1], self.group_order, self.group_dim_per_frame)
+        else:
+            group = self.group_input_proj(x).unsqueeze(2).expand(-1, -1, self.group_order, -1).contiguous()
+        if pad_mask is not None:
+            group = group.masked_fill(pad_mask[..., None, None], 0.0)
+        return group
+
     def compute_geometry_features(
         self,
         coords: torch.Tensor,
@@ -1440,11 +1483,7 @@ class HybridTransformerTrunk(nn.Module):
         scalar = x if self.stream_type == "scalar" else None
         group = None
         if self.stream_type == "tetra":
-            if self.group_input_proj is None:
-                raise RuntimeError("group_input_proj is not configured for tetra stream")
-            group = self.group_input_proj(x).unsqueeze(2).expand(-1, -1, self.group_order, -1).contiguous()
-            if pad_mask is not None:
-                group = group.masked_fill(pad_mask[..., None, None], 0.0)
+            group = self._lift_tetra_input(x, pad_mask)
         state = ModelState(
             pos=coords if coords is not None else x.new_zeros(x.shape[0], x.shape[1], 3),
             mask=pad_mask,
@@ -1461,8 +1500,18 @@ class HybridTransformerTrunk(nn.Module):
                 raise RuntimeError("Scalar hybrid trunk lost scalar state")
             scalar_out = state.scalar
         else:
-            if state.group is None or self.group_readout_proj is None:
+            if state.group is None:
                 raise RuntimeError("Tetra hybrid trunk lost group state")
+            if self.readout_kind == "platonic_ffn":
+                scalar_out = state.group.reshape(state.group.shape[0], state.group.shape[1], self.d_model)
+                out = scalar_out
+                if pad_mask is not None:
+                    out = out.masked_fill(pad_mask[..., None], 0.0)
+                if return_output:
+                    return HybridTrunkOutput(scalar=out, group=state.group, stream_type=self.stream_type)
+                return out
+            if self.group_readout_proj is None:
+                raise RuntimeError("group_readout_proj is not configured for group_mean tetra readout")
             scalar_out = self.group_readout_proj(state.group.mean(dim=2))
         out = self.norm_out(scalar_out)
         if pad_mask is not None:

@@ -205,6 +205,35 @@ def test_hybrid_stream_schedule_validation():
         )
 
 
+def test_tetra_platonic_linear_input_and_ffn_readout_path_shape():
+    torch.manual_seed(0)
+    trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        input_dim=7,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [0, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "input_lift": {"kind": "platonic_linear"},
+            "readout": {"kind": "platonic_ffn"},
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 4.0},
+        },
+        geometry_adapter=NonPeriodicGeometryAdapter(),
+    )
+    x = torch.randn(2, 4, 7)
+    coords = torch.randn(2, 4, 3)
+    mask = torch.tensor([[False, False, False, True], [False, False, False, False]])
+    out = trunk(x, None, pad_mask=mask, coords=coords, return_output=True)
+    assert out.stream_type == "tetra"
+    assert out.group is not None
+    assert out.group.shape == (2, 4, 12, 2)
+    assert out.scalar.shape == (2, 4, 24)
+    assert torch.all(out.group[mask] == 0)
+
+
 def _make_neighbor_idx(num_tokens: int, k_neighbors: int) -> torch.Tensor:
     idx = torch.arange(k_neighbors) % num_tokens
     return idx.view(1, 1, k_neighbors).expand(1, num_tokens, k_neighbors).clone()
