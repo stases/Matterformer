@@ -840,6 +840,8 @@ class CompactSimplicialAttention(nn.Module):
 
 
 class SimplicialLocalLayer(nn.Module):
+    requires_geometry_cache = True
+
     def __init__(self, d_model: int, config: dict[str, Any], *, dropout: float = 0.0, mlp_ratio: float = 4.0) -> None:
         super().__init__()
         self.target = str(config.get("target", "scalar")).lower()
@@ -1153,6 +1155,8 @@ class GroupFramewiseSimplicialAttention(nn.Module):
 
 
 class GroupFramewiseSimplicialLayer(nn.Module):
+    requires_geometry_cache = True
+
     def __init__(
         self,
         *,
@@ -1239,6 +1243,8 @@ class GroupFramewiseSimplicialLayer(nn.Module):
 
 
 class TetraPlatonicGlobalLayer(nn.Module):
+    requires_geometry_cache = False
+
     def __init__(
         self,
         *,
@@ -1357,6 +1363,7 @@ class TrivialGlobalLayer(nn.Module):
             if geometry_adapter is not None and position_encoding != "none"
             else None
         )
+        self.requires_geometry_cache = self.geometry_bias is not None
 
     @staticmethod
     def _positions(pos: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -1576,6 +1583,14 @@ class HybridTransformerTrunk(nn.Module):
                     )
             blocks.append(HybridBlock(sublayers))
         self.blocks = nn.ModuleList(blocks)
+        self.requires_geometry_cache = (
+            self.input_lift_kind == "local_moment_lift"
+            or any(
+                bool(getattr(layer, "requires_geometry_cache", False))
+                for block in self.blocks
+                for layer in block.sublayers
+            )
+        )
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
@@ -1689,7 +1704,11 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"pad_mask shape {tuple(pad_mask.shape)} does not match x {tuple(x.shape)}")
         if self.geometry_adapter is not None and coords is None:
             raise ValueError("coords must be provided when geometry_adapter is configured")
-        geom = self._build_geom_cache(coords=coords, pad_mask=pad_mask, lattice=lattice, seq_len=x.shape[1]) if coords is not None else None
+        geom = (
+            self._build_geom_cache(coords=coords, pad_mask=pad_mask, lattice=lattice, seq_len=x.shape[1])
+            if coords is not None and self.requires_geometry_cache
+            else None
+        )
         scalar = x if self.stream_type == "scalar" else None
         group = None
         if self.stream_type == "tetra":

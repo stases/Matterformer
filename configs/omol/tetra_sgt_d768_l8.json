@@ -1,0 +1,45 @@
+{
+  "num_blocks": 8,
+  "stream_type": "tetra",
+  "block_mix": [1, 1, 0],
+  "order_policy": "local_then_global",
+  "scalar_dim": 768,
+  "tetra_dim_per_frame": 64,
+  "simplicial": {
+    "target": "group",
+    "k_neighbors": 32,
+    "num_heads": 8,
+    "head_dim": null,
+    "projection_mode": "group_linear",
+    "bias": {
+      "kind": "spherical_low_rank",
+      "angle_rank": 32,
+      "channels_by_l": {"0": 5, "1": 4, "2": 3},
+      "radial_basis_dim": 32,
+      "radial_cutoff": 6.0
+    },
+    "message": {
+      "enabled": false,
+      "rank": 16
+    },
+    "kernel": {
+      "backend": "triton_knn"
+    }
+  },
+  "tetra": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "heads_per_frame": 1,
+    "rope_sigma": 4.0,
+    "learned_freqs": true,
+    "use_key": false,
+    "rope_on_values": true,
+    "ffn_mult": 4
+  },
+  "input_lift": {
+    "kind": "scalar_copy"
+  },
+  "readout": {
+    "kind": "platonic_ffn"
+  }
+}

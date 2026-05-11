@@ -1,0 +1,38 @@
+{
+  "num_blocks": 8,
+  "stream_type": "scalar",
+  "block_mix": [1, 0, 1],
+  "order_policy": "local_then_global",
+  "scalar_dim": 768,
+  "simplicial": {
+    "target": "scalar",
+    "k_neighbors": 32,
+    "num_heads": 12,
+    "head_dim": null,
+    "bias": {
+      "kind": "spherical_low_rank",
+      "angle_rank": 32,
+      "channels_by_l": {"0": 5, "1": 4, "2": 3},
+      "radial_basis_dim": 32,
+      "radial_cutoff": 6.0
+    },
+    "message": {
+      "enabled": false,
+      "rank": 16
+    },
+    "kernel": {
+      "backend": "triton_knn"
+    }
+  },
+  "trivial": {
+    "target": "scalar",
+    "attention": {
+      "kind": "mha",
+      "num_heads": 12,
+      "position_encoding": "distance_bias"
+    },
+    "ffn": {
+      "ffn_mult": 4
+    }
+  }
+}

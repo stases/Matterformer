@@ -35,6 +35,7 @@ from matterformer.models.hybrid import (
     expand_hybrid_schedule,
 )
 from matterformer.models.mof_stage1 import MOFStage1EDMModel
+from matterformer.models.omol import MatterformerOMolForceField
 from matterformer.models.qm9 import QM9EDMModel, QM9RegressionModel
 from matterformer.models.regular_attention import (
     RegularAttention,
@@ -70,6 +71,7 @@ __all__ = [
     "LatticeEmbedder",
     "MaskEmbedder",
     "MhaFactorizedGeometryBias",
+    "MatterformerOMolForceField",
     "QM9EDMModel",
     "QM9RegressionModel",
     "RegularAttention",

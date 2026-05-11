@@ -26,6 +26,10 @@ dependencies = [
 chem = [
   "rdkit>=2023.9.5",
 ]
+omol = [
+  "fairchem-core",
+  "ase>=3.26.0",
+]
 dev = [
   "pytest>=8.0",
 ]

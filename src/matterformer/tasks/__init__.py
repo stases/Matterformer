@@ -22,6 +22,12 @@ from matterformer.tasks.mof_stage1_edm import (
     wrap_frac,
     y1_to_lattice_params,
 )
+from matterformer.tasks.omol_forcefield import (
+    OMolDirectForceLoss,
+    OMolElementReferences,
+    OMolLossOutput,
+    load_omol_element_references,
+)
 
 __all__ = [
     "EDMLoss",
@@ -29,6 +35,9 @@ __all__ = [
     "GeomDrugsEDMLoss",
     "MOFStage1EDMLoss",
     "MOFStage1EDMPreconditioner",
+    "OMolDirectForceLoss",
+    "OMolElementReferences",
+    "OMolLossOutput",
     "decode_atom_types",
     "decode_qm9_charges",
     "decode_geom_drugs_types_and_charges",
@@ -36,6 +45,7 @@ __all__ = [
     "lattice_latent_to_lattice_params",
     "lattice_params_to_lattice_latent",
     "lattice_params_to_y1",
+    "load_omol_element_references",
     "mod1",
     "mof_stage1_edm_sampler",
     "recenter_coordinates",

@@ -1,0 +1,18 @@
+{
+  "num_blocks": 8,
+  "stream_type": "scalar",
+  "block_mix": [0, 0, 1],
+  "order_policy": "local_then_global",
+  "scalar_dim": 768,
+  "trivial": {
+    "target": "scalar",
+    "attention": {
+      "kind": "mha",
+      "num_heads": 12,
+      "position_encoding": "distance_bias"
+    },
+    "ffn": {
+      "ffn_mult": 4
+    }
+  }
+}

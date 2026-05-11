@@ -28,6 +28,16 @@ from matterformer.models.triton_grouped_compact_simplicial_attention import (
 )
 
 
+class CountingNonPeriodicGeometryAdapter(NonPeriodicGeometryAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.calls += 1
+        return super().forward(*args, **kwargs)
+
+
 @pytest.mark.parametrize(
     ("block_mix", "expected"),
     [
@@ -112,6 +122,7 @@ def test_trivial_global_layer_position_encoding_modes():
 
     none = TrivialGlobalLayer(**kwargs, position_encoding="none")
     assert none.geometry_bias is None
+    assert not none.requires_geometry_cache
 
 
 def test_trivial_global_layer_can_use_mha_rope_and_pair_rbf_config():
@@ -195,6 +206,103 @@ def test_hybrid_stream_schedule_validation():
             hybrid_config={"stream_type": "scalar", "num_blocks": 1, "block_mix": [0, 1, 0]},
             geometry_adapter=NonPeriodicGeometryAdapter(),
         )
+
+
+def test_hybrid_trunk_skips_geometry_cache_for_pure_tetra_global():
+    torch.manual_seed(0)
+    adapter = CountingNonPeriodicGeometryAdapter()
+    trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [0, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 1.0},
+        },
+        geometry_adapter=adapter,
+    )
+    assert not trunk.requires_geometry_cache
+
+    x = torch.randn(2, 5, 24)
+    coords = torch.randn(2, 5, 3)
+    mask = torch.zeros(2, 5, dtype=torch.bool)
+    out = trunk(x, None, pad_mask=mask, coords=coords)
+
+    assert out.shape == x.shape
+    assert adapter.calls == 0
+
+
+def test_hybrid_trunk_builds_geometry_cache_when_required():
+    torch.manual_seed(0)
+    x = torch.randn(2, 5, 24)
+    coords = torch.randn(2, 5, 3)
+    mask = torch.zeros(2, 5, dtype=torch.bool)
+
+    sg_adapter = CountingNonPeriodicGeometryAdapter()
+    sg_trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [1, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "simplicial": {
+                "k_neighbors": 2,
+                "num_heads": 1,
+                "head_dim": 2,
+                "bias": {"angle_rank": 4, "radial_basis_dim": 4, "hidden_dim": 8},
+                "kernel": {"backend": "torch"},
+            },
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 1.0},
+        },
+        geometry_adapter=sg_adapter,
+    )
+    assert sg_trunk.requires_geometry_cache
+    assert sg_trunk(x, None, pad_mask=mask, coords=coords).shape == x.shape
+    assert sg_adapter.calls == 1
+
+    moment_adapter = CountingNonPeriodicGeometryAdapter()
+    moment_trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [0, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "input_lift": {"kind": "local_moment_lift", "hidden_dim": 8},
+            "simplicial": {"k_neighbors": 2, "bias": {"radial_basis_dim": 4}},
+            "tetra": {"heads_per_frame": 1, "rope_sigma": 1.0},
+        },
+        geometry_adapter=moment_adapter,
+    )
+    assert moment_trunk.requires_geometry_cache
+    assert moment_trunk(x, None, pad_mask=mask, coords=coords).shape == x.shape
+    assert moment_adapter.calls == 1
+
+    trivial_adapter = CountingNonPeriodicGeometryAdapter()
+    trivial_trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=6,
+        n_layers=1,
+        hybrid_config={
+            "stream_type": "scalar",
+            "num_blocks": 1,
+            "block_mix": [0, 0, 1],
+            "trivial": {"attention": {"num_heads": 6, "position_encoding": "distance_bias"}},
+        },
+        geometry_adapter=trivial_adapter,
+        use_adaln_conditioning=False,
+    )
+    assert trivial_trunk.requires_geometry_cache
+    assert trivial_trunk(x, None, pad_mask=mask, coords=coords, sigma=torch.ones(2)).shape == x.shape
+    assert trivial_adapter.calls == 1
     with pytest.raises(ValueError, match="does not allow"):
         HybridTransformerTrunk(
             d_model=16,

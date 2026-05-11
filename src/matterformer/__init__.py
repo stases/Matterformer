@@ -31,6 +31,7 @@ from matterformer.geometry.adapters import (
 )
 from matterformer.models.geom_drugs import GeomDrugsEDMModel
 from matterformer.models.mof_stage1 import MOFStage1EDMModel
+from matterformer.models.omol import MatterformerOMolForceField
 from matterformer.models.qm9 import QM9EDMModel, QM9RegressionModel
 from matterformer.models.embeddings import (
     FourierCoordEmbedder,
@@ -71,6 +72,7 @@ __all__ = [
     "LatticeEmbedder",
     "MaskEmbedder",
     "MhaFactorizedGeometryBias",
+    "MatterformerOMolForceField",
     "NonPeriodicGeometryAdapter",
     "PeriodicGeometryAdapter",
     "QM9Batch",
