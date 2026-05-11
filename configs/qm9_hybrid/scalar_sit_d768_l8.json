@@ -1,10 +1,9 @@
 {
   "num_blocks": 8,
+  "stream_type": "scalar",
   "block_mix": [1, 0, 1],
   "order_policy": "local_then_global",
-  "branch_mode": "scalar_only",
   "scalar_dim": 768,
-  "tetra_dim_per_frame": 16,
   "d_model_total": 768,
   "simplicial": {
     "target": "scalar",
@@ -36,17 +35,5 @@
     "ffn": {
       "ffn_mult": 4
     }
-  },
-  "coupling": {
-    "scalar_to_group": {
-      "enabled": false,
-      "gate_init": 0.0
-    },
-    "group_to_scalar": {
-      "enabled": false,
-      "gate_init": 0.0
-    },
-    "after_each_tetra": false,
-    "after_each_macro_block": false
   }
 }

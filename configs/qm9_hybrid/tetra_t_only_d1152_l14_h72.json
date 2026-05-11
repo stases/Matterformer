@@ -1,0 +1,24 @@
+{
+  "num_blocks": 14,
+  "stream_type": "tetra",
+  "block_mix": [0, 1, 0],
+  "order_policy": "local_then_global",
+  "scalar_dim": 1152,
+  "tetra_dim_per_frame": 96,
+  "tetra": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "heads_per_frame": 6,
+    "rope_sigma": 4.0,
+    "learned_freqs": true,
+    "use_key": false,
+    "rope_on_values": true,
+    "ffn_mult": 4
+  },
+  "input_lift": {
+    "kind": "scalar_copy"
+  },
+  "readout": {
+    "kind": "group_mean"
+  }
+}

@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
-from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock
+from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
+from matterformer.models.platonic.layers import GroupLayerNorm
 from matterformer.models.transformer import AdaLNBlock, GeometryBiasBuilder, _canonicalize_mha_position_mode
 from matterformer.models.triton_compact_simplicial_attention import (
     TRITON_COMPACT_SIMPLICIAL_AVAILABLE,
@@ -97,10 +98,10 @@ def expand_hybrid_schedule(
 @dataclass
 class HybridConfig:
     num_blocks: int = 4
-    block_mix: Any = field(default_factory=lambda: [[2, 1, 0], [2, 0, 1]])
+    block_mix: Any = field(default_factory=lambda: [[1, 0, 1]])
     order_policy: str = "local_then_global"
     explicit_orders: list[list[str]] | None = None
-    branch_mode: str = "auto"
+    stream_type: str = "scalar"
     scalar_dim: int | None = None
     tetra_dim_per_frame: int | None = None
     d_model_total: int | None = None
@@ -108,7 +109,8 @@ class HybridConfig:
     simplicial: dict[str, Any] = field(default_factory=dict)
     tetra: dict[str, Any] = field(default_factory=dict)
     trivial: dict[str, Any] = field(default_factory=dict)
-    coupling: dict[str, Any] = field(default_factory=dict)
+    input_lift: dict[str, Any] = field(default_factory=dict)
+    readout: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_input(
@@ -123,7 +125,21 @@ class HybridConfig:
             cfg = value
         else:
             raw = dict(value or {})
+            legacy_keys = {"branch_mode", "coupling"} & set(raw)
+            if legacy_keys:
+                raise ValueError(
+                    "Dual-stream hybrid configuration has been removed. "
+                    f"Unsupported legacy key(s): {sorted(legacy_keys)}. "
+                    "Use stream_type='scalar' for S+I or stream_type='tetra' for S_g+T."
+                )
             cfg = cls(**raw)
+        cfg.stream_type = str(cfg.stream_type).lower().replace("-", "_")
+        if cfg.stream_type in {"scalar_only", "trivial", "sit"}:
+            cfg.stream_type = "scalar"
+        if cfg.stream_type in {"tetra_only", "sgt"}:
+            cfg.stream_type = "tetra"
+        if cfg.stream_type not in {"scalar", "tetra"}:
+            raise ValueError("HybridConfig.stream_type must be one of {'scalar', 'tetra'}")
         cfg.scalar_dim = int(cfg.scalar_dim or d_model)
         if cfg.scalar_dim != d_model:
             raise ValueError(f"Hybrid scalar_dim ({cfg.scalar_dim}) must match d_model ({d_model}) for wrapper compatibility")
@@ -141,6 +157,7 @@ class HybridConfig:
             "bias": {"kind": "spherical_low_rank", "angle_rank": 32, "radial_basis_dim": 32},
             "message": {"enabled": False, "rank": 16},
             "kernel": {"backend": "triton_knn"},
+            "projection_mode": "group_linear",
             **dict(cfg.simplicial),
         }
         cfg.tetra = {
@@ -160,15 +177,9 @@ class HybridConfig:
             "ffn": {"ffn_mult": 4},
             **dict(cfg.trivial),
         }
-        cfg.coupling = {
-            "init_group_from_scalar": True,
-            "scalar_to_group": {"enabled": True, "gate_init": 0.0},
-            "group_to_scalar": {"enabled": True, "gate_init": 0.0},
-            "after_each_tetra": True,
-            "after_each_macro_block": True,
-            **dict(cfg.coupling),
-        }
-        cfg.d_model_total = cfg.d_model_total or (cfg.scalar_dim + 12 * cfg.tetra_dim_per_frame)
+        cfg.input_lift = {"kind": "scalar_copy", **dict(cfg.input_lift)}
+        cfg.readout = {"kind": "group_mean", **dict(cfg.readout)}
+        cfg.d_model_total = cfg.d_model_total or (cfg.scalar_dim if cfg.stream_type == "scalar" else 12 * cfg.tetra_dim_per_frame)
         return cfg
 
 
@@ -195,6 +206,13 @@ class ModelState:
     geom: GeometryCache | None
     cond_emb: torch.Tensor | None = None
     sigma: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class HybridTrunkOutput:
+    scalar: torch.Tensor
+    group: torch.Tensor | None
+    stream_type: Literal["scalar", "tetra"]
 
 
 def _gather_neighbor_values(values: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
@@ -330,6 +348,34 @@ def build_geometry_cache(
         rbf=_rbf(dist, rbf_dim=rbf_dim, cutoff=cutoff),
         pair_mask=pair_knn_mask,
     )
+
+
+def _repeat_geometry_cache_for_group(geom: GeometryCache, group_order: int) -> GeometryCache:
+    repeats = int(group_order)
+    return GeometryCache(
+        features=geom.features,
+        coords_len=geom.coords_len,
+        seq_len=geom.seq_len,
+        neighbor_idx=geom.neighbor_idx.repeat_interleave(repeats, dim=0),
+        neighbor_mask=geom.neighbor_mask.repeat_interleave(repeats, dim=0),
+        rel=geom.rel.repeat_interleave(repeats, dim=0),
+        dist=geom.dist.repeat_interleave(repeats, dim=0),
+        unit=geom.unit.repeat_interleave(repeats, dim=0),
+        rbf=geom.rbf.repeat_interleave(repeats, dim=0),
+        pair_mask=geom.pair_mask.repeat_interleave(repeats, dim=0),
+    )
+
+
+def validate_hybrid_schedule(schedule: list[list[LayerType]], stream_type: str) -> None:
+    stream_type = str(stream_type)
+    allowed = {"simplicial", "trivial"} if stream_type == "scalar" else {"simplicial", "tetra"}
+    for block_idx, block in enumerate(schedule):
+        invalid = [layer_type for layer_type in block if layer_type not in allowed]
+        if invalid:
+            raise ValueError(
+                f"Hybrid stream_type={stream_type!r} does not allow layer(s) {invalid} "
+                f"in block {block_idx}; allowed layers are {sorted(allowed)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -709,22 +755,35 @@ class CompactSimplicialAttention(nn.Module):
         k2 = self._split(k2)
         v2 = self._split(v2)
         bias = self.bias(geom, dtype=x_atoms.dtype)
-        fn = compact_simplicial_attention_triton if self.backend in {"triton", "triton_knn"} else compact_simplicial_attention_torch
-        out = fn(
-            q,
-            k1,
-            v1,
-            k2,
-            v2,
-            neighbor_idx=geom.neighbor_idx,
-            neighbor_mask=geom.neighbor_mask,
-            bias=bias,
-            dropout_p=self.dropout,
-            training=self.training,
-            precision=self.precision,
-            debug_torch_backward=self.debug_torch_backward,
-            strict=self.strict_triton,
-        )
+        if self.backend in {"triton", "triton_knn"}:
+            out = compact_simplicial_attention_triton(
+                q,
+                k1,
+                v1,
+                k2,
+                v2,
+                neighbor_idx=geom.neighbor_idx,
+                neighbor_mask=geom.neighbor_mask,
+                bias=bias,
+                dropout_p=self.dropout,
+                training=self.training,
+                precision=self.precision,
+                debug_torch_backward=self.debug_torch_backward,
+                strict=self.strict_triton,
+            )
+        else:
+            out = compact_simplicial_attention_torch(
+                q,
+                k1,
+                v1,
+                k2,
+                v2,
+                neighbor_idx=geom.neighbor_idx,
+                neighbor_mask=geom.neighbor_mask,
+                bias=bias,
+                dropout_p=self.dropout,
+                training=self.training,
+            )
         return self.out_proj(self._merge(out))
 
 
@@ -769,6 +828,217 @@ class SimplicialLocalLayer(nn.Module):
         if state.mask is not None:
             scalar = scalar.masked_fill(state.mask[..., None], 0.0)
         state.scalar = scalar
+        return state
+
+
+class GroupFramewiseSimplicialAttention(nn.Module):
+    def __init__(
+        self,
+        dim_per_frame: int,
+        group_order: int,
+        num_heads: int,
+        *,
+        head_dim: int | None = None,
+        dropout: float = 0.0,
+        backend: str = "triton_knn",
+        precision: str = "bf16_tc",
+        debug_torch_backward: bool = False,
+        strict_triton: bool = False,
+        projection_mode: str = "group_linear",
+        solid: str = "tetrahedron",
+        bias_config: dict[str, Any] | None = None,
+        message_config: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.dim_per_frame = int(dim_per_frame)
+        self.group_order = int(group_order)
+        self.num_heads = int(num_heads)
+        if head_dim is None:
+            if self.dim_per_frame % self.num_heads != 0:
+                raise ValueError("dim_per_frame must be divisible by num_heads when head_dim is omitted")
+            head_dim = self.dim_per_frame // self.num_heads
+        self.head_dim = int(head_dim)
+        self.inner_dim = self.num_heads * self.head_dim
+        self.scale = self.head_dim ** -0.5
+        self.dropout = float(dropout)
+        self.backend = str(backend).lower()
+        self.precision = str(precision).lower()
+        self.debug_torch_backward = bool(debug_torch_backward)
+        self.strict_triton = bool(strict_triton)
+        self.projection_mode = str(projection_mode).lower()
+        if self.projection_mode not in {"group_linear", "shared_frame"}:
+            raise ValueError("projection_mode must be one of {'group_linear', 'shared_frame'}")
+
+        if self.projection_mode == "group_linear":
+            d_group_in = self.group_order * self.dim_per_frame
+            d_group_out = self.group_order * self.inner_dim
+            self.in_proj = PlatonicLinear(d_group_in, 5 * d_group_out, solid=solid)
+            self.out_proj = PlatonicLinear(d_group_out, d_group_in, solid=solid)
+        else:
+            self.in_proj = nn.Linear(self.dim_per_frame, 5 * self.inner_dim)
+            self.out_proj = nn.Linear(self.inner_dim, self.dim_per_frame)
+
+        bias_config = dict(bias_config or {})
+        message_config = dict(message_config or {})
+        bias_kind = str(bias_config.get("kind", "spherical_low_rank")).lower()
+        if bias_kind == "feature_gated_spherical_low_rank":
+            raise NotImplementedError(
+                "feature_gated_spherical_low_rank is not implemented for S_g yet; "
+                "the current group-framewise local bias is geometry-only spherical_low_rank"
+            )
+        if bias_kind not in {"spherical_low_rank"}:
+            raise ValueError(f"Unsupported group-framewise simplicial bias kind: {bias_kind!r}")
+        self.bias = CompactSimplicialGeometryBias(
+            num_heads=self.num_heads,
+            rank=int(bias_config.get("angle_rank", 32)),
+            rbf_dim=int(bias_config.get("radial_basis_dim", 32)),
+            channels_by_l=bias_config.get("channels_by_l"),
+            use_radial_uv=bool(bias_config.get("use_radial_uv", bias_config.get("use_radial_bias", True))),
+            use_angle=bool(bias_config.get("use_angle", bias_config.get("use_angle_bias", True))),
+            message_enabled=bool(message_config.get("enabled", False)),
+            message_rank=int(message_config.get("rank", 16)),
+            message_channels_by_l=message_config.get("channels_by_l"),
+            head_dim=self.head_dim,
+        )
+
+    def _split(self, x: torch.Tensor) -> torch.Tensor:
+        return x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _merge(self, x: torch.Tensor) -> torch.Tensor:
+        return x.transpose(1, 2).contiguous().view(x.shape[0], x.shape[2], self.inner_dim)
+
+    def _project_in(self, x_group: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_atoms, group_order, channels = x_group.shape
+        if group_order != self.group_order or channels != self.dim_per_frame:
+            raise ValueError(
+                f"Expected group tensor [B, N, {self.group_order}, {self.dim_per_frame}], "
+                f"got {tuple(x_group.shape)}"
+            )
+        if self.projection_mode == "group_linear":
+            projected = self.in_proj(x_group.reshape(batch_size, num_atoms, self.group_order * self.dim_per_frame))
+            projected = projected.view(batch_size, num_atoms, self.group_order, 5 * self.inner_dim)
+        else:
+            projected = self.in_proj(x_group)
+        return tuple(projected.chunk(5, dim=-1))  # type: ignore[return-value]
+
+    def _project_out(self, out_group: torch.Tensor) -> torch.Tensor:
+        batch_size, num_atoms = out_group.shape[:2]
+        if self.projection_mode == "group_linear":
+            out = self.out_proj(out_group.reshape(batch_size, num_atoms, self.group_order * self.inner_dim))
+            return out.view(batch_size, num_atoms, self.group_order, self.dim_per_frame)
+        return self.out_proj(out_group)
+
+    def forward(self, x_group_atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
+        batch_size, num_atoms, group_order, _ = x_group_atoms.shape
+        q, k1, v1, k2, v2 = self._project_in(x_group_atoms)
+
+        def fold(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.permute(0, 2, 1, 3).reshape(batch_size * group_order, num_atoms, self.inner_dim)
+
+        q = self._split(fold(q)) * self.scale
+        k1 = self._split(fold(k1))
+        v1 = self._split(fold(v1))
+        k2 = self._split(fold(k2))
+        v2 = self._split(fold(v2))
+        geom_group = _repeat_geometry_cache_for_group(geom, group_order)
+        bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+        if self.backend in {"triton", "triton_knn"}:
+            out = compact_simplicial_attention_triton(
+                q,
+                k1,
+                v1,
+                k2,
+                v2,
+                neighbor_idx=geom_group.neighbor_idx,
+                neighbor_mask=geom_group.neighbor_mask,
+                bias=bias,
+                dropout_p=self.dropout,
+                training=self.training,
+                precision=self.precision,
+                debug_torch_backward=self.debug_torch_backward,
+                strict=self.strict_triton,
+            )
+        else:
+            out = compact_simplicial_attention_torch(
+                q,
+                k1,
+                v1,
+                k2,
+                v2,
+                neighbor_idx=geom_group.neighbor_idx,
+                neighbor_mask=geom_group.neighbor_mask,
+                bias=bias,
+                dropout_p=self.dropout,
+                training=self.training,
+            )
+        out = self._merge(out).view(batch_size, group_order, num_atoms, self.inner_dim).permute(0, 2, 1, 3).contiguous()
+        return self._project_out(out)
+
+
+class GroupFramewiseSimplicialLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        group_order: int,
+        dim_per_frame: int,
+        config: dict[str, Any],
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        eps: float = 1e-6,
+        solid: str = "tetrahedron",
+    ) -> None:
+        super().__init__()
+        self.group_order = int(group_order)
+        self.dim_per_frame = int(dim_per_frame)
+        self.projection_mode = str(config.get("projection_mode", "group_linear")).lower()
+        num_heads = int(config.get("num_heads", 1))
+        self.norm1 = GroupLayerNorm(self.group_order, self.dim_per_frame, eps=eps)
+        self.norm2 = GroupLayerNorm(self.group_order, self.dim_per_frame, eps=eps)
+        self.attn = GroupFramewiseSimplicialAttention(
+            self.dim_per_frame,
+            self.group_order,
+            num_heads,
+            head_dim=config.get("head_dim"),
+            dropout=dropout,
+            backend=dict(config.get("kernel", {})).get("backend", "triton_knn"),
+            precision=dict(config.get("kernel", {})).get("precision", "bf16_tc"),
+            debug_torch_backward=bool(dict(config.get("kernel", {})).get("debug_torch_backward", False)),
+            strict_triton=bool(dict(config.get("kernel", {})).get("strict", False)),
+            projection_mode=self.projection_mode,
+            solid=solid,
+            bias_config=dict(config.get("bias", {})),
+            message_config=dict(config.get("message", {})),
+        )
+        d_group = self.group_order * self.dim_per_frame
+        hidden = int(d_group * mlp_ratio)
+        self.mlp = nn.Sequential(
+            PlatonicLinear(d_group, hidden, solid=solid),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+            PlatonicLinear(hidden, d_group, solid=solid),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, state: ModelState) -> ModelState:
+        if state.group is None:
+            return state
+        if state.geom is None:
+            raise RuntimeError("GroupFramewiseSimplicialLayer requires geometry cache")
+        coords_len = state.geom.coords_len
+        group = state.group
+        atoms = group[:, :coords_len, :, :]
+        atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
+        attn_in = self.norm1(atoms_flat).view_as(atoms)
+        atoms = atoms + self.dropout(self.attn(attn_in, state.geom))
+        atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
+        atoms = atoms + self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+        if group.shape[1] == coords_len:
+            group = atoms
+        else:
+            group = torch.cat([atoms, group[:, coords_len:, :, :]], dim=1)
+        if state.mask is not None:
+            group = group.masked_fill(state.mask[..., None, None], 0.0)
+        state.group = group
         return state
 
 
@@ -928,77 +1198,14 @@ class TrivialGlobalLayer(nn.Module):
         return state
 
 
-class HybridCoupling(nn.Module):
-    def __init__(
-        self,
-        *,
-        scalar_dim: int,
-        group_order: int,
-        group_dim_per_frame: int,
-        config: dict[str, Any],
-    ) -> None:
-        super().__init__()
-        self.group_order = int(group_order)
-        self.group_dim_per_frame = int(group_dim_per_frame)
-        scalar_to_group = dict(config.get("scalar_to_group", {}))
-        group_to_scalar = dict(config.get("group_to_scalar", {}))
-        self.scalar_to_group_enabled = bool(scalar_to_group.get("enabled", True))
-        self.group_to_scalar_enabled = bool(group_to_scalar.get("enabled", True))
-        self.scalar_to_group = nn.Linear(scalar_dim, self.group_dim_per_frame)
-        self.group_to_scalar = nn.Linear(self.group_dim_per_frame, scalar_dim)
-        self.scalar_to_group_pre_gate = nn.Parameter(torch.tensor(float(scalar_to_group.get("pre_gate_init", 1.0))))
-        self.scalar_to_group_gate = nn.Parameter(torch.tensor(float(scalar_to_group.get("gate_init", 0.0))))
-        self.group_to_scalar_gate = nn.Parameter(torch.tensor(float(group_to_scalar.get("gate_init", 0.0))))
-
-    def init_group(self, scalar: torch.Tensor) -> torch.Tensor:
-        lifted = self.scalar_to_group(scalar).unsqueeze(2)
-        return lifted.expand(-1, -1, self.group_order, -1).contiguous()
-
-    def _mask(self, state: ModelState) -> ModelState:
-        if state.mask is not None:
-            if state.scalar is not None:
-                state.scalar = state.scalar.masked_fill(state.mask[..., None], 0.0)
-            if state.group is not None:
-                state.group = state.group.masked_fill(state.mask[..., None, None], 0.0)
-        return state
-
-    def scalar_to_group_pre(self, state: ModelState) -> ModelState:
-        if state.scalar is not None and state.group is not None and self.scalar_to_group_enabled:
-            lifted = self.scalar_to_group(state.scalar).unsqueeze(2).expand_as(state.group)
-            state.group = state.group + self.scalar_to_group_pre_gate.to(dtype=state.group.dtype) * lifted
-        return self._mask(state)
-
-    def group_to_scalar_post(self, state: ModelState) -> ModelState:
-        if state.scalar is not None and state.group is not None and self.group_to_scalar_enabled:
-            pooled = state.group.mean(dim=2)
-            state.scalar = state.scalar + self.group_to_scalar_gate.to(dtype=state.scalar.dtype) * self.group_to_scalar(pooled)
-        return self._mask(state)
-
-    def forward(self, state: ModelState) -> ModelState:
-        if state.scalar is not None and state.group is not None and self.scalar_to_group_enabled:
-            lifted = self.scalar_to_group(state.scalar).unsqueeze(2).expand_as(state.group)
-            state.group = state.group + self.scalar_to_group_gate.to(dtype=state.group.dtype) * lifted
-        if state.scalar is not None and state.group is not None and self.group_to_scalar_enabled:
-            pooled = state.group.mean(dim=2)
-            state.scalar = state.scalar + self.group_to_scalar_gate.to(dtype=state.scalar.dtype) * self.group_to_scalar(pooled)
-        return self._mask(state)
-
-
 class HybridBlock(nn.Module):
-    def __init__(self, sublayers: list[nn.Module], *, coupling: HybridCoupling | None, couple_after_tetra: bool) -> None:
+    def __init__(self, sublayers: list[nn.Module]) -> None:
         super().__init__()
         self.sublayers = nn.ModuleList(sublayers)
-        self.coupling = coupling
-        self.couple_after_tetra = bool(couple_after_tetra)
 
     def forward(self, state: ModelState) -> ModelState:
         for layer in self.sublayers:
-            if self.coupling is not None and self.couple_after_tetra and isinstance(layer, TetraPlatonicGlobalLayer):
-                state = self.coupling.scalar_to_group_pre(state)
-                state = layer(state)
-                state = self.coupling.group_to_scalar_post(state)
-            else:
-                state = layer(state)
+            state = layer(state)
         return state
 
 
@@ -1023,25 +1230,22 @@ class HybridTransformerTrunk(nn.Module):
         self.config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.geometry_adapter = geometry_adapter
         self.use_final_norm = bool(use_final_norm)
+        self.stream_type: Literal["scalar", "tetra"] = self.config.stream_type  # type: ignore[assignment]
         self.group_order = int(self.config.tetra.get("group_order", 12))
         self.group_dim_per_frame = int(self.config.tetra_dim_per_frame or 0)
+        self.tetra_solid = str(self.config.tetra.get("group", "tetrahedron")).lower()
         schedule = expand_hybrid_schedule(
             self.config.num_blocks,
             self.config.block_mix,
             self.config.order_policy,
             self.config.explicit_orders,
         )
-        needs_group = any("tetra" in block for block in schedule) or self.config.branch_mode in {"tetra_only", "two_stream"}
-        self.coupling = (
-            HybridCoupling(
-                scalar_dim=d_model,
-                group_order=self.group_order,
-                group_dim_per_frame=self.group_dim_per_frame,
-                config=self.config.coupling,
-            )
-            if needs_group
-            else None
-        )
+        validate_hybrid_schedule(schedule, self.stream_type)
+        input_lift_kind = str(self.config.input_lift.get("kind", "scalar_copy")).lower()
+        if self.stream_type == "tetra" and input_lift_kind != "scalar_copy":
+            raise NotImplementedError("Only tetra input_lift kind 'scalar_copy' is implemented")
+        self.group_input_proj = nn.Linear(d_model, self.group_dim_per_frame) if self.stream_type == "tetra" else None
+        self.group_readout_proj = nn.Linear(self.group_dim_per_frame, d_model) if self.stream_type == "tetra" else None
         self.k_neighbors = int(self.config.simplicial.get("k_neighbors", 32))
         bias_cfg = dict(self.config.simplicial.get("bias", {}))
         self.rbf_dim = int(bias_cfg.get("radial_basis_dim", 32))
@@ -1052,7 +1256,20 @@ class HybridTransformerTrunk(nn.Module):
             sublayers: list[nn.Module] = []
             for layer_type in block_order:
                 if layer_type == "simplicial":
-                    sublayers.append(SimplicialLocalLayer(d_model, self.config.simplicial, dropout=dropout, mlp_ratio=mlp_ratio))
+                    if self.stream_type == "scalar":
+                        sublayers.append(SimplicialLocalLayer(d_model, self.config.simplicial, dropout=dropout, mlp_ratio=mlp_ratio))
+                    else:
+                        sublayers.append(
+                            GroupFramewiseSimplicialLayer(
+                                group_order=self.group_order,
+                                dim_per_frame=self.group_dim_per_frame,
+                                config=self.config.simplicial,
+                                dropout=dropout,
+                                mlp_ratio=mlp_ratio,
+                                eps=eps,
+                                solid=self.tetra_solid,
+                            )
+                        )
                 elif layer_type == "tetra":
                     sublayers.append(
                         TetraPlatonicGlobalLayer(
@@ -1111,15 +1328,8 @@ class HybridTransformerTrunk(nn.Module):
                             pair_rbf_max=float(trivial_attn.get("pair_rbf_max", 2.0)),
                         )
                     )
-            blocks.append(
-                HybridBlock(
-                    sublayers,
-                    coupling=self.coupling,
-                    couple_after_tetra=bool(self.config.coupling.get("after_each_tetra", True)),
-                )
-            )
+            blocks.append(HybridBlock(sublayers))
         self.blocks = nn.ModuleList(blocks)
-        self.couple_after_macro = bool(self.config.coupling.get("after_each_macro_block", True))
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
@@ -1164,7 +1374,8 @@ class HybridTransformerTrunk(nn.Module):
         coords: torch.Tensor | None = None,
         lattice: torch.Tensor | None = None,
         sigma: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_output: bool = False,
+    ) -> torch.Tensor | HybridTrunkOutput:
         if pad_mask is not None and pad_mask.dtype != torch.bool:
             pad_mask = pad_mask.bool()
         if pad_mask is not None and pad_mask.shape[:2] != x.shape[:2]:
@@ -1172,15 +1383,18 @@ class HybridTransformerTrunk(nn.Module):
         if self.geometry_adapter is not None and coords is None:
             raise ValueError("coords must be provided when geometry_adapter is configured")
         geom = self._build_geom_cache(coords=coords, pad_mask=pad_mask, lattice=lattice, seq_len=x.shape[1]) if coords is not None else None
+        scalar = x if self.stream_type == "scalar" else None
         group = None
-        if self.coupling is not None and bool(self.config.coupling.get("init_group_from_scalar", True)):
-            group = self.coupling.init_group(x)
+        if self.stream_type == "tetra":
+            if self.group_input_proj is None:
+                raise RuntimeError("group_input_proj is not configured for tetra stream")
+            group = self.group_input_proj(x).unsqueeze(2).expand(-1, -1, self.group_order, -1).contiguous()
             if pad_mask is not None:
                 group = group.masked_fill(pad_mask[..., None, None], 0.0)
         state = ModelState(
             pos=coords if coords is not None else x.new_zeros(x.shape[0], x.shape[1], 3),
             mask=pad_mask,
-            scalar=x,
+            scalar=scalar,
             group=group,
             geom=geom,
             cond_emb=cond_emb,
@@ -1188,13 +1402,17 @@ class HybridTransformerTrunk(nn.Module):
         )
         for block in self.blocks:
             state = block(state)
-            if self.coupling is not None and self.couple_after_macro:
-                state = self.coupling(state)
-        if state.scalar is None:
-            if state.group is None:
-                raise RuntimeError("Hybrid trunk has neither scalar nor group state")
-            state.scalar = self.coupling.group_to_scalar(state.group.mean(dim=2)) if self.coupling is not None else state.group.mean(dim=2)
-        out = self.norm_out(state.scalar)
+        if self.stream_type == "scalar":
+            if state.scalar is None:
+                raise RuntimeError("Scalar hybrid trunk lost scalar state")
+            scalar_out = state.scalar
+        else:
+            if state.group is None or self.group_readout_proj is None:
+                raise RuntimeError("Tetra hybrid trunk lost group state")
+            scalar_out = self.group_readout_proj(state.group.mean(dim=2))
+        out = self.norm_out(scalar_out)
         if pad_mask is not None:
             out = out.masked_fill(pad_mask[..., None], 0.0)
+        if return_output:
+            return HybridTrunkOutput(scalar=out, group=state.group, stream_type=self.stream_type)
         return out

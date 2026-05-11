@@ -155,11 +155,17 @@ class MOFStage1EDMModel(nn.Module):
         self.segment_embedding = nn.Embedding(2, d_model)
         self.conditioning = TimeEmbedder(d_model)
         if attn_type == "hybrid":
+            hybrid_cfg = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
+            if hybrid_cfg.stream_type == "tetra":
+                raise NotImplementedError(
+                    "MOFStage1EDMModel supports only scalar hybrid stream_type in this refactor; "
+                    "tetra stream requires a lattice/cell-aware readout."
+                )
             self.trunk = HybridTransformerTrunk(
                 d_model=d_model,
                 n_heads=n_heads,
                 n_layers=n_layers,
-                hybrid_config=hybrid_config,
+                hybrid_config=hybrid_cfg,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 attn_dropout=attn_dropout,

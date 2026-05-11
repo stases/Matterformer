@@ -7,16 +7,18 @@ from matterformer.models import (
     CompactSimplicialAttention,
     CompactSimplicialGeometryBias,
     GeomDrugsEDMModel,
+    GroupFramewiseSimplicialLayer,
     MOFStage1EDMModel,
     ModelState,
     QM9EDMModel,
+    HybridConfig,
+    HybridTransformerTrunk,
     TrivialGlobalLayer,
     build_geometry_cache,
     compact_simplicial_attention_torch,
     compact_simplicial_attention_triton,
     expand_hybrid_schedule,
 )
-from matterformer.models.hybrid import HybridCoupling
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.triton_compact_simplicial_attention import TRITON_COMPACT_SIMPLICIAL_AVAILABLE
 
@@ -152,30 +154,50 @@ def test_trivial_global_layer_can_use_mha_rope_and_pair_rbf_config():
     assert torch.all(out[mask] == 0)
 
 
-def test_hybrid_coupling_pre_tetra_refreshes_group_without_scalar_injection_at_init():
-    torch.manual_seed(0)
-    coupling = HybridCoupling(
-        scalar_dim=4,
-        group_order=2,
-        group_dim_per_frame=3,
-        config={
-            "scalar_to_group": {"enabled": True, "pre_gate_init": 1.0, "gate_init": 0.0},
-            "group_to_scalar": {"enabled": True, "gate_init": 0.0},
+def test_hybrid_config_rejects_legacy_dual_stream_keys():
+    with pytest.raises(ValueError, match="Dual-stream"):
+        HybridConfig.from_input({"branch_mode": "two_stream"}, d_model=16, n_heads=4, n_layers=1)
+    with pytest.raises(ValueError, match="Dual-stream"):
+        HybridConfig.from_input({"coupling": {}}, d_model=16, n_heads=4, n_layers=1)
+
+
+def test_hybrid_stream_schedule_validation():
+    HybridTransformerTrunk(
+        d_model=16,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config={"stream_type": "scalar", "num_blocks": 1, "block_mix": [1, 0, 1]},
+        geometry_adapter=NonPeriodicGeometryAdapter(),
+    )
+    HybridTransformerTrunk(
+        d_model=16,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 1,
+            "block_mix": [1, 1, 0],
+            "tetra_dim_per_frame": 4,
+            "simplicial": {"num_heads": 1, "bias": {"angle_rank": 8, "radial_basis_dim": 8}},
         },
+        geometry_adapter=NonPeriodicGeometryAdapter(),
     )
-    scalar = torch.randn(1, 5, 4)
-    state = ModelState(
-        pos=torch.zeros(1, 5, 3),
-        mask=None,
-        scalar=scalar.clone(),
-        group=torch.zeros(1, 5, 2, 3),
-        geom=None,
-    )
-    state = coupling.scalar_to_group_pre(state)
-    assert state.group is not None
-    assert not torch.allclose(state.group, torch.zeros_like(state.group))
-    state = coupling.group_to_scalar_post(state)
-    assert torch.allclose(state.scalar, scalar)
+    with pytest.raises(ValueError, match="does not allow"):
+        HybridTransformerTrunk(
+            d_model=16,
+            n_heads=4,
+            n_layers=1,
+            hybrid_config={"stream_type": "scalar", "num_blocks": 1, "block_mix": [0, 1, 0]},
+            geometry_adapter=NonPeriodicGeometryAdapter(),
+        )
+    with pytest.raises(ValueError, match="does not allow"):
+        HybridTransformerTrunk(
+            d_model=16,
+            n_heads=4,
+            n_layers=1,
+            hybrid_config={"stream_type": "tetra", "num_blocks": 1, "block_mix": [0, 0, 1]},
+            geometry_adapter=NonPeriodicGeometryAdapter(),
+        )
 
 
 def _make_neighbor_idx(num_tokens: int, k_neighbors: int) -> torch.Tensor:
@@ -420,12 +442,101 @@ def test_compact_simplicial_geometry_bias_can_disable_radial_or_angle():
     assert radial_bias.angle_gate is None
 
 
+def _small_geom(coords: torch.Tensor, pad_mask: torch.Tensor, k_neighbors: int = 3):
+    adapter = NonPeriodicGeometryAdapter()
+    return build_geometry_cache(
+        adapter(coords=coords, pad_mask=pad_mask),
+        coords_len=coords.shape[1],
+        seq_len=coords.shape[1],
+        k_neighbors=k_neighbors,
+        pad_mask=pad_mask,
+        rbf_dim=8,
+    )
+
+
+def test_group_framewise_simplicial_layer_shape_mask_and_equivariance():
+    torch.manual_seed(0)
+    group = PLATONIC_GROUPS["tetrahedron"]
+    layer = GroupFramewiseSimplicialLayer(
+        group_order=group.G,
+        dim_per_frame=4,
+        config={
+            "k_neighbors": 3,
+            "num_heads": 1,
+            "projection_mode": "group_linear",
+            "bias": {"angle_rank": 8, "radial_basis_dim": 8},
+            "kernel": {"backend": "torch"},
+        },
+        dropout=0.0,
+        mlp_ratio=2.0,
+    ).eval()
+    coords = torch.randn(2, 5, 3)
+    pad_mask = torch.tensor([[False, False, False, True, True], [False, False, False, False, True]])
+    geom = _small_geom(coords, pad_mask, k_neighbors=3)
+    group_features = torch.randn(2, 5, group.G, 4)
+    state = ModelState(pos=coords, mask=pad_mask, scalar=None, group=group_features.clone(), geom=geom)
+    out = layer(state).group
+    assert out is not None
+    assert out.shape == group_features.shape
+    assert torch.all(out[pad_mask] == 0)
+
+    permutation = group.cayley_table[3]
+    state_perm = ModelState(
+        pos=coords,
+        mask=pad_mask,
+        scalar=None,
+        group=group_features[:, :, permutation].clone(),
+        geom=geom,
+    )
+    out_perm = layer(state_perm).group
+    assert out_perm is not None
+    assert torch.allclose(out_perm, out[:, :, permutation], atol=1e-5, rtol=1e-5)
+
+
+def test_group_vector_readout_is_tetra_equivariant():
+    torch.manual_seed(0)
+    model = QM9EDMModel(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        attn_type="hybrid",
+        hybrid_config=_tetra_hybrid_config([0, 1, 0]),
+        coord_head_mode="group_vector",
+    )
+    model.group_vector_scale.data.fill_(1.0)
+    group = PLATONIC_GROUPS["tetrahedron"]
+    group_features = torch.randn(2, 4, group.G, 4)
+    pad_mask = torch.zeros(2, 4, dtype=torch.bool)
+    coord_delta = model._group_vector_coord_delta(group_features, pad_mask)
+    permutation = group.cayley_table[:, 5]
+    rotated = model._group_vector_coord_delta(group_features[:, :, permutation], pad_mask)
+    expected = torch.einsum("ij,bnj->bni", group.elements[5], coord_delta)
+    assert torch.allclose(rotated, expected, atol=1e-5, rtol=1e-5)
+
+
 def _hybrid_config() -> dict:
     return {
         "num_blocks": 1,
-        "block_mix": [1, 1, 1],
+        "stream_type": "scalar",
+        "block_mix": [1, 0, 1],
         "tetra_dim_per_frame": 4,
         "simplicial": {"k_neighbors": 3, "bias": {"angle_rank": 8, "radial_basis_dim": 8}},
+    }
+
+
+def _tetra_hybrid_config(block_mix=None) -> dict:
+    return {
+        "num_blocks": 1,
+        "stream_type": "tetra",
+        "block_mix": [1, 1, 0] if block_mix is None else block_mix,
+        "tetra_dim_per_frame": 4,
+        "simplicial": {
+            "k_neighbors": 3,
+            "num_heads": 1,
+            "projection_mode": "group_linear",
+            "bias": {"angle_rank": 8, "radial_basis_dim": 8},
+        },
+        "tetra": {"heads_per_frame": 1},
     }
 
 
@@ -448,9 +559,48 @@ def test_qm9_hybrid_edm_forward_backward():
     (atom_delta.square().mean() + coord_delta.square().mean()).backward()
 
 
+@pytest.mark.parametrize("block_mix", [[0, 1, 0], [1, 1, 0]])
+def test_qm9_tetra_hybrid_edm_forward_backward(block_mix):
+    torch.manual_seed(0)
+    model = QM9EDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=1,
+        attn_type="hybrid",
+        hybrid_config=_tetra_hybrid_config(block_mix),
+        coord_head_mode="group_vector",
+        geometry_adapter=NonPeriodicGeometryAdapter(),
+    )
+    atom = torch.randn(2, 4, 6)
+    coords = torch.randn(2, 4, 3)
+    pad_mask = torch.tensor([[False, False, False, True], [False, False, True, True]])
+    atom_delta, coord_delta = model(atom, coords, pad_mask, torch.tensor([0.1, 1.0]))
+    assert atom_delta.shape == atom.shape
+    assert coord_delta.shape == coords.shape
+    (atom_delta.square().mean() + coord_delta.square().mean()).backward()
+
+
 def test_geom_drugs_hybrid_edm_forward():
     torch.manual_seed(0)
     model = GeomDrugsEDMModel(d_model=32, n_heads=4, n_layers=2, attn_type="hybrid", hybrid_config=_hybrid_config())
+    atom = torch.randn(2, 5, model.atom_channels)
+    coords = torch.randn(2, 5, 3)
+    pad_mask = torch.tensor([[False, False, False, False, True], [False, False, False, True, True]])
+    atom_delta, coord_delta = model(atom, coords, pad_mask, torch.tensor([0.1, 1.0]))
+    assert atom_delta.shape == atom.shape
+    assert coord_delta.shape == coords.shape
+
+
+def test_geom_drugs_tetra_hybrid_edm_forward():
+    torch.manual_seed(0)
+    model = GeomDrugsEDMModel(
+        d_model=32,
+        n_heads=4,
+        n_layers=1,
+        attn_type="hybrid",
+        hybrid_config=_tetra_hybrid_config([1, 1, 0]),
+        coord_head_mode="group_vector",
+    )
     atom = torch.randn(2, 5, model.atom_channels)
     coords = torch.randn(2, 5, 3)
     pad_mask = torch.tensor([[False, False, False, False, True], [False, False, False, True, True]])
@@ -484,3 +634,15 @@ def test_mof_stage1_hybrid_edm_forward_backward():
     assert coord_delta.shape == coords.shape
     assert lattice_delta.shape == (2, 6)
     (coord_delta.square().mean() + lattice_delta.square().mean()).backward()
+
+
+def test_mof_stage1_tetra_hybrid_raises_until_lattice_readout_exists():
+    with pytest.raises(NotImplementedError, match="lattice/cell-aware readout"):
+        MOFStage1EDMModel(
+            block_feature_dim=5,
+            d_model=32,
+            n_heads=4,
+            n_layers=1,
+            attn_type="hybrid",
+            hybrid_config=_tetra_hybrid_config([0, 1, 0]),
+        )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import json
 import math
 from pathlib import Path
 import sys
@@ -26,6 +27,17 @@ from matterformer.utils import (
     random_rotation_matrices,
     seed_everything,
 )
+
+
+def load_hybrid_config(value: str | None) -> dict | None:
+    if value is None:
+        return None
+    path = Path(value)
+    text = path.read_text(encoding="utf-8") if path.exists() else value
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("--hybrid-config-json must decode to a JSON object")
+    return data
 
 
 def make_autocast_context(device: torch.device, enabled: bool):
@@ -361,6 +373,7 @@ def log_sampling_metrics(
 def main(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = default_device()
+    args.hybrid_config = load_hybrid_config(args.hybrid_config_json)
 
     train_dataset = GeomDrugsDataset(args.data_dir, split="train")
     val_dataset = GeomDrugsDataset(args.data_dir, split="val")
@@ -438,6 +451,7 @@ def main(args: argparse.Namespace) -> None:
         coord_embed_normalize=args.coord_embed_normalize,
         coord_head_mode=args.coord_head_mode,
         noise_conditioning=args.noise_conditioning,
+        hybrid_config=args.hybrid_config,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
     criterion = GeomDrugsEDMLoss(
@@ -932,6 +946,12 @@ if __name__ == "__main__":
     parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--attn-type", type=str, default="simplicial", choices=["mha", "simplicial", "hybrid"])
     parser.add_argument(
+        "--hybrid-config-json",
+        type=str,
+        default=None,
+        help="Path to JSON file or inline JSON object for HybridTransformerTrunk when --attn-type hybrid.",
+    )
+    parser.add_argument(
         "--simplicial-geom-mode",
         type=str,
         default="factorized",
@@ -1001,6 +1021,8 @@ if __name__ == "__main__":
         choices=[
             "equivariant",
             "direct",
+            "group_vector",
+            "group-vector",
             "relative",
             "non_equivariant",
             "non-equivariant",

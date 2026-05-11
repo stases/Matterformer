@@ -6,7 +6,8 @@ from torch import nn
 from matterformer.data.qm9 import QM9_ATOM_PAD_TOKEN, QM9_NUM_ATOM_TYPES
 from matterformer.geometry.adapters import BaseGeometryAdapter, NonPeriodicGeometryAdapter
 from matterformer.models.embeddings import FourierCoordEmbedder, TimeEmbedder
-from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk
+from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk, HybridTrunkOutput
+from matterformer.models.platonic import PLATONIC_GROUPS
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     LearnedNullConditioning,
@@ -323,6 +324,13 @@ class QM9EDMModel(nn.Module):
             coord_head_mode = "equivariant"
         if coord_head_mode in {"non_relative", "non_equivariant", "nonrelative"}:
             coord_head_mode = "direct"
+        if coord_head_mode in {"group-vector", "group_vector", "tetra_vector"}:
+            coord_head_mode = "group_vector"
+        effective_hybrid_config = (
+            HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
+            if attn_type == "hybrid"
+            else None
+        )
         if simplicial_geom_mode not in {"none", "factorized", "angle_residual", "angle_low_rank"}:
             raise ValueError(
                 "simplicial_geom_mode must be one of {'none', 'factorized', 'angle_residual', 'angle_low_rank'}"
@@ -341,10 +349,13 @@ class QM9EDMModel(nn.Module):
             raise ValueError("mha_position_mode must be one of {'none', 'rope'}")
         if mha_position_mode == "rope" and attn_type != "mha":
             raise ValueError("mha_position_mode='rope' requires attn_type='mha'")
-        if coord_head_mode not in {"equivariant", "direct"}:
+        if coord_head_mode not in {"equivariant", "direct", "group_vector"}:
             raise ValueError(
-                "coord_head_mode must be one of {'equivariant', 'direct'}"
+                "coord_head_mode must be one of {'equivariant', 'direct', 'group_vector'}"
             )
+        if coord_head_mode == "group_vector":
+            if effective_hybrid_config is None or effective_hybrid_config.stream_type != "tetra":
+                raise ValueError("coord_head_mode='group_vector' requires attn_type='hybrid' with stream_type='tetra'")
         geometry_bias = None
         simplicial_geometry_bias = None
         effective_message_mode = (
@@ -398,6 +409,8 @@ class QM9EDMModel(nn.Module):
         self.simplicial_rope_on_values = str(simplicial_rope_on_values).lower().replace("-", "_")
         self.coord_embed_normalize = bool(coord_embed_normalize)
         self.coord_head_mode = coord_head_mode
+        self.attn_type = attn_type
+        self.hybrid_stream_type = effective_hybrid_config.stream_type if effective_hybrid_config is not None else "scalar"
         self.noise_conditioning = _canonicalize_noise_conditioning(
             noise_conditioning,
             concat_sigma_condition,
@@ -424,7 +437,7 @@ class QM9EDMModel(nn.Module):
                 d_model=d_model,
                 n_heads=n_heads,
                 n_layers=n_layers,
-                hybrid_config=hybrid_config,
+                hybrid_config=effective_hybrid_config,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 attn_dropout=attn_dropout,
@@ -473,7 +486,7 @@ class QM9EDMModel(nn.Module):
             )
             nn.init.zeros_(self.pair_head[-1].weight)
             nn.init.zeros_(self.pair_head[-1].bias)
-        else:
+        elif self.coord_head_mode == "direct":
             self.coord_head = nn.Sequential(
                 nn.LayerNorm(d_model),
                 nn.Linear(d_model, d_model),
@@ -482,6 +495,19 @@ class QM9EDMModel(nn.Module):
             )
             nn.init.zeros_(self.coord_head[-1].weight)
             nn.init.zeros_(self.coord_head[-1].bias)
+        else:
+            assert effective_hybrid_config is not None
+            group = PLATONIC_GROUPS[str(effective_hybrid_config.tetra.get("group", "tetrahedron")).lower()]
+            self.group_vector_head = nn.Sequential(
+                nn.LayerNorm(int(effective_hybrid_config.tetra_dim_per_frame)),
+                nn.Linear(int(effective_hybrid_config.tetra_dim_per_frame), d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 3),
+            )
+            nn.init.zeros_(self.group_vector_head[-1].weight)
+            nn.init.zeros_(self.group_vector_head[-1].bias)
+            self.group_vector_scale = nn.Parameter(torch.tensor(1.0))
+            self.register_buffer("_group_vector_rotations", group.elements, persistent=False)
 
         self.register_buffer(
             "_pair_rbf_centers",
@@ -544,6 +570,15 @@ class QM9EDMModel(nn.Module):
         coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
         return coord_delta.masked_fill(pad_mask[..., None], 0.0)
 
+    def _group_vector_coord_delta(self, group_out: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        local_vectors = self.group_vector_head(group_out)
+        rotations = self._group_vector_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+        global_vectors = torch.einsum("gij,bngi->bngj", rotations, local_vectors)
+        coord_delta = self.group_vector_scale.to(dtype=global_vectors.dtype) * global_vectors.mean(dim=2)
+        coord_delta = coord_delta.masked_fill(pad_mask[..., None], 0.0)
+        coord_delta = coord_delta - _masked_mean(coord_delta, pad_mask)
+        return coord_delta.masked_fill(pad_mask[..., None], 0.0)
+
     def forward(
         self,
         atom_noisy: torch.Tensor,
@@ -580,14 +615,29 @@ class QM9EDMModel(nn.Module):
             if self.conditioning is not None
             else None
         )
-        trunk_out = self.trunk(
-            token_features,
-            cond_emb,
-            pad_mask=pad_mask,
-            coords=coords_noisy,
-            lattice=lattice,
-            sigma=sigma,
-        )
+        if self.attn_type == "hybrid" and self.coord_head_mode == "group_vector":
+            trunk_result = self.trunk(
+                token_features,
+                cond_emb,
+                pad_mask=pad_mask,
+                coords=coords_noisy,
+                lattice=lattice,
+                sigma=sigma,
+                return_output=True,
+            )
+            assert isinstance(trunk_result, HybridTrunkOutput)
+            trunk_out = trunk_result.scalar
+            trunk_group = trunk_result.group
+        else:
+            trunk_out = self.trunk(
+                token_features,
+                cond_emb,
+                pad_mask=pad_mask,
+                coords=coords_noisy,
+                lattice=lattice,
+                sigma=sigma,
+            )
+            trunk_group = None
         atom_delta = self.atom_head(trunk_out)
         atom_delta = atom_delta.masked_fill(pad_mask[..., None], 0.0)
 
@@ -598,6 +648,10 @@ class QM9EDMModel(nn.Module):
                 lattice=lattice,
             )
             coord_delta = self._equivariant_coord_delta(trunk_out, geom_features, pad_mask)
-        else:
+        elif self.coord_head_mode == "direct":
             coord_delta = self._direct_coord_delta(trunk_out, pad_mask)
+        else:
+            if trunk_group is None:
+                raise RuntimeError("group_vector coordinate head requires tetra group trunk output")
+            coord_delta = self._group_vector_coord_delta(trunk_group[:, : coords_noisy.shape[1]], pad_mask)
         return atom_delta, coord_delta

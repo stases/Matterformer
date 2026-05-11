@@ -1197,6 +1197,8 @@ if __name__ == "__main__":
         choices=[
             "equivariant",
             "direct",
+            "group_vector",
+            "group-vector",
             "relative",
             "non_equivariant",
             "non-equivariant",

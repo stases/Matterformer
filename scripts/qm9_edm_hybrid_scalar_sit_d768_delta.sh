@@ -23,6 +23,7 @@ export BATCH_SIZE="${BATCH_SIZE:-64}"
 export MAX_STEPS="${MAX_STEPS:-250000}"
 export SAMPLE_BATCH_SIZE="${SAMPLE_BATCH_SIZE:-64}"
 export RUN_SLUG="${RUN_SLUG:-matterformer_qm9_scalar_sit_d768_l8}"
-export WANDB_GROUP="${WANDB_GROUP:-qm9_hybrid_sit_l8}"
+export COORD_HEAD_MODE="${COORD_HEAD_MODE:-equivariant}"
+export WANDB_GROUP="${WANDB_GROUP:-qm9_scalar_sit_l8}"
 
 exec "$REPO_ROOT/scripts/qm9_edm_hybrid_delta.sh"
