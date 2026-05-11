@@ -6,6 +6,7 @@ from torch import nn
 from matterformer.data.mof_bwdb import MOF_BLOCK_PAD_TOKEN, MOF_NUM_BLOCK_TYPES
 from matterformer.geometry.adapters import BaseGeometryAdapter, PeriodicGeometryAdapter
 from matterformer.models.embeddings import FourierCoordEmbedder, LatticeEmbedder, TimeEmbedder
+from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     SimplicialGeometryBias,
@@ -56,12 +57,14 @@ class MOFStage1EDMModel(nn.Module):
         lattice_embed_mode: str = "rff",
         lattice_rff_dim: int = 256,
         lattice_rff_sigma: float = 5.0,
+        hybrid_config: dict | HybridConfig | None = None,
     ) -> None:
         super().__init__()
         geometry_adapter = geometry_adapter or PeriodicGeometryAdapter(
             pbc_radius=pbc_radius,
             lattice_repr=lattice_repr,
         )
+        attn_type = attn_type.lower()
         simplicial_geom_mode = simplicial_geom_mode.lower()
         simplicial_message_mode = simplicial_message_mode.lower()
         coord_embed_mode = coord_embed_mode.lower().replace("-", "_")
@@ -89,17 +92,17 @@ class MOFStage1EDMModel(nn.Module):
             )
         if mha_position_mode not in {"none", "rope"}:
             raise ValueError("mha_position_mode must be one of {'none', 'rope'}")
-        if mha_position_mode == "rope" and attn_type.lower() != "mha":
+        if mha_position_mode == "rope" and attn_type != "mha":
             raise ValueError("mha_position_mode='rope' requires attn_type='mha'")
         geometry_bias = None
         simplicial_geometry_bias = None
         effective_message_mode = (
             simplicial_message_mode
-            if use_geometry_bias and attn_type.lower() == "simplicial"
+            if use_geometry_bias and attn_type == "simplicial"
             else "none"
         )
         if use_geometry_bias:
-            if attn_type.lower() == "simplicial":
+            if attn_type == "simplicial":
                 if simplicial_geom_mode != "none" or effective_message_mode != "none":
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
@@ -110,7 +113,7 @@ class MOFStage1EDMModel(nn.Module):
                         use_periodic_features=True,
                         use_noise_gate=True,
                     )
-            else:
+            elif attn_type == "mha":
                 geometry_bias = GeometryBiasBuilder(
                     n_heads=n_heads,
                     use_distance_bias=True,
@@ -151,25 +154,38 @@ class MOFStage1EDMModel(nn.Module):
         )
         self.segment_embedding = nn.Embedding(2, d_model)
         self.conditioning = TimeEmbedder(d_model)
-        self.trunk = TransformerTrunk(
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            attn_dropout=attn_dropout,
-            attn_type=attn_type,
-            simplicial_impl=simplicial_impl,
-            simplicial_precision=simplicial_precision,
-            simplicial_message_mode=effective_message_mode,
-            simplicial_message_rank=simplicial_message_rank,
-            geometry_adapter=geometry_adapter,
-            geometry_bias=geometry_bias,
-            simplicial_geometry_bias=simplicial_geometry_bias,
-            mha_position_mode=mha_position_mode,
-            mha_rope_freq_sigma=mha_rope_freq_sigma,
-            mha_rope_learned_freqs=mha_rope_learned_freqs,
-        )
+        if attn_type == "hybrid":
+            self.trunk = HybridTransformerTrunk(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                hybrid_config=hybrid_config,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                geometry_adapter=geometry_adapter,
+                use_adaln_conditioning=True,
+            )
+        else:
+            self.trunk = TransformerTrunk(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                attn_type=attn_type,
+                simplicial_impl=simplicial_impl,
+                simplicial_precision=simplicial_precision,
+                simplicial_message_mode=effective_message_mode,
+                simplicial_message_rank=simplicial_message_rank,
+                geometry_adapter=geometry_adapter,
+                geometry_bias=geometry_bias,
+                simplicial_geometry_bias=simplicial_geometry_bias,
+                mha_position_mode=mha_position_mode,
+                mha_rope_freq_sigma=mha_rope_freq_sigma,
+                mha_rope_learned_freqs=mha_rope_learned_freqs,
+            )
         self.coord_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),

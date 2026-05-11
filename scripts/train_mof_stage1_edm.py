@@ -973,7 +973,7 @@ if __name__ == "__main__":
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
-    parser.add_argument("--attn-type", type=str, default="simplicial", choices=["mha", "simplicial"])
+    parser.add_argument("--attn-type", type=str, default="simplicial", choices=["mha", "simplicial", "hybrid"])
     parser.add_argument(
         "--simplicial-geom-mode",
         type=str,

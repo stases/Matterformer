@@ -196,6 +196,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[EDMPreco
         noise_conditioning=model_args.get("noise_conditioning", None),
         concat_sigma_condition=bool(model_args.get("concat_sigma_condition", False)),
         charge_feature_scale=float(model_args.get("charge_feature_scale", 8.0)),
+        hybrid_config=model_args.get("hybrid_config", None),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
 

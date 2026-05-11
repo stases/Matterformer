@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import json
 import math
 from pathlib import Path
 import sys
@@ -32,6 +33,17 @@ def make_autocast_context(device: torch.device, enabled: bool):
     if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
+
+
+def load_hybrid_config(value: str | None) -> dict | None:
+    if value is None:
+        return None
+    candidate = Path(value).expanduser()
+    text = candidate.read_text() if candidate.is_file() else value
+    config = json.loads(text)
+    if not isinstance(config, dict):
+        raise ValueError("--hybrid-config-json must decode to a JSON object")
+    return config
 
 
 def evaluate_loss(
@@ -156,6 +168,7 @@ def maybe_configure_wandb(
                 "charge_feature_scale": args.charge_feature_scale,
                 "simplicial_impl": args.simplicial_impl,
                 "simplicial_precision": args.simplicial_precision,
+                "hybrid_config": args.hybrid_config,
                 "num_parameters": num_parameters,
                 "num_trainable_parameters": num_trainable_parameters,
             },
@@ -175,6 +188,11 @@ def maybe_configure_wandb(
             "ema": {
                 "decay": args.ema_decay,
                 "use_for_sampling": args.ema_use_for_sampling,
+            },
+            "training_guards": {
+                "skip_loss_threshold": args.skip_loss_threshold,
+                "skip_grad_norm_threshold": args.skip_grad_norm_threshold,
+                "max_consecutive_skipped_updates": args.max_consecutive_skipped_updates,
             },
             "diffusion": {
                 "sigma_data": args.sigma_data,
@@ -366,6 +384,7 @@ def log_sampling_metrics(
 def main(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = default_device()
+    args.hybrid_config = load_hybrid_config(args.hybrid_config_json)
 
     train_dataset = QM9Dataset(args.data_dir, split="train")
     val_dataset = QM9Dataset(args.data_dir, split="val")
@@ -431,6 +450,7 @@ def main(args: argparse.Namespace) -> None:
         charge_feature_scale=args.charge_feature_scale,
         norm_affine_when_no_adaln=args.norm_affine_when_no_adaln,
         use_final_norm=args.use_final_norm,
+        hybrid_config=args.hybrid_config,
     ).to(device)
     net = EDMPreconditioner(model, sigma_data=args.sigma_data).to(device)
     criterion = EDMLoss(
@@ -497,10 +517,28 @@ def main(args: argparse.Namespace) -> None:
         f"max_loss_weight={args.max_loss_weight}"
     )
     print(f"precision: bf16={args.bf16}")
+    if args.hybrid_config is not None:
+        print(f"hybrid_config: {args.hybrid_config}")
     print(
         "checkpointing: "
         f"save_checkpoint={args.save_checkpoint} output={args.output} "
         f"selector={args.best_checkpoint_selector}"
+    )
+    skip_loss_threshold = (
+        None
+        if args.skip_loss_threshold is None or args.skip_loss_threshold <= 0.0
+        else float(args.skip_loss_threshold)
+    )
+    skip_grad_norm_threshold = (
+        None
+        if args.skip_grad_norm_threshold is None or args.skip_grad_norm_threshold <= 0.0
+        else float(args.skip_grad_norm_threshold)
+    )
+    print(
+        "skip_guards: "
+        f"loss_threshold={skip_loss_threshold} "
+        f"grad_norm_threshold={skip_grad_norm_threshold} "
+        f"max_consecutive={args.max_consecutive_skipped_updates}"
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -520,6 +558,12 @@ def main(args: argparse.Namespace) -> None:
     global_step = 0
     last_full_val_step = -1
     last_full_val: tuple[float, float, float] | None = None
+    skipped_updates = 0
+    skipped_nonfinite_loss = 0
+    skipped_loss_threshold = 0
+    skipped_nonfinite_grad = 0
+    skipped_grad_threshold = 0
+    consecutive_skipped_updates = 0
     sampler_kwargs = sampler_kwargs_from_args(args)
     composite_weights = (
         args.checkpoint_molecule_stability_weight,
@@ -601,24 +645,115 @@ def main(args: argparse.Namespace) -> None:
                 break
             batch = batch.to(device)
             batch = apply_rotation_augmentation(batch, enabled=args.train_augm)
+            epoch_float = (epoch - 1) + batch_idx / max(batches_per_epoch, 1)
             with make_autocast_context(device, args.bf16):
                 loss, diagnostics = criterion(net, batch)
+            loss_value = float(loss.detach().float().item())
+            skip_reason = None
+            if not torch.isfinite(loss.detach()):
+                skip_reason = "nonfinite_loss"
+                skipped_nonfinite_loss += 1
+            elif skip_loss_threshold is not None and loss_value > skip_loss_threshold:
+                skip_reason = "loss_threshold"
+                skipped_loss_threshold += 1
+
+            if skip_reason is not None:
+                optimizer.zero_grad(set_to_none=True)
+                skipped_updates += 1
+                consecutive_skipped_updates += 1
+                if skipped_updates <= 10 or skipped_updates % 100 == 0:
+                    print(
+                        "skip_update: "
+                        f"reason={skip_reason} loss={loss_value:.6g} "
+                        f"global_step={global_step} epoch={epoch_float:.4f}"
+                    )
+                if run is not None:
+                    run.log(
+                        {
+                            "trainer/global_step": global_step,
+                            "trainer/epoch": epoch_float,
+                            "train/skipped_updates": skipped_updates,
+                            "train/skipped_nonfinite_loss": skipped_nonfinite_loss,
+                            "train/skipped_loss_threshold": skipped_loss_threshold,
+                            "train/skipped_nonfinite_grad": skipped_nonfinite_grad,
+                            "train/skipped_grad_threshold": skipped_grad_threshold,
+                            "train/skip_loss": loss_value,
+                            f"train/skip_reason/{skip_reason}": 1,
+                        },
+                        step=global_step,
+                    )
+                if (
+                    args.max_consecutive_skipped_updates > 0
+                    and consecutive_skipped_updates >= args.max_consecutive_skipped_updates
+                ):
+                    raise RuntimeError(
+                        "Exceeded max_consecutive_skipped_updates="
+                        f"{args.max_consecutive_skipped_updates}; last reason={skip_reason}"
+                    )
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+            grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+            skip_reason = None
+            if not math.isfinite(grad_norm_value):
+                skip_reason = "nonfinite_grad"
+                skipped_nonfinite_grad += 1
+            elif skip_grad_norm_threshold is not None and grad_norm_value > skip_grad_norm_threshold:
+                skip_reason = "grad_norm_threshold"
+                skipped_grad_threshold += 1
+
+            if skip_reason is not None:
+                optimizer.zero_grad(set_to_none=True)
+                skipped_updates += 1
+                consecutive_skipped_updates += 1
+                if skipped_updates <= 10 or skipped_updates % 100 == 0:
+                    print(
+                        "skip_update: "
+                        f"reason={skip_reason} loss={loss_value:.6g} "
+                        f"grad_norm={grad_norm_value:.6g} "
+                        f"global_step={global_step} epoch={epoch_float:.4f}"
+                    )
+                if run is not None:
+                    run.log(
+                        {
+                            "trainer/global_step": global_step,
+                            "trainer/epoch": epoch_float,
+                            "train/skipped_updates": skipped_updates,
+                            "train/skipped_nonfinite_loss": skipped_nonfinite_loss,
+                            "train/skipped_loss_threshold": skipped_loss_threshold,
+                            "train/skipped_nonfinite_grad": skipped_nonfinite_grad,
+                            "train/skipped_grad_threshold": skipped_grad_threshold,
+                            "train/skip_loss": loss_value,
+                            "train/skip_grad_norm": grad_norm_value,
+                            f"train/skip_reason/{skip_reason}": 1,
+                        },
+                        step=global_step,
+                    )
+                if (
+                    args.max_consecutive_skipped_updates > 0
+                    and consecutive_skipped_updates >= args.max_consecutive_skipped_updates
+                ):
+                    raise RuntimeError(
+                        "Exceeded max_consecutive_skipped_updates="
+                        f"{args.max_consecutive_skipped_updates}; last reason={skip_reason}"
+                    )
+                continue
+
             optimizer.step()
             scheduler.step()
             if ema is not None:
                 ema.update(model)
             global_step += 1
+            consecutive_skipped_updates = 0
 
             batch_size = int(batch.num_atoms.shape[0])
-            total_loss += loss.item() * batch_size
+            total_loss += loss_value * batch_size
             total_atom_loss += diagnostics["atom_loss"].mean().item() * batch_size
             total_coord_loss += diagnostics["coord_loss"].mean().item() * batch_size
             total_samples += batch_size
 
-            epoch_float = (epoch - 1) + batch_idx / max(batches_per_epoch, 1)
             lr = optimizer.param_groups[0]["lr"]
 
             if run is not None and args.log_every_steps > 0 and global_step % args.log_every_steps == 0:
@@ -626,7 +761,7 @@ def main(args: argparse.Namespace) -> None:
                     {
                         "trainer/global_step": global_step,
                         "trainer/epoch": epoch_float,
-                        "train/loss": loss.item(),
+                        "train/loss": loss_value,
                         "train/atom_loss": diagnostics["atom_loss"].mean().item(),
                         "train/coord_loss": diagnostics["coord_loss"].mean().item(),
                         "noise/sigma_mean": diagnostics["sigma"].mean().item(),
@@ -635,8 +770,13 @@ def main(args: argparse.Namespace) -> None:
                         "noise/log_sigma_over_4_std": diagnostics["log_sigma_over_4"].std(unbiased=False).item(),
                         "noise/loss_weight_mean": diagnostics["loss_weight"].mean().item(),
                         "noise/loss_weight_clamped_frac": diagnostics["loss_weight_clamped"].mean().item(),
-                        "optim/grad_norm": float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm),
+                        "optim/grad_norm": grad_norm_value,
                         "optim/lr": lr,
+                        "train/skipped_updates": skipped_updates,
+                        "train/skipped_nonfinite_loss": skipped_nonfinite_loss,
+                        "train/skipped_loss_threshold": skipped_loss_threshold,
+                        "train/skipped_nonfinite_grad": skipped_nonfinite_grad,
+                        "train/skipped_grad_threshold": skipped_grad_threshold,
                     },
                     step=global_step,
                 )
@@ -932,7 +1072,13 @@ if __name__ == "__main__":
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--attn-dropout", type=float, default=0.0)
-    parser.add_argument("--attn-type", type=str, default="simplicial", choices=["mha", "simplicial"])
+    parser.add_argument("--attn-type", type=str, default="simplicial", choices=["mha", "simplicial", "hybrid"])
+    parser.add_argument(
+        "--hybrid-config-json",
+        type=str,
+        default=None,
+        help="Path to a JSON HybridConfig object, or an inline JSON object, used when --attn-type hybrid.",
+    )
     parser.add_argument(
         "--simplicial-geom-mode",
         type=str,
@@ -1102,6 +1248,32 @@ if __name__ == "__main__":
     parser.add_argument("--ema-use-for-sampling", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--skip-loss-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Skip optimizer/scheduler/EMA updates when the scalar training loss exceeds this value. "
+            "Use a non-positive value or omit to disable finite-loss threshold skipping. "
+            "Non-finite losses are always skipped."
+        ),
+    )
+    parser.add_argument(
+        "--skip-grad-norm-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Skip optimizer/scheduler/EMA updates when the pre-clipping gradient norm exceeds this value. "
+            "Use a non-positive value or omit to disable finite-gradient threshold skipping. "
+            "Non-finite gradient norms are always skipped."
+        ),
+    )
+    parser.add_argument(
+        "--max-consecutive-skipped-updates",
+        type=int,
+        default=1000,
+        help="Abort if this many training batches are skipped in a row. Use <=0 to never abort on skip streaks.",
+    )
     parser.add_argument(
         "--best-checkpoint-selector",
         type=str,

@@ -1,0 +1,40 @@
+{
+  "num_blocks": 19,
+  "block_mix": [0, 0, 1],
+  "order_policy": "local_then_global",
+  "branch_mode": "scalar_only",
+  "scalar_dim": 768,
+  "tetra_dim_per_frame": 16,
+  "d_model_total": 768,
+  "trivial": {
+    "target": "scalar",
+    "attention": {
+      "kind": "matterformer_mha",
+      "num_heads": 12,
+      "position_encoding": "edge_delta_bias",
+      "mha_position_mode": "rope",
+      "mha_rope_freq_sigma": 4.0,
+      "mha_rope_learned_freqs": true,
+      "mha_rope_use_key": false,
+      "mha_rope_on_values": true,
+      "pair_hidden_dim": 128,
+      "pair_n_rbf": 16,
+      "pair_rbf_max": 4.0
+    },
+    "ffn": {
+      "ffn_mult": 4
+    }
+  },
+  "coupling": {
+    "scalar_to_group": {
+      "enabled": false,
+      "gate_init": 0.0
+    },
+    "group_to_scalar": {
+      "enabled": false,
+      "gate_init": 0.0
+    },
+    "after_each_tetra": false,
+    "after_each_macro_block": false
+  }
+}

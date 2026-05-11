@@ -6,6 +6,7 @@ from torch import nn
 from matterformer.data.qm9 import QM9_ATOM_PAD_TOKEN, QM9_NUM_ATOM_TYPES
 from matterformer.geometry.adapters import BaseGeometryAdapter, NonPeriodicGeometryAdapter
 from matterformer.models.embeddings import FourierCoordEmbedder, TimeEmbedder
+from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk
 from matterformer.models.transformer import (
     GeometryBiasBuilder,
     LearnedNullConditioning,
@@ -265,6 +266,15 @@ class QM9EDMModel(nn.Module):
         simplicial_message_mode: str = "none",
         simplicial_message_rank: int = 16,
         simplicial_content_logits: str = "on",
+        simplicial_position_mode: str = "none",
+        simplicial_rope_key_mode: str = "constant",
+        simplicial_rope_n_freqs: int = 16,
+        simplicial_rope_freq_sigma: float = 1.0,
+        simplicial_rope_learned_freqs: bool = False,
+        simplicial_rope_gate: str = "none",
+        simplicial_rope_value_n_freqs: int | None = None,
+        simplicial_rope_value_scale_init: float = 1.0,
+        simplicial_rope_on_values: str = "none",
         mha_geom_bias_mode: str = "standard",
         mha_position_mode: str = "none",
         mha_rope_freq_sigma: float = 1.0,
@@ -287,9 +297,11 @@ class QM9EDMModel(nn.Module):
         pair_rbf_max: float = 4.0,
         norm_affine_when_no_adaln: bool = False,
         use_final_norm: bool = True,
+        hybrid_config: dict | HybridConfig | None = None,
     ) -> None:
         super().__init__()
         geometry_adapter = geometry_adapter or NonPeriodicGeometryAdapter()
+        attn_type = attn_type.lower()
         simplicial_geom_mode = simplicial_geom_mode.lower()
         simplicial_message_mode = simplicial_message_mode.lower()
         mha_geom_bias_mode = mha_geom_bias_mode.lower()
@@ -327,7 +339,7 @@ class QM9EDMModel(nn.Module):
             )
         if mha_position_mode not in {"none", "rope"}:
             raise ValueError("mha_position_mode must be one of {'none', 'rope'}")
-        if mha_position_mode == "rope" and attn_type.lower() != "mha":
+        if mha_position_mode == "rope" and attn_type != "mha":
             raise ValueError("mha_position_mode='rope' requires attn_type='mha'")
         if coord_head_mode not in {"equivariant", "direct"}:
             raise ValueError(
@@ -337,11 +349,11 @@ class QM9EDMModel(nn.Module):
         simplicial_geometry_bias = None
         effective_message_mode = (
             simplicial_message_mode
-            if use_geometry_bias and attn_type.lower() == "simplicial"
+            if use_geometry_bias and attn_type == "simplicial"
             else "none"
         )
         if use_geometry_bias:
-            if attn_type.lower() == "simplicial":
+            if attn_type == "simplicial":
                 if simplicial_geom_mode != "none" or effective_message_mode != "none":
                     simplicial_geometry_bias = SimplicialGeometryBias(
                         n_heads=n_heads,
@@ -352,7 +364,7 @@ class QM9EDMModel(nn.Module):
                         use_periodic_features=geometry_adapter.geometry_kind == "periodic",
                         use_noise_gate=True,
                     )
-            else:
+            elif attn_type == "mha":
                 if mha_geom_bias_mode == "factorized_marginal":
                     geometry_bias = MhaFactorizedGeometryBias(
                         n_heads=n_heads,
@@ -373,6 +385,17 @@ class QM9EDMModel(nn.Module):
         self.coord_embed_mode = coord_embed_mode
         self.mha_position_mode = mha_position_mode
         self.simplicial_content_logits = str(simplicial_content_logits).lower().replace("-", "_")
+        self.simplicial_position_mode = str(simplicial_position_mode).lower().replace("-", "_")
+        self.simplicial_rope_key_mode = str(simplicial_rope_key_mode).lower().replace("-", "_")
+        self.simplicial_rope_n_freqs = int(simplicial_rope_n_freqs)
+        self.simplicial_rope_freq_sigma = float(simplicial_rope_freq_sigma)
+        self.simplicial_rope_learned_freqs = bool(simplicial_rope_learned_freqs)
+        self.simplicial_rope_gate = str(simplicial_rope_gate).lower().replace("-", "_")
+        self.simplicial_rope_value_n_freqs = (
+            None if simplicial_rope_value_n_freqs is None else int(simplicial_rope_value_n_freqs)
+        )
+        self.simplicial_rope_value_scale_init = float(simplicial_rope_value_scale_init)
+        self.simplicial_rope_on_values = str(simplicial_rope_on_values).lower().replace("-", "_")
         self.coord_embed_normalize = bool(coord_embed_normalize)
         self.coord_head_mode = coord_head_mode
         self.noise_conditioning = _canonicalize_noise_conditioning(
@@ -396,31 +419,46 @@ class QM9EDMModel(nn.Module):
             else None
         )
         self.conditioning = TimeEmbedder(d_model) if self.use_adaln_conditioning else None
-        self.trunk = TransformerTrunk(
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            attn_dropout=attn_dropout,
-            attn_type=attn_type,
-            simplicial_impl=simplicial_impl,
-            simplicial_precision=simplicial_precision,
-            simplicial_message_mode=effective_message_mode,
-            simplicial_message_rank=simplicial_message_rank,
-            simplicial_content_logits=simplicial_content_logits,
-            geometry_adapter=geometry_adapter,
-            geometry_bias=geometry_bias,
-            simplicial_geometry_bias=simplicial_geometry_bias,
-            mha_position_mode=mha_position_mode,
-            mha_rope_freq_sigma=mha_rope_freq_sigma,
-            mha_rope_learned_freqs=mha_rope_learned_freqs,
-            mha_rope_use_key=mha_rope_use_key,
-            mha_rope_on_values=mha_rope_on_values,
-            use_adaln_conditioning=self.use_adaln_conditioning,
-            norm_affine_when_no_adaln=norm_affine_when_no_adaln,
-            use_final_norm=use_final_norm,
-        )
+        if attn_type == "hybrid":
+            self.trunk = HybridTransformerTrunk(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                hybrid_config=hybrid_config,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                geometry_adapter=geometry_adapter,
+                use_adaln_conditioning=self.use_adaln_conditioning,
+                norm_affine_when_no_adaln=norm_affine_when_no_adaln,
+                use_final_norm=use_final_norm,
+            )
+        else:
+            self.trunk = TransformerTrunk(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_layers=n_layers,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                attn_type=attn_type,
+                simplicial_impl=simplicial_impl,
+                simplicial_precision=simplicial_precision,
+                simplicial_message_mode=effective_message_mode,
+                simplicial_message_rank=simplicial_message_rank,
+                simplicial_content_logits=simplicial_content_logits,
+                geometry_adapter=geometry_adapter,
+                geometry_bias=geometry_bias,
+                simplicial_geometry_bias=simplicial_geometry_bias,
+                mha_position_mode=mha_position_mode,
+                mha_rope_freq_sigma=mha_rope_freq_sigma,
+                mha_rope_learned_freqs=mha_rope_learned_freqs,
+                mha_rope_use_key=mha_rope_use_key,
+                mha_rope_on_values=mha_rope_on_values,
+                use_adaln_conditioning=self.use_adaln_conditioning,
+                norm_affine_when_no_adaln=norm_affine_when_no_adaln,
+                use_final_norm=use_final_norm,
+            )
         self.atom_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),

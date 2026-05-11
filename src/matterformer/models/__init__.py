@@ -15,6 +15,22 @@ from matterformer.models.embeddings import (
 )
 from matterformer.models.heads import CrystalHeads
 from matterformer.models.geom_drugs import GeomDrugsEDMModel
+from matterformer.models.hybrid import (
+    CompactSimplicialBias,
+    CompactSimplicialAttention,
+    CompactSimplicialGeometryBias,
+    GeometryCache,
+    HybridBlock,
+    HybridConfig,
+    HybridTransformerTrunk,
+    ModelState,
+    TetraPlatonicGlobalLayer,
+    TrivialGlobalLayer,
+    build_geometry_cache,
+    compact_simplicial_attention_torch,
+    compact_simplicial_attention_triton,
+    expand_hybrid_schedule,
+)
 from matterformer.models.mof_stage1 import MOFStage1EDMModel
 from matterformer.models.qm9 import QM9EDMModel, QM9RegressionModel
 from matterformer.models.regular_attention import (
@@ -37,7 +53,14 @@ __all__ = [
     "CrystalHeads",
     "FourierCoordEmbedder",
     "GeomDrugsEDMModel",
+    "CompactSimplicialAttention",
+    "CompactSimplicialBias",
+    "CompactSimplicialGeometryBias",
     "MOFStage1EDMModel",
+    "GeometryCache",
+    "HybridBlock",
+    "HybridConfig",
+    "HybridTransformerTrunk",
     "LatticeEmbedder",
     "MaskEmbedder",
     "MhaFactorizedGeometryBias",
@@ -53,8 +76,15 @@ __all__ = [
     "SimplicialGeometryBias",
     "SimplicialLowRankAngleResidual",
     "SimplicialLowRankMessageResidual",
+    "ModelState",
+    "TetraPlatonicGlobalLayer",
     "TimeEmbedder",
     "TransformerTrunk",
+    "TrivialGlobalLayer",
     "TokenEmbedder",
     "TwoSimplicialAttention",
+    "build_geometry_cache",
+    "compact_simplicial_attention_torch",
+    "compact_simplicial_attention_triton",
+    "expand_hybrid_schedule",
 ]
