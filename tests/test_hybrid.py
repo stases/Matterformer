@@ -961,6 +961,95 @@ def test_scalar_compact_spherical_coefficients_triton_match_expanded_cuda():
 
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
+    reason="scalar compact Triton natural coefficient layout parity requires CUDA and Triton",
+)
+def test_scalar_compact_simplicial_triton_natural_coeffs_head_gates_bnhd_cuda():
+    torch.manual_seed(27)
+    device = torch.device("cuda")
+    batch_size, num_heads, num_tokens, k_neighbors, head_dim = 2, 3, 8, 4, 16
+    channels_by_l = (2, 3, 1)
+    angle_rank = channels_by_l[0] + 3 * channels_by_l[1] + 5 * channels_by_l[2]
+    coeff_dim = sum(channels_by_l)
+    kwargs = {"device": device, "dtype": torch.float32, "requires_grad": True}
+    tensors = [torch.randn(batch_size, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+    base_idx = torch.arange(num_tokens, device=device)[:, None]
+    offsets = torch.arange(k_neighbors, device=device)[None, :]
+    neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.25).contiguous()
+    neighbor_mask[..., 0] = True
+    neighbor_mask[0, 0, :] = False
+    unit = torch.randn(batch_size, num_tokens, k_neighbors, 3, device=device, dtype=torch.float32)
+    unit = torch.nn.functional.normalize(unit, dim=-1)
+    unit = unit.masked_fill(~neighbor_mask[..., None], 0.0)
+    bias_tensors = [
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(num_heads, **kwargs),
+        torch.randn(batch_size, num_tokens, k_neighbors, num_heads, coeff_dim, **kwargs),
+        torch.randn(batch_size, num_tokens, k_neighbors, num_heads, coeff_dim, **kwargs),
+        torch.randn(num_heads, **kwargs),
+    ]
+    ref_tensors = [_clone_leaf(t) for t in tensors]
+    tri_tensors = [_clone_leaf(t) for t in tensors]
+    ref_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    tri_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    ref_bias = CompactSimplicialBias(
+        u=ref_bias_tensors[0],
+        v=ref_bias_tensors[1],
+        gate=ref_bias_tensors[2],
+        angle_left_coeff=ref_bias_tensors[3],
+        angle_right_coeff=ref_bias_tensors[4],
+        angle_channels_by_l=channels_by_l,
+        angle_rank=angle_rank,
+        angle_gate=ref_bias_tensors[5],
+    )
+    tri_bias = CompactSimplicialBias(
+        u=tri_bias_tensors[0],
+        v=tri_bias_tensors[1],
+        gate=tri_bias_tensors[2],
+        angle_left_coeff=tri_bias_tensors[3],
+        angle_right_coeff=tri_bias_tensors[4],
+        angle_channels_by_l=channels_by_l,
+        angle_rank=angle_rank,
+        angle_gate=tri_bias_tensors[5],
+    )
+    ref = compact_simplicial_attention_torch(
+        *ref_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=ref_bias,
+        unit=unit,
+    )
+    actual_bnhd = compact_simplicial_attention_triton(
+        *tri_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=tri_bias,
+        unit=unit,
+        precision="ieee_fp32",
+        strict=True,
+        output_layout="bnhd",
+    )
+    assert actual_bnhd.shape == (batch_size, num_tokens, num_heads, head_dim)
+    actual = actual_bnhd.transpose(1, 2)
+    assert torch.allclose(actual, ref, atol=5e-4, rtol=5e-4)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    actual_bnhd.backward(grad.transpose(1, 2).contiguous())
+    for actual_tensor, ref_tensor in zip(tri_tensors + tri_bias_tensors, ref_tensors + ref_bias_tensors):
+        assert actual_tensor.grad is not None
+        assert ref_tensor.grad is not None
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
+    invalid_coeff_mask = ~neighbor_mask[:, :, :, None, None]
+    left_invalid_grad = tri_bias_tensors[3].grad.masked_select(invalid_coeff_mask.expand_as(tri_bias_tensors[3]))
+    right_invalid_grad = tri_bias_tensors[4].grad.masked_select(invalid_coeff_mask.expand_as(tri_bias_tensors[4]))
+    assert torch.allclose(left_invalid_grad, torch.zeros_like(left_invalid_grad), atol=1e-6, rtol=0.0)
+    assert torch.allclose(right_invalid_grad, torch.zeros_like(right_invalid_grad), atol=1e-6, rtol=0.0)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
     reason="scalar compact Triton variable-N parity requires CUDA and Triton",
 )
 def test_scalar_compact_simplicial_triton_accepts_variable_num_atoms_cuda():

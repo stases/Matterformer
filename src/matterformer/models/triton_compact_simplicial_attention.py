@@ -76,6 +76,70 @@ def _gather_neighbor_heads(values: torch.Tensor, neighbor_idx: torch.Tensor) -> 
     return torch.gather(source, dim=3, index=idx)
 
 
+def _gate_for_scores_torch(gate: torch.Tensor, *, num_heads: int) -> torch.Tensor:
+    if gate.ndim == 1:
+        if gate.shape[0] != num_heads:
+            raise ValueError(f"per-head gate has {gate.shape[0]} heads, expected {num_heads}")
+        return gate.view(1, num_heads, 1, 1, 1).float()
+    if gate.ndim == 3:
+        if gate.shape[1] != num_heads:
+            raise ValueError(f"gate has {gate.shape[1]} heads, expected {num_heads}")
+        return gate[:, :, :, None, None].float()
+    raise ValueError(f"gate must be [H] or [B,H,N], got shape {tuple(gate.shape)}")
+
+
+def _compact_angle_coefficients_as_bhnkc(
+    *,
+    unit: torch.Tensor,
+    angle_left_coeff: torch.Tensor,
+    angle_right_coeff: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_atoms, k_neighbors, _ = unit.shape
+    if angle_left_coeff.shape != angle_right_coeff.shape:
+        raise ValueError(
+            "compact angle coefficient tensors must have matching shapes, got "
+            f"{tuple(angle_left_coeff.shape)} and {tuple(angle_right_coeff.shape)}"
+        )
+    if angle_left_coeff.ndim != 5:
+        raise ValueError(f"compact angle coefficients must be rank-5, got {tuple(angle_left_coeff.shape)}")
+    if angle_left_coeff.shape[0] != batch_size:
+        raise ValueError(
+            f"compact angle coefficient batch dim {angle_left_coeff.shape[0]} does not match {batch_size}"
+        )
+    if angle_left_coeff.shape[2] == num_atoms and angle_left_coeff.shape[3] == k_neighbors:
+        return angle_left_coeff, angle_right_coeff
+    if angle_left_coeff.shape[1] == num_atoms and angle_left_coeff.shape[2] == k_neighbors:
+        return angle_left_coeff.permute(0, 3, 1, 2, 4), angle_right_coeff.permute(0, 3, 1, 2, 4)
+    raise ValueError(
+        "compact angle coefficients must be [B,H,N,K,C] or [B,N,K,H,C], got "
+        f"{tuple(angle_left_coeff.shape)} for unit shape {tuple(unit.shape)}"
+    )
+
+
+def _compact_angle_coeff_canonical_strides(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    num_heads: int,
+    num_atoms: int,
+    k_neighbors: int,
+) -> tuple[int, int, int, int, int]:
+    if tensor.numel() == 0:
+        return (0, 0, 0, 0, 0)
+    if tensor.ndim != 5:
+        raise ValueError(f"compact angle coefficients must be rank-5, got {tuple(tensor.shape)}")
+    if tensor.shape[0] != batch_size:
+        raise ValueError(f"compact angle coefficient batch dim {tensor.shape[0]} does not match {batch_size}")
+    if tensor.shape[1] == num_heads and tensor.shape[2] == num_atoms and tensor.shape[3] == k_neighbors:
+        return (tensor.stride(0), tensor.stride(2), tensor.stride(3), tensor.stride(1), tensor.stride(4))
+    if tensor.shape[1] == num_atoms and tensor.shape[2] == k_neighbors and tensor.shape[3] == num_heads:
+        return (tensor.stride(0), tensor.stride(1), tensor.stride(2), tensor.stride(3), tensor.stride(4))
+    raise ValueError(
+        "compact angle coefficients must be [B,H,N,K,C] or [B,N,K,H,C], got "
+        f"{tuple(tensor.shape)} for B={batch_size}, H={num_heads}, N={num_atoms}, K={k_neighbors}"
+    )
+
+
 def _compact_angle_from_coefficients_torch(
     *,
     unit: torch.Tensor,
@@ -84,6 +148,11 @@ def _compact_angle_from_coefficients_torch(
     angle_channels_by_l: tuple[int, int, int],
     angle_rank: int,
 ) -> torch.Tensor:
+    angle_left_coeff, angle_right_coeff = _compact_angle_coefficients_as_bhnkc(
+        unit=unit,
+        angle_left_coeff=angle_left_coeff,
+        angle_right_coeff=angle_right_coeff,
+    )
     c0, c1, c2 = (int(v) for v in angle_channels_by_l)
     if c0 + c1 + c2 != int(angle_left_coeff.shape[-1]):
         raise ValueError(
@@ -147,18 +216,18 @@ def compact_simplicial_attention_torch_reference(
     q_eff = q * float(q_scale)
     scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q_eff, k1_n, k2_n).float()
     if u is not None and v_bias is not None and gate is not None:
-        scores = scores + gate[:, :, :, None, None].float() * (
+        scores = scores + _gate_for_scores_torch(gate, num_heads=q.shape[1]) * (
             u[:, :, :, :, None].float() + v_bias[:, :, :, None, :].float()
         )
     if angle_left is not None and angle_right is not None:
-        local_angle_gate = 1.0 if angle_gate is None else angle_gate[:, :, :, None, None].float()
+        local_angle_gate = 1.0 if angle_gate is None else _gate_for_scores_torch(angle_gate, num_heads=q.shape[1])
         angle = torch.einsum("bhnjr,bhnkr->bhnjk", angle_left.float(), angle_right.float())
         scores = scores + local_angle_gate * angle * (angle_left.shape[-1] ** -0.5)
     if angle_left_coeff is not None or angle_right_coeff is not None:
         if unit is None or angle_left_coeff is None or angle_right_coeff is None or angle_channels_by_l is None:
             raise ValueError("compact angle coefficients require unit, both coefficient tensors, and angle_channels_by_l")
         local_rank = int(angle_rank or (angle_channels_by_l[0] + 3 * angle_channels_by_l[1] + 5 * angle_channels_by_l[2]))
-        local_angle_gate = 1.0 if angle_gate is None else angle_gate[:, :, :, None, None].float()
+        local_angle_gate = 1.0 if angle_gate is None else _gate_for_scores_torch(angle_gate, num_heads=q.shape[1])
         angle = _compact_angle_from_coefficients_torch(
             unit=unit,
             angle_left_coeff=angle_left_coeff,
@@ -234,6 +303,16 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         v2_stride_h,
         v2_stride_n,
         v2_stride_d,
+        angle_left_coeff_stride_b,
+        angle_left_coeff_stride_n,
+        angle_left_coeff_stride_k,
+        angle_left_coeff_stride_h,
+        angle_left_coeff_stride_c,
+        angle_right_coeff_stride_b,
+        angle_right_coeff_stride_n,
+        angle_right_coeff_stride_k,
+        angle_right_coeff_stride_h,
+        angle_right_coeff_stride_c,
         head_dim: tl.constexpr,
         k_neighbors: tl.constexpr,
         angle_rank: tl.constexpr,
@@ -242,6 +321,9 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         HAS_ANGLE: tl.constexpr,
         HAS_COMPACT_ANGLE: tl.constexpr,
         HAS_MESSAGE: tl.constexpr,
+        GATE_HEAD_ONLY: tl.constexpr,
+        ANGLE_GATE_HEAD_ONLY: tl.constexpr,
+        OUTPUT_LAYOUT_BNHD: tl.constexpr,
         ANGLE_C0: tl.constexpr,
         ANGLE_C1: tl.constexpr,
         ANGLE_C2: tl.constexpr,
@@ -323,7 +405,10 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             bias_base = (bh_idx * num_atoms + atom_idx) * k_neighbors
             u = tl.load(u_ptr + bias_base + offs_k, mask=k_mask, other=0.0).to(tl.float32)
             vb = tl.load(v_bias_ptr + bias_base + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-            gate = tl.load(gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if GATE_HEAD_ONLY:
+                gate = tl.load(gate_ptr + head_idx).to(tl.float32)
+            else:
+                gate = tl.load(gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += gate * (u[:, None] + vb[None, :])
 
         if HAS_ANGLE:
@@ -340,7 +425,10 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             angle = tl.dot(left, tl.trans(right), input_precision=INPUT_PRECISION) * tl.rsqrt(angle_rank + 0.0)
-            agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if ANGLE_GATE_HEAD_ONLY:
+                agate = tl.load(angle_gate_ptr + head_idx).to(tl.float32)
+            else:
+                agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += agate * angle
 
         if HAS_COMPACT_ANGLE:
@@ -350,17 +438,32 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             uz = tl.load(unit_ptr + unit_base + 2, mask=k_mask, other=0.0).to(tl.float32)
             cos = ux[:, None] * ux[None, :] + uy[:, None] * uy[None, :] + uz[:, None] * uz[None, :]
             p2 = 0.5 * (3.0 * cos * cos - 1.0)
-            coeff_base = ((bh_idx * num_atoms + atom_idx) * k_neighbors) * ANGLE_COEFFS
+            left_coeff_base = (
+                batch_idx * angle_left_coeff_stride_b
+                + atom_idx * angle_left_coeff_stride_n
+                + head_idx * angle_left_coeff_stride_h
+            )
+            right_coeff_base = (
+                batch_idx * angle_right_coeff_stride_b
+                + atom_idx * angle_right_coeff_stride_n
+                + head_idx * angle_right_coeff_stride_h
+            )
             angle_unscaled = tl.zeros((BLOCK_K, BLOCK_K), dtype=tl.float32)
             if ANGLE_C0 > 0:
                 c_mask = offs_c < ANGLE_C0
                 left0 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + offs_c[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right0 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + offs_c[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
@@ -369,12 +472,18 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 c_mask = offs_c < ANGLE_C1
                 c_offs = ANGLE_C0 + offs_c
                 left1 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + c_offs[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right1 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + c_offs[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
@@ -383,18 +492,27 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 c_mask = offs_c < ANGLE_C2
                 c_offs = ANGLE_C0 + ANGLE_C1 + offs_c
                 left2 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + c_offs[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right2 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + c_offs[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 angle_unscaled += tl.dot(left2, tl.trans(right2), input_precision=INPUT_PRECISION) * p2
             angle = angle_unscaled * tl.rsqrt(angle_rank + 0.0)
-            agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if ANGLE_GATE_HEAD_ONLY:
+                agate = tl.load(angle_gate_ptr + head_idx).to(tl.float32)
+            else:
+                agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += agate * angle
 
         pair_valid = valid[:, None] & valid[None, :]
@@ -437,7 +555,11 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             out += tl.sum(coeff[:, None] * basis, axis=0)
 
         out = tl.where(has_valid, out, 0.0)
-        tl.store(out_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, out, mask=d_mask)
+        if OUTPUT_LAYOUT_BNHD:
+            out_offset = ((batch_idx * num_atoms + atom_idx) * num_heads + head_idx) * head_dim
+        else:
+            out_offset = (bh_idx * num_atoms + atom_idx) * head_dim
+        tl.store(out_ptr + out_offset + offs_d, out, mask=d_mask)
         lse = tl.where(has_valid, row_max + tl.log(denom), 0.0)
         tl.store(lse_ptr + bh_idx * num_atoms + atom_idx, lse)
 
@@ -504,6 +626,26 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         v2_stride_h,
         v2_stride_n,
         v2_stride_d,
+        angle_left_coeff_stride_b,
+        angle_left_coeff_stride_n,
+        angle_left_coeff_stride_k,
+        angle_left_coeff_stride_h,
+        angle_left_coeff_stride_c,
+        angle_right_coeff_stride_b,
+        angle_right_coeff_stride_n,
+        angle_right_coeff_stride_k,
+        angle_right_coeff_stride_h,
+        angle_right_coeff_stride_c,
+        dangle_left_coeff_stride_b,
+        dangle_left_coeff_stride_n,
+        dangle_left_coeff_stride_k,
+        dangle_left_coeff_stride_h,
+        dangle_left_coeff_stride_c,
+        dangle_right_coeff_stride_b,
+        dangle_right_coeff_stride_n,
+        dangle_right_coeff_stride_k,
+        dangle_right_coeff_stride_h,
+        dangle_right_coeff_stride_c,
         head_dim: tl.constexpr,
         k_neighbors: tl.constexpr,
         angle_rank: tl.constexpr,
@@ -512,6 +654,9 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         HAS_ANGLE: tl.constexpr,
         HAS_COMPACT_ANGLE: tl.constexpr,
         HAS_MESSAGE: tl.constexpr,
+        GATE_HEAD_ONLY: tl.constexpr,
+        ANGLE_GATE_HEAD_ONLY: tl.constexpr,
+        OUTPUT_LAYOUT_BNHD: tl.constexpr,
         ANGLE_C0: tl.constexpr,
         ANGLE_C1: tl.constexpr,
         ANGLE_C2: tl.constexpr,
@@ -550,8 +695,12 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             other=0.0,
         )
         q = q * q_scale
-        go = tl.load(grad_out_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        out = tl.load(out_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        if OUTPUT_LAYOUT_BNHD:
+            out_offset = ((batch_idx * num_atoms + atom_idx) * num_heads + head_idx) * head_dim
+        else:
+            out_offset = (bh_idx * num_atoms + atom_idx) * head_dim
+        go = tl.load(grad_out_ptr + out_offset + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        out = tl.load(out_ptr + out_offset + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lse = tl.load(lse_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
 
         k1 = tl.load(
@@ -604,7 +753,10 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             bias_base = (bh_idx * num_atoms + atom_idx) * k_neighbors
             u = tl.load(u_ptr + bias_base + offs_k, mask=k_mask, other=0.0).to(tl.float32)
             vb = tl.load(v_bias_ptr + bias_base + offs_k, mask=k_mask, other=0.0).to(tl.float32)
-            gate = tl.load(gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if GATE_HEAD_ONLY:
+                gate = tl.load(gate_ptr + head_idx).to(tl.float32)
+            else:
+                gate = tl.load(gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += gate * (u[:, None] + vb[None, :])
 
         angle = tl.zeros((BLOCK_K, BLOCK_K), dtype=tl.float32)
@@ -633,7 +785,10 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             angle = tl.dot(left, tl.trans(right), input_precision=INPUT_PRECISION) * tl.rsqrt(angle_rank + 0.0)
-            agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if ANGLE_GATE_HEAD_ONLY:
+                agate = tl.load(angle_gate_ptr + head_idx).to(tl.float32)
+            else:
+                agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += agate * angle
 
         if HAS_COMPACT_ANGLE:
@@ -643,17 +798,32 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             uz = tl.load(unit_ptr + unit_base + 2, mask=k_mask, other=0.0).to(tl.float32)
             compact_cos = ux[:, None] * ux[None, :] + uy[:, None] * uy[None, :] + uz[:, None] * uz[None, :]
             compact_p2 = 0.5 * (3.0 * compact_cos * compact_cos - 1.0)
-            coeff_base = ((bh_idx * num_atoms + atom_idx) * k_neighbors) * ANGLE_COEFFS
+            left_coeff_base = (
+                batch_idx * angle_left_coeff_stride_b
+                + atom_idx * angle_left_coeff_stride_n
+                + head_idx * angle_left_coeff_stride_h
+            )
+            right_coeff_base = (
+                batch_idx * angle_right_coeff_stride_b
+                + atom_idx * angle_right_coeff_stride_n
+                + head_idx * angle_right_coeff_stride_h
+            )
             angle_unscaled = tl.zeros((BLOCK_K, BLOCK_K), dtype=tl.float32)
             if ANGLE_C0 > 0:
                 c_mask = offs_c < ANGLE_C0
                 left0 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + offs_c[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right0 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + offs_c[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
@@ -662,12 +832,18 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 c_mask = offs_c < ANGLE_C1
                 c_offs = ANGLE_C0 + offs_c
                 left1 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + c_offs[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right1 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + c_offs[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
@@ -676,18 +852,27 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 c_mask = offs_c < ANGLE_C2
                 c_offs = ANGLE_C0 + ANGLE_C1 + offs_c
                 left2 = tl.load(
-                    angle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_left_coeff_ptr
+                    + left_coeff_base
+                    + offs_k[:, None] * angle_left_coeff_stride_k
+                    + c_offs[None, :] * angle_left_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 right2 = tl.load(
-                    angle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    angle_right_coeff_ptr
+                    + right_coeff_base
+                    + offs_k[:, None] * angle_right_coeff_stride_k
+                    + c_offs[None, :] * angle_right_coeff_stride_c,
                     mask=valid[:, None] & c_mask[None, :],
                     other=0.0,
                 ).to(tl.float32)
                 angle_unscaled += tl.dot(left2, tl.trans(right2), input_precision=INPUT_PRECISION) * compact_p2
             angle = angle_unscaled * tl.rsqrt(angle_rank + 0.0)
-            agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
+            if ANGLE_GATE_HEAD_ONLY:
+                agate = tl.load(angle_gate_ptr + head_idx).to(tl.float32)
+            else:
+                agate = tl.load(angle_gate_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
             score += agate * angle
 
         pair_valid = valid[:, None] & valid[None, :]
@@ -788,7 +973,10 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             dgate = tl.sum(tl.sum(ds * (u[:, None] + vb[None, :]), axis=0), axis=0)
             tl.store(du_ptr + bias_base + offs_k, du, mask=k_mask)
             tl.store(dv_bias_ptr + bias_base + offs_k, dvb, mask=k_mask)
-            tl.store(dgate_ptr + bh_idx * num_atoms + atom_idx, dgate)
+            if GATE_HEAD_ONLY:
+                tl.atomic_add(dgate_ptr + head_idx, dgate, sem="relaxed")
+            else:
+                tl.store(dgate_ptr + bh_idx * num_atoms + atom_idx, dgate)
 
         if HAS_ANGLE:
             r_mask = offs_r < angle_rank
@@ -807,10 +995,22 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 dright,
                 mask=k_mask[:, None] & r_mask[None, :],
             )
-            tl.store(dangle_gate_ptr + bh_idx * num_atoms + atom_idx, dangle_gate)
+            if ANGLE_GATE_HEAD_ONLY:
+                tl.atomic_add(dangle_gate_ptr + head_idx, dangle_gate, sem="relaxed")
+            else:
+                tl.store(dangle_gate_ptr + bh_idx * num_atoms + atom_idx, dangle_gate)
 
         if HAS_COMPACT_ANGLE:
-            coeff_base = ((bh_idx * num_atoms + atom_idx) * k_neighbors) * ANGLE_COEFFS
+            dleft_coeff_base = (
+                batch_idx * dangle_left_coeff_stride_b
+                + atom_idx * dangle_left_coeff_stride_n
+                + head_idx * dangle_left_coeff_stride_h
+            )
+            dright_coeff_base = (
+                batch_idx * dangle_right_coeff_stride_b
+                + atom_idx * dangle_right_coeff_stride_n
+                + head_idx * dangle_right_coeff_stride_h
+            )
             scale = agate * tl.rsqrt(angle_rank + 0.0)
             if ANGLE_C0 > 0:
                 c_mask = offs_c < ANGLE_C0
@@ -818,12 +1018,18 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 dleft0 = tl.dot(weighted, right0, input_precision=INPUT_PRECISION)
                 dright0 = tl.dot(tl.trans(weighted), left0, input_precision=INPUT_PRECISION)
                 tl.store(
-                    dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    dangle_left_coeff_ptr
+                    + dleft_coeff_base
+                    + offs_k[:, None] * dangle_left_coeff_stride_k
+                    + offs_c[None, :] * dangle_left_coeff_stride_c,
                     dleft0,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
-                    dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
+                    dangle_right_coeff_ptr
+                    + dright_coeff_base
+                    + offs_k[:, None] * dangle_right_coeff_stride_k
+                    + offs_c[None, :] * dangle_right_coeff_stride_c,
                     dright0,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
@@ -834,12 +1040,18 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 dleft1 = tl.dot(weighted, right1, input_precision=INPUT_PRECISION)
                 dright1 = tl.dot(tl.trans(weighted), left1, input_precision=INPUT_PRECISION)
                 tl.store(
-                    dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    dangle_left_coeff_ptr
+                    + dleft_coeff_base
+                    + offs_k[:, None] * dangle_left_coeff_stride_k
+                    + c_offs[None, :] * dangle_left_coeff_stride_c,
                     dleft1,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
-                    dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    dangle_right_coeff_ptr
+                    + dright_coeff_base
+                    + offs_k[:, None] * dangle_right_coeff_stride_k
+                    + c_offs[None, :] * dangle_right_coeff_stride_c,
                     dright1,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
@@ -850,17 +1062,26 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 dleft2 = tl.dot(weighted, right2, input_precision=INPUT_PRECISION)
                 dright2 = tl.dot(tl.trans(weighted), left2, input_precision=INPUT_PRECISION)
                 tl.store(
-                    dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    dangle_left_coeff_ptr
+                    + dleft_coeff_base
+                    + offs_k[:, None] * dangle_left_coeff_stride_k
+                    + c_offs[None, :] * dangle_left_coeff_stride_c,
                     dleft2,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
-                    dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
+                    dangle_right_coeff_ptr
+                    + dright_coeff_base
+                    + offs_k[:, None] * dangle_right_coeff_stride_k
+                    + c_offs[None, :] * dangle_right_coeff_stride_c,
                     dright2,
                     mask=k_mask[:, None] & c_mask[None, :],
                 )
             dangle_gate = tl.sum(tl.sum(ds * angle, axis=0), axis=0)
-            tl.store(dangle_gate_ptr + bh_idx * num_atoms + atom_idx, dangle_gate)
+            if ANGLE_GATE_HEAD_ONLY:
+                tl.atomic_add(dangle_gate_ptr + head_idx, dangle_gate, sem="relaxed")
+            else:
+                tl.store(dangle_gate_ptr + bh_idx * num_atoms + atom_idx, dangle_gate)
 
 
 class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
@@ -894,6 +1115,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         angle_c2: int,
         angle_coeffs: int,
         compact_angle_rank: int,
+        output_layout_bnhd: bool,
     ) -> torch.Tensor:
         if not TRITON_COMPACT_SIMPLICIAL_AVAILABLE:  # pragma: no cover - guarded before dispatch.
             raise RuntimeError("triton is not installed")
@@ -903,6 +1125,8 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         has_expanded_angle = angle_left.numel() > 0 and angle_right.numel() > 0
         has_compact_angle = angle_left_coeff.numel() > 0 and angle_right_coeff.numel() > 0
         has_message = message_left.numel() > 0 and message_right.numel() > 0 and message_basis.numel() > 0
+        gate_head_only = has_radial_bias and gate.ndim == 1
+        angle_gate_head_only = (has_expanded_angle or has_compact_angle) and angle_gate.ndim == 1
         angle_rank = (
             int(angle_left.shape[-1])
             if has_expanded_angle
@@ -920,8 +1144,31 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         block_r = compact_block_r_for_rank(max(angle_rank if has_expanded_angle else 1, message_rank if has_message else 1))
         block_c = compact_block_r_for_rank(max(angle_c0, angle_c1, angle_c2, 1))
         input_precision = _precision_kernel_config(precision)
+        left_coeff_strides = _compact_angle_coeff_canonical_strides(
+            angle_left_coeff,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_atoms=num_atoms,
+            k_neighbors=k_neighbors,
+        )
+        if has_compact_angle:
+            right_coeff_strides = _compact_angle_coeff_canonical_strides(
+                angle_right_coeff,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                num_atoms=num_atoms,
+                k_neighbors=k_neighbors,
+            )
+        else:
+            right_coeff_strides = (0, 0, 0, 0, 0)
 
-        out_fp32 = torch.empty((batch_size, num_heads, num_atoms, head_dim), device=q.device, dtype=torch.float32)
+        output_layout_bnhd = bool(output_layout_bnhd)
+        out_shape = (
+            (batch_size, num_atoms, num_heads, head_dim)
+            if output_layout_bnhd
+            else (batch_size, num_heads, num_atoms, head_dim)
+        )
+        out_fp32 = torch.empty(out_shape, device=q.device, dtype=torch.float32)
         lse = torch.empty((batch_size, num_heads, num_atoms), device=q.device, dtype=torch.float32)
         grid = (batch_size * num_heads * num_atoms,)
         _compact_forward_kernel[grid](
@@ -969,6 +1216,16 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             v2.stride(1),
             v2.stride(2),
             v2.stride(3),
+            left_coeff_strides[0],
+            left_coeff_strides[1],
+            left_coeff_strides[2],
+            left_coeff_strides[3],
+            left_coeff_strides[4],
+            right_coeff_strides[0],
+            right_coeff_strides[1],
+            right_coeff_strides[2],
+            right_coeff_strides[3],
+            right_coeff_strides[4],
             head_dim=head_dim,
             k_neighbors=k_neighbors,
             angle_rank=angle_rank,
@@ -977,6 +1234,9 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             HAS_ANGLE=has_expanded_angle,
             HAS_COMPACT_ANGLE=has_compact_angle,
             HAS_MESSAGE=has_message,
+            GATE_HEAD_ONLY=gate_head_only,
+            ANGLE_GATE_HEAD_ONLY=angle_gate_head_only,
+            OUTPUT_LAYOUT_BNHD=output_layout_bnhd,
             ANGLE_C0=angle_c0,
             ANGLE_C1=angle_c1,
             ANGLE_C2=angle_c2,
@@ -1018,6 +1278,9 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         ctx.has_expanded_angle = has_expanded_angle
         ctx.has_compact_angle = has_compact_angle
         ctx.has_message = has_message
+        ctx.gate_head_only = gate_head_only
+        ctx.angle_gate_head_only = angle_gate_head_only
+        ctx.output_layout_bnhd = output_layout_bnhd
         ctx.angle_rank = angle_rank
         ctx.message_rank = message_rank
         ctx.angle_c0 = angle_c0
@@ -1135,6 +1398,8 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
                     message_basis=local_msg_basis,
                     q_scale=ctx.q_scale,
                 )
+                if ctx.output_layout_bnhd:
+                    ref = ref.transpose(1, 2).contiguous()
                 grads = torch.autograd.grad(ref, inputs, grad_out, allow_unused=True)
             dq = dk1 = dv1 = dk2 = dv2 = du = dvb = dgate = dleft = dright = dleft_coeff = dright_coeff = dagate = dml = dmr = dmb = None
             dq, dk1, dv1, dk2, dv2 = grads[:5]
@@ -1178,6 +1443,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         batch_size, num_heads, num_atoms, head_dim = q.shape
@@ -1196,7 +1462,13 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         dv2 = torch.zeros(v2.shape, device=v2.device, dtype=grad_dtype)
         du = torch.empty_like(u, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(u)
         dvb = torch.empty_like(v_bias, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(v_bias)
-        dgate = torch.empty_like(gate, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(gate)
+        dgate = (
+            torch.zeros_like(gate, dtype=grad_dtype)
+            if ctx.has_radial_bias and ctx.gate_head_only
+            else torch.empty_like(gate, dtype=grad_dtype)
+            if ctx.has_radial_bias
+            else torch.empty_like(gate)
+        )
         dleft = torch.empty_like(angle_left, dtype=grad_dtype) if ctx.has_expanded_angle else torch.empty_like(angle_left)
         dright = torch.empty_like(angle_right, dtype=grad_dtype) if ctx.has_expanded_angle else torch.empty_like(angle_right)
         dleft_coeff = (
@@ -1210,13 +1482,55 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             else torch.empty_like(angle_right_coeff)
         )
         dagate = (
-            torch.empty_like(angle_gate, dtype=grad_dtype)
+            torch.zeros_like(angle_gate, dtype=grad_dtype)
+            if (ctx.has_expanded_angle or ctx.has_compact_angle) and ctx.angle_gate_head_only
+            else torch.empty_like(angle_gate, dtype=grad_dtype)
             if ctx.has_expanded_angle or ctx.has_compact_angle
             else torch.empty_like(angle_gate)
         )
         dml = torch.empty_like(message_left, dtype=grad_dtype) if ctx.has_message else torch.empty_like(message_left)
         dmr = torch.empty_like(message_right, dtype=grad_dtype) if ctx.has_message else torch.empty_like(message_right)
         dmb = torch.zeros_like(message_basis, dtype=grad_dtype) if ctx.has_message else torch.empty_like(message_basis)
+        left_coeff_strides = _compact_angle_coeff_canonical_strides(
+            angle_left_coeff,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_atoms=num_atoms,
+            k_neighbors=k_neighbors,
+        )
+        right_coeff_strides = (
+            _compact_angle_coeff_canonical_strides(
+                angle_right_coeff,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                num_atoms=num_atoms,
+                k_neighbors=k_neighbors,
+            )
+            if ctx.has_compact_angle
+            else (0, 0, 0, 0, 0)
+        )
+        dleft_coeff_strides = (
+            _compact_angle_coeff_canonical_strides(
+                dleft_coeff,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                num_atoms=num_atoms,
+                k_neighbors=k_neighbors,
+            )
+            if ctx.has_compact_angle
+            else (0, 0, 0, 0, 0)
+        )
+        dright_coeff_strides = (
+            _compact_angle_coeff_canonical_strides(
+                dright_coeff,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                num_atoms=num_atoms,
+                k_neighbors=k_neighbors,
+            )
+            if ctx.has_compact_angle
+            else (0, 0, 0, 0, 0)
+        )
         grid = (batch_size * num_heads * num_atoms,)
         _compact_backward_kernel[grid](
             grad_out,
@@ -1280,6 +1594,26 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             v2.stride(1),
             v2.stride(2),
             v2.stride(3),
+            left_coeff_strides[0],
+            left_coeff_strides[1],
+            left_coeff_strides[2],
+            left_coeff_strides[3],
+            left_coeff_strides[4],
+            right_coeff_strides[0],
+            right_coeff_strides[1],
+            right_coeff_strides[2],
+            right_coeff_strides[3],
+            right_coeff_strides[4],
+            dleft_coeff_strides[0],
+            dleft_coeff_strides[1],
+            dleft_coeff_strides[2],
+            dleft_coeff_strides[3],
+            dleft_coeff_strides[4],
+            dright_coeff_strides[0],
+            dright_coeff_strides[1],
+            dright_coeff_strides[2],
+            dright_coeff_strides[3],
+            dright_coeff_strides[4],
             head_dim=head_dim,
             k_neighbors=k_neighbors,
             angle_rank=ctx.angle_rank,
@@ -1288,6 +1622,9 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             HAS_ANGLE=ctx.has_expanded_angle,
             HAS_COMPACT_ANGLE=ctx.has_compact_angle,
             HAS_MESSAGE=ctx.has_message,
+            GATE_HEAD_ONLY=ctx.gate_head_only,
+            ANGLE_GATE_HEAD_ONLY=ctx.angle_gate_head_only,
+            OUTPUT_LAYOUT_BNHD=ctx.output_layout_bnhd,
             ANGLE_C0=ctx.angle_c0,
             ANGLE_C1=ctx.angle_c1,
             ANGLE_C2=ctx.angle_c2,
@@ -1319,6 +1656,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             dml if ctx.has_message else None,
             dmr if ctx.has_message else None,
             dmb if ctx.has_message else None,
+            None,
             None,
             None,
             None,
@@ -1431,8 +1769,12 @@ def triton_compact_simplicial_attention(
     debug_torch_backward: bool = False,
     strict: bool = False,
     q_scale: float = 1.0,
+    output_layout: str = "bhnd",
 ) -> torch.Tensor:
     precision = normalize_compact_simplicial_precision(precision)
+    output_layout = str(output_layout).lower()
+    if output_layout not in {"bhnd", "bnhd"}:
+        raise ValueError("output_layout must be one of {'bhnd', 'bnhd'}")
     reason = _unavailable_reason(
         q,
         neighbor_idx,
@@ -1452,7 +1794,7 @@ def triton_compact_simplicial_attention(
     if reason is not None:
         if strict:
             raise RuntimeError(f"Compact Triton simplicial attention is unavailable: {reason}")
-        return compact_simplicial_attention_torch_reference(
+        out = compact_simplicial_attention_torch_reference(
             q,
             k1,
             v1,
@@ -1478,24 +1820,41 @@ def triton_compact_simplicial_attention(
             training=training,
             q_scale=q_scale,
         )
+        return out.transpose(1, 2).contiguous() if output_layout == "bnhd" else out
     empty_float = q.new_empty(0)
     u_tensor = u.contiguous() if u is not None and v_bias is not None and gate is not None else empty_float
     v_tensor = v_bias.contiguous() if u is not None and v_bias is not None and gate is not None else empty_float
-    gate_tensor = gate.contiguous() if u is not None and v_bias is not None and gate is not None else empty_float
+    if u is not None and v_bias is not None and gate is not None:
+        if gate.ndim == 1:
+            gate_tensor = gate
+        elif gate.ndim == 3 and gate.shape[0] == 1 and gate.shape[2] == 1:
+            gate_tensor = gate.reshape(-1)
+        elif gate.ndim == 3:
+            gate_tensor = gate.contiguous()
+        else:
+            raise ValueError(f"gate must be [H] or [B,H,N], got {tuple(gate.shape)}")
+    else:
+        gate_tensor = empty_float
     has_expanded_angle = angle_left is not None and angle_right is not None
     has_compact_angle = angle_left_coeff is not None and angle_right_coeff is not None
     angle_left_tensor = angle_left.contiguous() if has_expanded_angle else empty_float
     angle_right_tensor = angle_right.contiguous() if has_expanded_angle else empty_float
     unit_tensor = unit.contiguous() if has_compact_angle and unit is not None else empty_float
-    angle_left_coeff_tensor = angle_left_coeff.contiguous() if has_compact_angle else empty_float
-    angle_right_coeff_tensor = angle_right_coeff.contiguous() if has_compact_angle else empty_float
-    angle_gate_tensor = (
-        angle_gate.contiguous()
-        if (has_expanded_angle or has_compact_angle) and angle_gate is not None
-        else empty_float
-    )
+    angle_left_coeff_tensor = angle_left_coeff if has_compact_angle else empty_float
+    angle_right_coeff_tensor = angle_right_coeff if has_compact_angle else empty_float
+    if (has_expanded_angle or has_compact_angle) and angle_gate is not None:
+        if angle_gate.ndim == 1:
+            angle_gate_tensor = angle_gate
+        elif angle_gate.ndim == 3 and angle_gate.shape[0] == 1 and angle_gate.shape[2] == 1:
+            angle_gate_tensor = angle_gate.reshape(-1)
+        elif angle_gate.ndim == 3:
+            angle_gate_tensor = angle_gate.contiguous()
+        else:
+            raise ValueError(f"angle_gate must be [H] or [B,H,N], got {tuple(angle_gate.shape)}")
+    else:
+        angle_gate_tensor = empty_float
     if (has_expanded_angle or has_compact_angle) and angle_gate is None:
-        angle_gate_tensor = torch.ones(q.shape[:3], device=q.device, dtype=q.dtype).contiguous()
+        angle_gate_tensor = torch.ones((q.shape[1],), device=q.device, dtype=q.dtype)
     if has_compact_angle:
         if angle_channels_by_l is None:
             raise ValueError("compact angle coefficients require angle_channels_by_l")
@@ -1549,4 +1908,5 @@ def triton_compact_simplicial_attention(
         angle_c2,
         angle_coeffs,
         compact_angle_rank,
+        output_layout == "bnhd",
     )

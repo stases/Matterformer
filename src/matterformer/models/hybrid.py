@@ -404,13 +404,21 @@ def _expand_compact_angle_bias_if_needed(bias: CompactSimplicialBias, geom: Geom
         raise RuntimeError("Compact spherical angle coefficients require angle_channels_by_l")
     channels_by_l = {idx: int(count) for idx, count in enumerate(bias.angle_channels_by_l)}
     basis = _spherical_basis_lmax2(geom.unit)
+    left_coeff = bias.angle_left_coeff
+    right_coeff = bias.angle_right_coeff
+    if left_coeff.shape[1] == geom.unit.shape[1] and left_coeff.shape[2] == geom.unit.shape[2]:
+        left_coeff_bnkhc = left_coeff
+        right_coeff_bnkhc = right_coeff
+    else:
+        left_coeff_bnkhc = left_coeff.permute(0, 2, 3, 1, 4).contiguous()
+        right_coeff_bnkhc = right_coeff.permute(0, 2, 3, 1, 4).contiguous()
     left = _expand_spherical_coefficients(
-        bias.angle_left_coeff.permute(0, 2, 3, 1, 4).contiguous(),
+        left_coeff_bnkhc,
         basis=basis,
         channels_by_l=channels_by_l,
     ).to(dtype=bias.angle_left_coeff.dtype)
     right = _expand_spherical_coefficients(
-        bias.angle_right_coeff.permute(0, 2, 3, 1, 4).contiguous(),
+        right_coeff_bnkhc,
         basis=basis,
         channels_by_l=channels_by_l,
     ).to(dtype=bias.angle_right_coeff.dtype)
@@ -424,6 +432,42 @@ def _expand_compact_angle_bias_if_needed(bias: CompactSimplicialBias, geom: Geom
         message_left=bias.message_left,
         message_right=bias.message_right,
         message_basis=bias.message_basis,
+    )
+
+
+def _gate_for_scores(gate: torch.Tensor, *, num_heads: int) -> torch.Tensor:
+    if gate.ndim == 1:
+        if gate.shape[0] != num_heads:
+            raise RuntimeError(f"per-head gate has {gate.shape[0]} heads, expected {num_heads}")
+        return gate.view(1, num_heads, 1, 1, 1).float()
+    if gate.ndim == 3:
+        if gate.shape[1] != num_heads:
+            raise RuntimeError(f"gate has {gate.shape[1]} heads, expected {num_heads}")
+        return gate[:, :, :, None, None].float()
+    raise RuntimeError(f"gate must be [H] or [B,H,N], got {tuple(gate.shape)}")
+
+
+def _compact_coefficients_as_bhnkc(
+    coeff_left: torch.Tensor,
+    coeff_right: torch.Tensor,
+    *,
+    unit: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if coeff_left.shape != coeff_right.shape:
+        raise RuntimeError(
+            "compact spherical angle coefficient tensors must have matching shapes, got "
+            f"{tuple(coeff_left.shape)} and {tuple(coeff_right.shape)}"
+        )
+    if coeff_left.ndim != 5:
+        raise RuntimeError(f"compact spherical angle coefficients must be rank-5, got {tuple(coeff_left.shape)}")
+    _, num_atoms, num_neighbors, _ = unit.shape
+    if coeff_left.shape[2] == num_atoms and coeff_left.shape[3] == num_neighbors:
+        return coeff_left, coeff_right
+    if coeff_left.shape[1] == num_atoms and coeff_left.shape[2] == num_neighbors:
+        return coeff_left.permute(0, 3, 1, 2, 4), coeff_right.permute(0, 3, 1, 2, 4)
+    raise RuntimeError(
+        "compact spherical angle coefficients must be [B,H,N,K,C] or [B,N,K,H,C], got "
+        f"{tuple(coeff_left.shape)} for unit shape {tuple(unit.shape)}"
     )
 
 
@@ -450,14 +494,14 @@ def compact_simplicial_attention_torch(
     scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q_eff, k1_n, k2_n).float()
     if bias is not None:
         if bias.u is not None and bias.v is not None and bias.gate is not None:
-            scores = scores + bias.gate[:, :, :, None, None].float() * (
+            scores = scores + _gate_for_scores(bias.gate, num_heads=q.shape[1]) * (
                 bias.u[:, :, :, :, None].float() + bias.v[:, :, :, None, :].float()
             )
         if bias.angle_left is not None and bias.angle_right is not None:
             if bias.angle_gate is None:
                 angle_gate = 1.0
             else:
-                angle_gate = bias.angle_gate[:, :, :, None, None].float()
+                angle_gate = _gate_for_scores(bias.angle_gate, num_heads=q.shape[1])
             angle = torch.einsum("bhnjr,bhnkr->bhnjk", bias.angle_left.float(), bias.angle_right.float())
             angle = angle * (bias.angle_left.shape[-1] ** -0.5)
             scores = scores + angle_gate * angle
@@ -467,32 +511,37 @@ def compact_simplicial_attention_torch(
             if bias.angle_channels_by_l is None:
                 raise RuntimeError("Compact spherical angle coefficients require angle_channels_by_l")
             c0, c1, c2 = (int(v) for v in bias.angle_channels_by_l)
-            if c0 + c1 + c2 != int(bias.angle_left_coeff.shape[-1]):
+            angle_left_coeff, angle_right_coeff = _compact_coefficients_as_bhnkc(
+                bias.angle_left_coeff,
+                bias.angle_right_coeff,
+                unit=unit,
+            )
+            if c0 + c1 + c2 != int(angle_left_coeff.shape[-1]):
                 raise RuntimeError(
                     "angle_channels_by_l does not match compact coefficient width: "
-                    f"{(c0, c1, c2)} vs {bias.angle_left_coeff.shape[-1]}"
+                    f"{(c0, c1, c2)} vs {angle_left_coeff.shape[-1]}"
                 )
             cos = torch.einsum("bnjc,bnkc->bnjk", unit.float(), unit.float())
             p2 = 0.5 * (3.0 * cos.square() - 1.0)
             compact_angle = scores.new_zeros(scores.shape)
             offset = 0
             if c0 > 0:
-                left = bias.angle_left_coeff[..., offset : offset + c0].float()
-                right = bias.angle_right_coeff[..., offset : offset + c0].float()
+                left = angle_left_coeff[..., offset : offset + c0].float()
+                right = angle_right_coeff[..., offset : offset + c0].float()
                 compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right)
                 offset += c0
             if c1 > 0:
-                left = bias.angle_left_coeff[..., offset : offset + c1].float()
-                right = bias.angle_right_coeff[..., offset : offset + c1].float()
+                left = angle_left_coeff[..., offset : offset + c1].float()
+                right = angle_right_coeff[..., offset : offset + c1].float()
                 compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right) * cos[:, None]
                 offset += c1
             if c2 > 0:
-                left = bias.angle_left_coeff[..., offset : offset + c2].float()
-                right = bias.angle_right_coeff[..., offset : offset + c2].float()
+                left = angle_left_coeff[..., offset : offset + c2].float()
+                right = angle_right_coeff[..., offset : offset + c2].float()
                 compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right) * p2[:, None]
             angle_rank = int(bias.angle_rank or (c0 + 3 * c1 + 5 * c2))
             compact_angle = compact_angle * (angle_rank ** -0.5)
-            angle_gate = 1.0 if bias.angle_gate is None else bias.angle_gate[:, :, :, None, None].float()
+            angle_gate = 1.0 if bias.angle_gate is None else _gate_for_scores(bias.angle_gate, num_heads=q.shape[1])
             scores = scores + angle_gate * compact_angle
     valid = neighbor_mask[:, None, :, :, None] & neighbor_mask[:, None, :, None, :]
     scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
@@ -530,6 +579,7 @@ def compact_simplicial_attention_triton(
     debug_torch_backward: bool = False,
     strict: bool = False,
     q_scale: float = 1.0,
+    output_layout: str = "bhnd",
 ) -> torch.Tensor:
     """Compact-kNN Triton backend entrypoint with Torch fallback."""
 
@@ -570,7 +620,7 @@ def compact_simplicial_attention_triton(
     if reason is not None:
         if strict:
             raise RuntimeError(f"Compact Triton simplicial attention is unavailable: {reason}")
-        return compact_simplicial_attention_torch(
+        out = compact_simplicial_attention_torch(
             q,
             k1,
             v1,
@@ -584,6 +634,7 @@ def compact_simplicial_attention_triton(
             training=training,
             q_scale=q_scale,
         )
+        return out.transpose(1, 2).contiguous() if str(output_layout).lower() == "bnhd" else out
 
     if bias is None:
         return triton_compact_simplicial_attention(
@@ -600,6 +651,7 @@ def compact_simplicial_attention_triton(
             debug_torch_backward=debug_torch_backward,
             strict=strict,
             q_scale=q_scale,
+            output_layout=output_layout,
         )
     return triton_compact_simplicial_attention(
         q,
@@ -629,6 +681,7 @@ def compact_simplicial_attention_triton(
         debug_torch_backward=debug_torch_backward,
         strict=strict,
         q_scale=q_scale,
+        output_layout=output_layout,
     )
 
 
@@ -721,7 +774,7 @@ class CompactSimplicialGeometryBias(nn.Module):
             self.register_parameter("message_basis", None)
             self.register_parameter("message_gate", None)
 
-    def forward(self, geom: GeometryCache, *, dtype: torch.dtype) -> CompactSimplicialBias:
+    def forward(self, geom: GeometryCache, *, dtype: torch.dtype, scalar_triton_layout: bool = False) -> CompactSimplicialBias:
         edge_features = geom.rbf
         batch_size, num_atoms, num_neighbors, _ = edge_features.shape
         needs_basis = (self.use_angle and self.representation == "expanded") or self.message_enabled
@@ -733,7 +786,10 @@ class CompactSimplicialGeometryBias(nn.Module):
                 assert self.u_mlp is not None and self.v_mlp is not None and self.gate is not None
                 u = self.u_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
                 v = self.v_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
-                gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
+                if scalar_triton_layout:
+                    gate = self.gate.reshape(self.num_heads).to(dtype=dtype)
+                else:
+                    gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         left = right = angle_gate = left_compact = right_compact = None
         if self.use_angle:
             with record_function("simplicial_bias/angle_coeff_mlp"):
@@ -753,15 +809,23 @@ class CompactSimplicialGeometryBias(nn.Module):
                     self.num_coefficients,
                 )
             if self.representation == "compact":
-                with record_function("simplicial_bias/angle_compact_pack"):
-                    left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
-                    right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                if scalar_triton_layout:
+                    with record_function("simplicial_bias/angle_compact_cast"):
+                        left_compact = left_coeff.to(dtype=dtype)
+                        right_compact = right_coeff.to(dtype=dtype)
+                else:
+                    with record_function("simplicial_bias/angle_compact_pack"):
+                        left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                        right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
             else:
                 with record_function("simplicial_bias/angle_expand_spherical"):
                     assert basis is not None
                     left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
                     right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-            angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
+            if scalar_triton_layout:
+                angle_gate = self.angle_gate.reshape(self.num_heads).to(dtype=dtype)
+            else:
+                angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         message_left = message_right = message_basis = None
         if self.message_enabled:
             with record_function("simplicial_bias/message_mlp_expand"):
@@ -913,7 +977,7 @@ class CompactSimplicialAttention(nn.Module):
             k2 = self._split(k2)
             v2 = self._split(v2)
         with record_function("compact_simplicial/bias_build"):
-            bias = self.bias(geom, dtype=x_atoms.dtype)
+            bias = self.bias(geom, dtype=x_atoms.dtype, scalar_triton_layout=self.backend in {"triton", "triton_knn"})
         if bias.angle_left_coeff is not None and self.backend not in {"triton", "triton_knn"}:
             with record_function("compact_simplicial/compact_angle_expand_for_scalar_kernel"):
                 bias = _expand_compact_angle_bias_if_needed(bias, geom)
@@ -935,6 +999,7 @@ class CompactSimplicialAttention(nn.Module):
                     debug_torch_backward=self.debug_torch_backward,
                     strict=self.strict_triton,
                     q_scale=self.scale,
+                    output_layout="bnhd",
                 )
         else:
             with record_function("compact_simplicial/torch_attention"):
@@ -953,6 +1018,8 @@ class CompactSimplicialAttention(nn.Module):
                     q_scale=self.scale,
                 )
         with record_function("compact_simplicial/out_proj"):
+            if self.backend in {"triton", "triton_knn"}:
+                return self.out_proj(out.reshape(out.shape[0], out.shape[1], self.inner_dim))
             return self.out_proj(self._merge(out))
 
 
