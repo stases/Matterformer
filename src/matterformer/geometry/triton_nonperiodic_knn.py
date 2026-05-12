@@ -118,7 +118,11 @@ if TRITON_NONPERIODIC_KNN_AVAILABLE:
         best_d2 = tl.full((BLOCK_K,), inf, dtype=tl.float32)
         best_idx = tl.full((BLOCK_K,), 0, dtype=tl.int32)
 
-        for start in range(0, num_atoms, BLOCK_N):
+        # Use a Triton loop rather than a Python range.  num_atoms is a constexpr,
+        # and Python range can be statically expanded into a huge kernel for large
+        # OMol padded batches.  tl.range keeps compile time bounded while still
+        # streaming exact all-atom candidates.
+        for start in tl.range(0, num_atoms, BLOCK_N):
             cand = start + offs_n
             cand_mask = cand < num_atoms
             valid = cand_mask & (cand != query_idx) & query_valid
