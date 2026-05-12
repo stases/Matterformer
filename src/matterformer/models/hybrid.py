@@ -437,6 +437,7 @@ def compact_simplicial_attention_torch(
     neighbor_idx: torch.Tensor,
     neighbor_mask: torch.Tensor,
     bias: CompactSimplicialBias | None = None,
+    unit: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
 ) -> torch.Tensor:
@@ -458,6 +459,39 @@ def compact_simplicial_attention_torch(
             angle = torch.einsum("bhnjr,bhnkr->bhnjk", bias.angle_left.float(), bias.angle_right.float())
             angle = angle * (bias.angle_left.shape[-1] ** -0.5)
             scores = scores + angle_gate * angle
+        if bias.angle_left_coeff is not None or bias.angle_right_coeff is not None:
+            if unit is None or bias.angle_left_coeff is None or bias.angle_right_coeff is None:
+                raise RuntimeError("Compact spherical angle coefficients require unit vectors")
+            if bias.angle_channels_by_l is None:
+                raise RuntimeError("Compact spherical angle coefficients require angle_channels_by_l")
+            c0, c1, c2 = (int(v) for v in bias.angle_channels_by_l)
+            if c0 + c1 + c2 != int(bias.angle_left_coeff.shape[-1]):
+                raise RuntimeError(
+                    "angle_channels_by_l does not match compact coefficient width: "
+                    f"{(c0, c1, c2)} vs {bias.angle_left_coeff.shape[-1]}"
+                )
+            cos = torch.einsum("bnjc,bnkc->bnjk", unit.float(), unit.float())
+            p2 = 0.5 * (3.0 * cos.square() - 1.0)
+            compact_angle = scores.new_zeros(scores.shape)
+            offset = 0
+            if c0 > 0:
+                left = bias.angle_left_coeff[..., offset : offset + c0].float()
+                right = bias.angle_right_coeff[..., offset : offset + c0].float()
+                compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right)
+                offset += c0
+            if c1 > 0:
+                left = bias.angle_left_coeff[..., offset : offset + c1].float()
+                right = bias.angle_right_coeff[..., offset : offset + c1].float()
+                compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right) * cos[:, None]
+                offset += c1
+            if c2 > 0:
+                left = bias.angle_left_coeff[..., offset : offset + c2].float()
+                right = bias.angle_right_coeff[..., offset : offset + c2].float()
+                compact_angle = compact_angle + torch.einsum("bhnjc,bhnkc->bhnjk", left, right) * p2[:, None]
+            angle_rank = int(bias.angle_rank or (c0 + 3 * c1 + 5 * c2))
+            compact_angle = compact_angle * (angle_rank ** -0.5)
+            angle_gate = 1.0 if bias.angle_gate is None else bias.angle_gate[:, :, :, None, None].float()
+            scores = scores + angle_gate * compact_angle
     valid = neighbor_mask[:, None, :, :, None] & neighbor_mask[:, None, :, None, :]
     scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
     attn = torch.softmax(scores.flatten(-2), dim=-1).view_as(scores)
@@ -487,6 +521,7 @@ def compact_simplicial_attention_triton(
     neighbor_idx: torch.Tensor,
     neighbor_mask: torch.Tensor,
     bias: CompactSimplicialBias | None = None,
+    unit: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
     precision: str = "bf16_tc",
@@ -512,6 +547,20 @@ def compact_simplicial_attention_triton(
         reason = f"compact Triton supports k_neighbors <= 64, got {neighbor_idx.shape[-1]}"
     elif bias is not None and bias.angle_left is not None and bias.angle_left.shape[-1] > 64:
         reason = f"compact Triton supports angle rank <= 64, got {bias.angle_left.shape[-1]}"
+    elif bias is not None and bias.angle_left_coeff is not None and bias.angle_right_coeff is None:
+        reason = "angle_left_coeff requires angle_right_coeff"
+    elif bias is not None and bias.angle_right_coeff is not None and bias.angle_left_coeff is None:
+        reason = "angle_right_coeff requires angle_left_coeff"
+    elif bias is not None and bias.angle_left is not None and bias.angle_left_coeff is not None:
+        reason = "use either expanded angle tensors or compact angle coefficients, not both"
+    elif bias is not None and bias.angle_left_coeff is not None and unit is None:
+        reason = "compact angle coefficients require unit vectors"
+    elif bias is not None and bias.angle_left_coeff is not None and unit is not None and unit.requires_grad:
+        reason = "compact angle coefficients do not implement gradients through unit vectors"
+    elif bias is not None and bias.angle_left_coeff is not None and bias.angle_channels_by_l is None:
+        reason = "compact angle coefficients require angle_channels_by_l"
+    elif bias is not None and bias.angle_left_coeff is not None and bias.angle_left_coeff.shape[-1] > 64:
+        reason = f"compact Triton supports compact angle coeff count <= 64, got {bias.angle_left_coeff.shape[-1]}"
     elif bias is not None and bias.message_left is not None and bias.message_left.shape[-1] > 64:
         reason = f"compact Triton supports message rank <= 64, got {bias.message_left.shape[-1]}"
 
@@ -527,6 +576,7 @@ def compact_simplicial_attention_triton(
             neighbor_idx=neighbor_idx,
             neighbor_mask=neighbor_mask,
             bias=bias,
+            unit=unit,
             dropout_p=dropout_p,
             training=training,
         )
@@ -559,6 +609,11 @@ def compact_simplicial_attention_triton(
         gate=bias.gate,
         angle_left=bias.angle_left,
         angle_right=bias.angle_right,
+        unit=unit,
+        angle_left_coeff=bias.angle_left_coeff,
+        angle_right_coeff=bias.angle_right_coeff,
+        angle_channels_by_l=bias.angle_channels_by_l,
+        angle_rank=bias.angle_rank,
         angle_gate=bias.angle_gate,
         message_left=bias.message_left,
         message_right=bias.message_right,
@@ -862,7 +917,7 @@ class CompactSimplicialAttention(nn.Module):
             v2 = self._split(v2)
         with record_function("compact_simplicial/bias_build"):
             bias = self.bias(geom, dtype=x_atoms.dtype)
-        if bias.angle_left_coeff is not None:
+        if bias.angle_left_coeff is not None and self.backend not in {"triton", "triton_knn"}:
             with record_function("compact_simplicial/compact_angle_expand_for_scalar_kernel"):
                 bias = _expand_compact_angle_bias_if_needed(bias, geom)
         if self.backend in {"triton", "triton_knn"}:
@@ -876,6 +931,7 @@ class CompactSimplicialAttention(nn.Module):
                     neighbor_idx=geom.neighbor_idx,
                     neighbor_mask=geom.neighbor_mask,
                     bias=bias,
+                    unit=geom.unit,
                     dropout_p=self.dropout,
                     training=self.training,
                     precision=self.precision,
@@ -893,6 +949,7 @@ class CompactSimplicialAttention(nn.Module):
                     neighbor_idx=geom.neighbor_idx,
                     neighbor_mask=geom.neighbor_mask,
                     bias=bias,
+                    unit=geom.unit,
                     dropout_p=self.dropout,
                     training=self.training,
                 )

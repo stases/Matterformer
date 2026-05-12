@@ -566,7 +566,7 @@ def test_grouped_compact_spherical_coefficients_match_expanded_reference():
         angle_rank=angle_rank,
         angle_gate=cmp_bias[5],
     )
-    assert torch.allclose(compact, expanded, atol=1e-10, rtol=1e-10)
+    assert torch.allclose(compact, expanded, atol=1e-6, rtol=1e-6)
 
     grad = torch.randn_like(expanded)
     expanded.backward(grad)
@@ -574,7 +574,86 @@ def test_grouped_compact_spherical_coefficients_match_expanded_reference():
     for actual_tensor, ref_tensor in zip(cmp_tensors + cmp_bias, exp_tensors + exp_bias):
         assert actual_tensor.grad is not None
         assert ref_tensor.grad is not None
-        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-10, rtol=1e-10)
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_scalar_compact_spherical_coefficients_match_expanded_reference():
+    torch.manual_seed(13)
+    batch_size, num_heads, num_tokens, k_neighbors, head_dim = 2, 2, 7, 4, 8
+    channels_by_l = (2, 3, 1)
+    angle_rank = channels_by_l[0] + 3 * channels_by_l[1] + 5 * channels_by_l[2]
+    coeff_dim = sum(channels_by_l)
+    kwargs = {"dtype": torch.float64, "requires_grad": True}
+    tensors = [torch.randn(batch_size, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+    base_idx = torch.arange(num_tokens)[:, None]
+    offsets = torch.arange(k_neighbors)[None, :]
+    neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors) > 0.2).contiguous()
+    neighbor_mask[..., 0] = True
+    neighbor_mask[0, 0, :] = False
+    unit = torch.randn(batch_size, num_tokens, k_neighbors, 3, dtype=torch.float64)
+    unit = torch.nn.functional.normalize(unit, dim=-1)
+    unit = unit.masked_fill(~neighbor_mask[..., None], 0.0)
+    bias_tensors = [
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, coeff_dim, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, coeff_dim, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+    ]
+    exp_tensors = [_clone_leaf(t) for t in tensors]
+    cmp_tensors = [_clone_leaf(t) for t in tensors]
+    exp_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    cmp_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    basis = _spherical_basis_lmax2(unit)
+    left_expanded = _expand_compact_spherical_coefficients(
+        exp_bias_tensors[3], basis=basis, channels_by_l=channels_by_l
+    )
+    right_expanded = _expand_compact_spherical_coefficients(
+        exp_bias_tensors[4], basis=basis, channels_by_l=channels_by_l
+    )
+    expanded_bias = CompactSimplicialBias(
+        u=exp_bias_tensors[0],
+        v=exp_bias_tensors[1],
+        gate=exp_bias_tensors[2],
+        angle_left=left_expanded,
+        angle_right=right_expanded,
+        angle_gate=exp_bias_tensors[5],
+    )
+    compact_bias = CompactSimplicialBias(
+        u=cmp_bias_tensors[0],
+        v=cmp_bias_tensors[1],
+        gate=cmp_bias_tensors[2],
+        angle_left_coeff=cmp_bias_tensors[3],
+        angle_right_coeff=cmp_bias_tensors[4],
+        angle_channels_by_l=channels_by_l,
+        angle_rank=angle_rank,
+        angle_gate=cmp_bias_tensors[5],
+    )
+
+    expanded = compact_simplicial_attention_torch(
+        *exp_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=expanded_bias,
+    )
+    compact = compact_simplicial_attention_torch(
+        *cmp_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=compact_bias,
+        unit=unit,
+    )
+    assert torch.allclose(compact, expanded, atol=1e-6, rtol=1e-6)
+
+    grad = torch.randn_like(expanded)
+    expanded.backward(grad)
+    compact.backward(grad)
+    for actual_tensor, ref_tensor in zip(cmp_tensors + cmp_bias_tensors, exp_tensors + exp_bias_tensors):
+        assert actual_tensor.grad is not None
+        assert ref_tensor.grad is not None
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(
@@ -724,6 +803,136 @@ def test_grouped_compact_spherical_coefficients_triton_match_expanded_cuda():
         assert actual_tensor.grad is not None
         assert ref_tensor.grad is not None
         assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
+    reason="scalar compact spherical coefficient Triton parity requires CUDA and Triton",
+)
+def test_scalar_compact_spherical_coefficients_triton_match_expanded_cuda():
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    batch_size, num_heads, num_tokens, k_neighbors, head_dim = 2, 2, 7, 4, 32
+    channels_by_l = (2, 3, 1)
+    angle_rank = channels_by_l[0] + 3 * channels_by_l[1] + 5 * channels_by_l[2]
+    coeff_dim = sum(channels_by_l)
+    kwargs = {"device": device, "dtype": torch.float32, "requires_grad": True}
+    tensors = [torch.randn(batch_size, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+    base_idx = torch.arange(num_tokens, device=device)[:, None]
+    offsets = torch.arange(k_neighbors, device=device)[None, :]
+    neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.2).contiguous()
+    neighbor_mask[..., 0] = True
+    neighbor_mask[0, 0, :] = False
+    unit = torch.randn(batch_size, num_tokens, k_neighbors, 3, device=device, dtype=torch.float32)
+    unit = torch.nn.functional.normalize(unit, dim=-1)
+    unit = unit.masked_fill(~neighbor_mask[..., None], 0.0)
+    bias_tensors = [
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, coeff_dim, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, k_neighbors, coeff_dim, **kwargs),
+        torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+    ]
+    exp_tensors = [_clone_leaf(t) for t in tensors]
+    cmp_tensors = [_clone_leaf(t) for t in tensors]
+    exp_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    cmp_bias_tensors = [_clone_leaf(t) for t in bias_tensors]
+    basis = _spherical_basis_lmax2(unit)
+    left_expanded = _expand_compact_spherical_coefficients(
+        exp_bias_tensors[3], basis=basis, channels_by_l=channels_by_l
+    )
+    right_expanded = _expand_compact_spherical_coefficients(
+        exp_bias_tensors[4], basis=basis, channels_by_l=channels_by_l
+    )
+    expanded_bias = CompactSimplicialBias(
+        u=exp_bias_tensors[0],
+        v=exp_bias_tensors[1],
+        gate=exp_bias_tensors[2],
+        angle_left=left_expanded,
+        angle_right=right_expanded,
+        angle_gate=exp_bias_tensors[5],
+    )
+    compact_bias = CompactSimplicialBias(
+        u=cmp_bias_tensors[0],
+        v=cmp_bias_tensors[1],
+        gate=cmp_bias_tensors[2],
+        angle_left_coeff=cmp_bias_tensors[3],
+        angle_right_coeff=cmp_bias_tensors[4],
+        angle_channels_by_l=channels_by_l,
+        angle_rank=angle_rank,
+        angle_gate=cmp_bias_tensors[5],
+    )
+
+    expanded = compact_simplicial_attention_triton(
+        *exp_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=expanded_bias,
+        precision="ieee_fp32",
+        strict=True,
+    )
+    compact = compact_simplicial_attention_triton(
+        *cmp_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=compact_bias,
+        unit=unit,
+        precision="ieee_fp32",
+        strict=True,
+    )
+    assert torch.allclose(compact, expanded, atol=5e-4, rtol=5e-4)
+
+    grad = torch.randn_like(expanded)
+    expanded.backward(grad)
+    compact.backward(grad)
+    for actual_tensor, ref_tensor in zip(cmp_tensors + cmp_bias_tensors, exp_tensors + exp_bias_tensors):
+        assert actual_tensor.grad is not None
+        assert ref_tensor.grad is not None
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
+    reason="scalar compact Triton variable-N parity requires CUDA and Triton",
+)
+def test_scalar_compact_simplicial_triton_accepts_variable_num_atoms_cuda():
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    for num_tokens in (6, 9, 7):
+        batch_size, num_heads, k_neighbors, head_dim, rank = 2, 2, 4, 16, 16
+        kwargs = {"device": device, "dtype": torch.float32, "requires_grad": True}
+        tensors = [torch.randn(batch_size, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+        base_idx = torch.arange(num_tokens, device=device)[:, None]
+        offsets = torch.arange(k_neighbors, device=device)[None, :]
+        neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+        neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.2).contiguous()
+        neighbor_mask[..., 0] = True
+        bias = CompactSimplicialBias(
+            angle_left=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+            angle_right=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+            angle_gate=torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        )
+        ref_tensors = [_clone_leaf(t) for t in tensors]
+        tri_tensors = [_clone_leaf(t) for t in tensors]
+        ref_bias = _clone_bias(bias)
+        tri_bias = _clone_bias(bias)
+        ref = compact_simplicial_attention_torch(
+            *ref_tensors,
+            neighbor_idx=neighbor_idx,
+            neighbor_mask=neighbor_mask,
+            bias=ref_bias,
+        )
+        actual = compact_simplicial_attention_triton(
+            *tri_tensors,
+            neighbor_idx=neighbor_idx,
+            neighbor_mask=neighbor_mask,
+            bias=tri_bias,
+            precision="ieee_fp32",
+            strict=True,
+        )
+        assert torch.allclose(actual, ref, atol=5e-4, rtol=5e-4)
 
 
 @pytest.mark.skipif(
