@@ -874,6 +874,7 @@ def test_scalar_compact_spherical_coefficients_triton_match_expanded_cuda():
     neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.2).contiguous()
     neighbor_mask[..., 0] = True
     neighbor_mask[0, 0, :] = False
+    neighbor_mask[1, 3, 1:] = False
     unit = torch.randn(batch_size, num_tokens, k_neighbors, 3, device=device, dtype=torch.float32)
     unit = torch.nn.functional.normalize(unit, dim=-1)
     unit = unit.masked_fill(~neighbor_mask[..., None], 0.0)
@@ -941,6 +942,21 @@ def test_scalar_compact_spherical_coefficients_triton_match_expanded_cuda():
         assert actual_tensor.grad is not None
         assert ref_tensor.grad is not None
         assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
+    invalid_coeff_mask = ~neighbor_mask[:, None, :, :, None]
+    left_invalid_grad = cmp_bias_tensors[3].grad.masked_select(invalid_coeff_mask.expand_as(cmp_bias_tensors[3]))
+    right_invalid_grad = cmp_bias_tensors[4].grad.masked_select(invalid_coeff_mask.expand_as(cmp_bias_tensors[4]))
+    assert torch.allclose(
+        left_invalid_grad,
+        torch.zeros_like(left_invalid_grad),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert torch.allclose(
+        right_invalid_grad,
+        torch.zeros_like(right_invalid_grad),
+        atol=1e-6,
+        rtol=0.0,
+    )
 
 
 @pytest.mark.skipif(

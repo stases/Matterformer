@@ -726,12 +726,12 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 tl.store(
                     dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
                     dleft0,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
                     dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + offs_c[None, :],
                     dright0,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
             if ANGLE_C1 > 0:
                 c_mask = offs_c < ANGLE_C1
@@ -742,12 +742,12 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 tl.store(
                     dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
                     dleft1,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
                     dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
                     dright1,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
             if ANGLE_C2 > 0:
                 c_mask = offs_c < ANGLE_C2
@@ -758,12 +758,12 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
                 tl.store(
                     dangle_left_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
                     dleft2,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
                 tl.store(
                     dangle_right_coeff_ptr + coeff_base + offs_k[:, None] * ANGLE_COEFFS + c_offs[None, :],
                     dright2,
-                    mask=valid[:, None] & c_mask[None, :],
+                    mask=k_mask[:, None] & c_mask[None, :],
                 )
             dangle_gate = tl.sum(tl.sum(ds * angle, axis=0), axis=0)
             tl.store(dangle_gate_ptr + bh_idx * num_atoms + atom_idx, dangle_gate)
