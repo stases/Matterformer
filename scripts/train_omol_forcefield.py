@@ -399,6 +399,7 @@ def main(args: argparse.Namespace) -> None:
         pair_hidden_dim=args.pair_hidden_dim,
         pair_n_rbf=args.pair_n_rbf,
         pair_rbf_max=args.pair_rbf_max,
+        force_head_mode=args.force_head_mode,
     ).to(device)
     initialize_model_parameters(model, train_dataset, device, bf16_enabled=args.bf16)
     close_dataset_handles(train_dataset)
@@ -691,6 +692,11 @@ if __name__ == "__main__":
     parser.add_argument("--pair-hidden-dim", type=int, default=128)
     parser.add_argument("--pair-n-rbf", type=int, default=16)
     parser.add_argument("--pair-rbf-max", type=float, default=6.0)
+    parser.add_argument(
+        "--force-head-mode",
+        default="auto",
+        choices=["auto", "pairwise", "direct", "direct_3d", "non_equivariant", "tetra_vector"],
+    )
     parser.add_argument("--train-augmentation", type=str, default="o3", choices=["off", "so3", "o3"])
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--float32-matmul-precision", type=str, default="highest")

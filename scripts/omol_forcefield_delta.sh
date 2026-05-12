@@ -24,6 +24,7 @@ CHGSPIN_MODE="${CHGSPIN_MODE:-add}"
 PAIR_HIDDEN_DIM="${PAIR_HIDDEN_DIM:-128}"
 PAIR_N_RBF="${PAIR_N_RBF:-16}"
 PAIR_RBF_MAX="${PAIR_RBF_MAX:-6.0}"
+FORCE_HEAD_MODE="${FORCE_HEAD_MODE:-auto}"
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
@@ -190,6 +191,7 @@ echo "weight_decay:            $WEIGHT_DECAY"
 echo "warmup_steps:            $WARMUP_STEPS"
 echo "normalizer_rmsd:         $NORMALIZER_RMSD"
 echo "train_augmentation:      $TRAIN_AUGMENTATION"
+echo "force_head_mode:        $FORCE_HEAD_MODE"
 echo "bf16:                    $BF16"
 echo "float32_matmul_prec:     $FLOAT32_MATMUL_PRECISION"
 echo "grad_clip_norm:          $GRAD_CLIP_NORM"
@@ -221,6 +223,7 @@ echo "============================================================"
   --pair-hidden-dim "$PAIR_HIDDEN_DIM" \
   --pair-n-rbf "$PAIR_N_RBF" \
   --pair-rbf-max "$PAIR_RBF_MAX" \
+  --force-head-mode "$FORCE_HEAD_MODE" \
   --batch-size "$BATCH_SIZE" \
   --val-batch-size "$VAL_BATCH_SIZE" \
   --max-atoms-per-batch "$MAX_ATOMS_PER_BATCH" \

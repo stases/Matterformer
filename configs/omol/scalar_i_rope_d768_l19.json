@@ -1,0 +1,23 @@
+{
+  "num_blocks": 19,
+  "stream_type": "scalar",
+  "block_mix": [0, 0, 1],
+  "order_policy": "local_then_global",
+  "scalar_dim": 768,
+  "trivial": {
+    "target": "scalar",
+    "attention": {
+      "kind": "mha",
+      "num_heads": 12,
+      "position_encoding": "none",
+      "mha_position_mode": "rope",
+      "mha_rope_freq_sigma": 4.0,
+      "mha_rope_learned_freqs": true,
+      "mha_rope_use_key": false,
+      "mha_rope_on_values": true
+    },
+    "ffn": {
+      "ffn_mult": 4
+    }
+  }
+}

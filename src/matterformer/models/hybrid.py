@@ -7,6 +7,7 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
 from matterformer.geometry.cache import GeometryCache
@@ -663,83 +664,89 @@ class CompactSimplicialGeometryBias(nn.Module):
         edge_features = geom.rbf
         batch_size, num_atoms, num_neighbors, _ = edge_features.shape
         needs_basis = (self.use_angle and self.representation == "expanded") or self.message_enabled
-        basis = _spherical_basis_lmax2(geom.unit) if needs_basis else None
+        with record_function("simplicial_bias/spherical_basis_expand_inputs"):
+            basis = _spherical_basis_lmax2(geom.unit) if needs_basis else None
         u = v = gate = None
         if self.use_radial_uv:
-            assert self.u_mlp is not None and self.v_mlp is not None and self.gate is not None
-            u = self.u_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
-            v = self.v_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
-            u = u.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
-            v = v.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
-            gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
+            with record_function("simplicial_bias/radial_uv_mlp"):
+                assert self.u_mlp is not None and self.v_mlp is not None and self.gate is not None
+                u = self.u_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
+                v = self.v_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
+                u = u.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
+                v = v.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
+                gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         left = right = angle_gate = left_compact = right_compact = None
         edge_mask = geom.neighbor_mask[:, None, :, :, None]
         if self.use_angle:
-            assert self.left_mlp is not None and self.right_mlp is not None and self.angle_gate is not None
-            left_coeff = self.left_mlp(edge_features).view(
-                batch_size,
-                num_atoms,
-                num_neighbors,
-                self.num_heads,
-                self.num_coefficients,
-            )
-            right_coeff = self.right_mlp(edge_features).view(
-                batch_size,
-                num_atoms,
-                num_neighbors,
-                self.num_heads,
-                self.num_coefficients,
-            )
+            with record_function("simplicial_bias/angle_coeff_mlp"):
+                assert self.left_mlp is not None and self.right_mlp is not None and self.angle_gate is not None
+                left_coeff = self.left_mlp(edge_features).view(
+                    batch_size,
+                    num_atoms,
+                    num_neighbors,
+                    self.num_heads,
+                    self.num_coefficients,
+                )
+                right_coeff = self.right_mlp(edge_features).view(
+                    batch_size,
+                    num_atoms,
+                    num_neighbors,
+                    self.num_heads,
+                    self.num_coefficients,
+                )
             if self.representation == "compact":
-                left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
-                right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
-                left_compact = left_compact.masked_fill(~edge_mask, 0.0)
-                right_compact = right_compact.masked_fill(~edge_mask, 0.0)
+                with record_function("simplicial_bias/angle_compact_pack"):
+                    left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                    right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
+                    left_compact = left_compact.masked_fill(~edge_mask, 0.0)
+                    right_compact = right_compact.masked_fill(~edge_mask, 0.0)
             else:
-                assert basis is not None
-                left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-                right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-                left = left.masked_fill(~edge_mask, 0.0)
-                right = right.masked_fill(~edge_mask, 0.0)
+                with record_function("simplicial_bias/angle_expand_spherical"):
+                    assert basis is not None
+                    left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
+                    right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
+                    left = left.masked_fill(~edge_mask, 0.0)
+                    right = right.masked_fill(~edge_mask, 0.0)
             angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         message_left = message_right = message_basis = None
         if self.message_enabled:
-            assert (
-                self.message_left_mlp is not None
-                and self.message_right_mlp is not None
-                and self.message_basis is not None
-                and self.message_gate is not None
-                and basis is not None
-            )
-            message_left_coeff = self.message_left_mlp(edge_features).view(
-                batch_size,
-                num_atoms,
-                num_neighbors,
-                self.num_heads,
-                self.num_message_coefficients,
-            )
-            message_right_coeff = self.message_right_mlp(edge_features).view(
-                batch_size,
-                num_atoms,
-                num_neighbors,
-                self.num_heads,
-                self.num_message_coefficients,
-            )
-            message_left = _expand_spherical_coefficients(
-                message_left_coeff,
-                basis=basis,
-                channels_by_l=self.message_channels_by_l,
-            ).to(dtype=dtype)
-            message_right = _expand_spherical_coefficients(
-                message_right_coeff,
-                basis=basis,
-                channels_by_l=self.message_channels_by_l,
-            ).to(dtype=dtype)
-            message_left = message_left.masked_fill(~edge_mask, 0.0)
-            message_right = message_right.masked_fill(~edge_mask, 0.0)
-            message_gate = self.message_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
-            message_left = message_left * message_gate[:, :, :, None, None]
-            message_basis = self.message_basis.to(dtype=dtype)
+            with record_function("simplicial_bias/message_mlp_expand"):
+                assert (
+                    self.message_left_mlp is not None
+                    and self.message_right_mlp is not None
+                    and self.message_basis is not None
+                    and self.message_gate is not None
+                    and basis is not None
+                )
+                message_left_coeff = self.message_left_mlp(edge_features).view(
+                    batch_size,
+                    num_atoms,
+                    num_neighbors,
+                    self.num_heads,
+                    self.num_message_coefficients,
+                )
+                message_right_coeff = self.message_right_mlp(edge_features).view(
+                    batch_size,
+                    num_atoms,
+                    num_neighbors,
+                    self.num_heads,
+                    self.num_message_coefficients,
+                )
+                message_left = _expand_spherical_coefficients(
+                    message_left_coeff,
+                    basis=basis,
+                    channels_by_l=self.message_channels_by_l,
+                ).to(dtype=dtype)
+                message_right = _expand_spherical_coefficients(
+                    message_right_coeff,
+                    basis=basis,
+                    channels_by_l=self.message_channels_by_l,
+                ).to(dtype=dtype)
+                message_left = message_left.masked_fill(~edge_mask, 0.0)
+                message_right = message_right.masked_fill(~edge_mask, 0.0)
+                message_gate = self.message_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
+                message_left = message_left * message_gate[:, :, :, None, None]
+                message_basis = self.message_basis.to(dtype=dtype)
         return CompactSimplicialBias(
             u=u,
             v=v,
@@ -846,45 +853,51 @@ class CompactSimplicialAttention(nn.Module):
         return x.transpose(1, 2).contiguous().view(x.shape[0], x.shape[2], self.inner_dim)
 
     def forward(self, x_atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
-        q, k1, v1, k2, v2 = self.in_proj(x_atoms).chunk(5, dim=-1)
-        q = self._split(q) * self.scale
-        k1 = self._split(k1)
-        v1 = self._split(v1)
-        k2 = self._split(k2)
-        v2 = self._split(v2)
-        bias = self.bias(geom, dtype=x_atoms.dtype)
+        with record_function("compact_simplicial/in_proj_split"):
+            q, k1, v1, k2, v2 = self.in_proj(x_atoms).chunk(5, dim=-1)
+            q = self._split(q) * self.scale
+            k1 = self._split(k1)
+            v1 = self._split(v1)
+            k2 = self._split(k2)
+            v2 = self._split(v2)
+        with record_function("compact_simplicial/bias_build"):
+            bias = self.bias(geom, dtype=x_atoms.dtype)
         if bias.angle_left_coeff is not None:
-            bias = _expand_compact_angle_bias_if_needed(bias, geom)
+            with record_function("compact_simplicial/compact_angle_expand_for_scalar_kernel"):
+                bias = _expand_compact_angle_bias_if_needed(bias, geom)
         if self.backend in {"triton", "triton_knn"}:
-            out = compact_simplicial_attention_triton(
-                q,
-                k1,
-                v1,
-                k2,
-                v2,
-                neighbor_idx=geom.neighbor_idx,
-                neighbor_mask=geom.neighbor_mask,
-                bias=bias,
-                dropout_p=self.dropout,
-                training=self.training,
-                precision=self.precision,
-                debug_torch_backward=self.debug_torch_backward,
-                strict=self.strict_triton,
-            )
+            with record_function("compact_simplicial/triton_attention"):
+                out = compact_simplicial_attention_triton(
+                    q,
+                    k1,
+                    v1,
+                    k2,
+                    v2,
+                    neighbor_idx=geom.neighbor_idx,
+                    neighbor_mask=geom.neighbor_mask,
+                    bias=bias,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                    precision=self.precision,
+                    debug_torch_backward=self.debug_torch_backward,
+                    strict=self.strict_triton,
+                )
         else:
-            out = compact_simplicial_attention_torch(
-                q,
-                k1,
-                v1,
-                k2,
-                v2,
-                neighbor_idx=geom.neighbor_idx,
-                neighbor_mask=geom.neighbor_mask,
-                bias=bias,
-                dropout_p=self.dropout,
-                training=self.training,
-            )
-        return self.out_proj(self._merge(out))
+            with record_function("compact_simplicial/torch_attention"):
+                out = compact_simplicial_attention_torch(
+                    q,
+                    k1,
+                    v1,
+                    k2,
+                    v2,
+                    neighbor_idx=geom.neighbor_idx,
+                    neighbor_mask=geom.neighbor_mask,
+                    bias=bias,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                )
+        with record_function("compact_simplicial/out_proj"):
+            return self.out_proj(self._merge(out))
 
 
 class SimplicialLocalLayer(nn.Module):
@@ -920,9 +933,11 @@ class SimplicialLocalLayer(nn.Module):
         coords_len = state.geom.coords_len
         scalar = state.scalar
         atoms = scalar[:, :coords_len, :]
-        attn_out = self.attn(self.norm1(atoms), state.geom)
-        atoms = atoms + self.dropout(attn_out)
-        atoms = atoms + self.dropout(self.mlp(self.norm2(atoms)))
+        with record_function("simplicial_local/attention_residual"):
+            attn_out = self.attn(self.norm1(atoms), state.geom)
+            atoms = atoms + self.dropout(attn_out)
+        with record_function("simplicial_local/mlp_residual"):
+            atoms = atoms + self.dropout(self.mlp(self.norm2(atoms)))
         if scalar.shape[1] == coords_len:
             scalar = atoms
         else:
@@ -1103,7 +1118,8 @@ class GroupFramewiseSimplicialAttention(nn.Module):
 
     def forward(self, x_group_atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
         batch_size, num_atoms, group_order, _ = x_group_atoms.shape
-        q, k1, v1, k2, v2 = self._project_in(x_group_atoms)
+        with record_function("group_simplicial/in_proj"):
+            q, k1, v1, k2, v2 = self._project_in(x_group_atoms)
 
         def split_group(tensor: torch.Tensor) -> torch.Tensor:
             return (
@@ -1112,95 +1128,106 @@ class GroupFramewiseSimplicialAttention(nn.Module):
                 .contiguous()
             )
 
-        q_g = split_group(q) * self.scale
-        k1_g = split_group(k1)
-        v1_g = split_group(v1)
-        k2_g = split_group(k2)
-        v2_g = split_group(v2)
+        with record_function("group_simplicial/split_heads"):
+            q_g = split_group(q) * self.scale
+            k1_g = split_group(k1)
+            v1_g = split_group(v1)
+            k2_g = split_group(k2)
+            v2_g = split_group(v2)
 
         if self.backend in {"triton_grouped", "triton_sg"}:
             # Geometry is invariant across tetra frames.  Compute it once per real
             # batch item and let the grouped Triton kernel map each program id to
             # (batch, group, head, atom), reusing the same neighbor/bias rows for
             # all group frames.  This avoids the old [B * G, H, N, K, R] materialization.
-            bias = self.bias(geom, dtype=x_group_atoms.dtype)
-            out_g = triton_grouped_compact_simplicial_attention(
-                q_g,
-                k1_g,
-                v1_g,
-                k2_g,
-                v2_g,
-                neighbor_idx=geom.neighbor_idx,
-                neighbor_mask=geom.neighbor_mask,
-                u=bias.u,
-                v_bias=bias.v,
-                gate=bias.gate,
-                angle_left=bias.angle_left,
-                angle_right=bias.angle_right,
-                unit=geom.unit,
-                angle_left_coeff=bias.angle_left_coeff,
-                angle_right_coeff=bias.angle_right_coeff,
-                angle_channels_by_l=bias.angle_channels_by_l,
-                angle_rank=bias.angle_rank,
-                angle_gate=bias.angle_gate,
-                message_left=bias.message_left,
-                message_right=bias.message_right,
-                message_basis=bias.message_basis,
-                dropout_p=self.dropout,
-                training=self.training,
-                precision=self.precision,
-                debug_torch_backward=self.debug_torch_backward,
-                strict=self.strict_triton,
-            )
+            with record_function("group_simplicial/bias_build"):
+                bias = self.bias(geom, dtype=x_group_atoms.dtype)
+            with record_function("group_simplicial/triton_grouped_attention"):
+                out_g = triton_grouped_compact_simplicial_attention(
+                    q_g,
+                    k1_g,
+                    v1_g,
+                    k2_g,
+                    v2_g,
+                    neighbor_idx=geom.neighbor_idx,
+                    neighbor_mask=geom.neighbor_mask,
+                    u=bias.u,
+                    v_bias=bias.v,
+                    gate=bias.gate,
+                    angle_left=bias.angle_left,
+                    angle_right=bias.angle_right,
+                    unit=geom.unit,
+                    angle_left_coeff=bias.angle_left_coeff,
+                    angle_right_coeff=bias.angle_right_coeff,
+                    angle_channels_by_l=bias.angle_channels_by_l,
+                    angle_rank=bias.angle_rank,
+                    angle_gate=bias.angle_gate,
+                    message_left=bias.message_left,
+                    message_right=bias.message_right,
+                    message_basis=bias.message_basis,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                    precision=self.precision,
+                    debug_torch_backward=self.debug_torch_backward,
+                    strict=self.strict_triton,
+                )
         elif self.backend in {"triton", "triton_knn"}:
-            q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            geom_group = _repeat_geometry_cache_for_group(geom, group_order)
-            bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            with record_function("group_simplicial/repeat_group_geometry"):
+                q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                geom_group = _repeat_geometry_cache_for_group(geom, group_order)
+            with record_function("group_simplicial/bias_build_repeated"):
+                bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
             if bias.angle_left_coeff is not None:
-                bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
-            out_flat = compact_simplicial_attention_triton(
-                q_flat,
-                k1_flat,
-                v1_flat,
-                k2_flat,
-                v2_flat,
-                neighbor_idx=geom_group.neighbor_idx,
-                neighbor_mask=geom_group.neighbor_mask,
-                bias=bias,
-                dropout_p=self.dropout,
-                training=self.training,
-                precision=self.precision,
-                debug_torch_backward=self.debug_torch_backward,
-                strict=self.strict_triton,
-            )
+                with record_function("group_simplicial/compact_angle_expand_repeated"):
+                    bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
+            with record_function("group_simplicial/triton_attention_repeated"):
+                out_flat = compact_simplicial_attention_triton(
+                    q_flat,
+                    k1_flat,
+                    v1_flat,
+                    k2_flat,
+                    v2_flat,
+                    neighbor_idx=geom_group.neighbor_idx,
+                    neighbor_mask=geom_group.neighbor_mask,
+                    bias=bias,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                    precision=self.precision,
+                    debug_torch_backward=self.debug_torch_backward,
+                    strict=self.strict_triton,
+                )
             out_g = out_flat.view(batch_size, group_order, self.num_heads, num_atoms, self.head_dim)
         else:
             # Reference path keeps the pre-existing fold-B*G behavior.
-            q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
-            geom_group = _repeat_geometry_cache_for_group(geom, group_order)
-            bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
+            with record_function("group_simplicial/torch_repeat_group_geometry"):
+                q_flat = q_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                k1_flat = k1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                v1_flat = v1_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                k2_flat = k2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                v2_flat = v2_g.reshape(batch_size * group_order, self.num_heads, num_atoms, self.head_dim)
+                geom_group = _repeat_geometry_cache_for_group(geom, group_order)
+            with record_function("group_simplicial/torch_bias_build_repeated"):
+                bias = self.bias(geom_group, dtype=x_group_atoms.dtype)
             if bias.angle_left_coeff is not None:
-                bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
-            out_flat = compact_simplicial_attention_torch(
-                q_flat,
-                k1_flat,
-                v1_flat,
-                k2_flat,
-                v2_flat,
-                neighbor_idx=geom_group.neighbor_idx,
-                neighbor_mask=geom_group.neighbor_mask,
-                bias=bias,
-                dropout_p=self.dropout,
-                training=self.training,
-            )
+                with record_function("group_simplicial/torch_compact_angle_expand_repeated"):
+                    bias = _expand_compact_angle_bias_if_needed(bias, geom_group)
+            with record_function("group_simplicial/torch_attention_repeated"):
+                out_flat = compact_simplicial_attention_torch(
+                    q_flat,
+                    k1_flat,
+                    v1_flat,
+                    k2_flat,
+                    v2_flat,
+                    neighbor_idx=geom_group.neighbor_idx,
+                    neighbor_mask=geom_group.neighbor_mask,
+                    bias=bias,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                )
             out_g = out_flat.view(batch_size, group_order, self.num_heads, num_atoms, self.head_dim)
 
         self._record_diagnostics(
@@ -1212,8 +1239,9 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             bias=bias,
             out_g=out_g,
         )
-        out = out_g.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, num_atoms, group_order, self.inner_dim)
-        return self._project_out(out)
+        with record_function("group_simplicial/out_proj"):
+            out = out_g.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, num_atoms, group_order, self.inner_dim)
+            return self._project_out(out)
 
 
 class GroupFramewiseSimplicialLayer(nn.Module):
@@ -1272,13 +1300,15 @@ class GroupFramewiseSimplicialLayer(nn.Module):
         group = state.group
         atoms = group[:, :coords_len, :, :]
         atoms_before = atoms
-        atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
-        attn_in = self.norm1(atoms_flat).view_as(atoms)
-        attn_delta = self.dropout(self.attn(attn_in, state.geom))
-        atoms = atoms + attn_delta
-        atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
-        mlp_delta = self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
-        atoms = atoms + mlp_delta
+        with record_function("group_simplicial_layer/attention_residual"):
+            atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
+            attn_in = self.norm1(atoms_flat).view_as(atoms)
+            attn_delta = self.dropout(self.attn(attn_in, state.geom))
+            atoms = atoms + attn_delta
+        with record_function("group_simplicial_layer/mlp_residual"):
+            atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
+            mlp_delta = self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+            atoms = atoms + mlp_delta
         input_rms = _diag_rms(atoms_before)
         attn_delta_rms = _diag_rms(attn_delta)
         mlp_delta_rms = _diag_rms(mlp_delta)
@@ -1350,10 +1380,11 @@ class TetraPlatonicGlobalLayer(nn.Module):
     def forward(self, state: ModelState) -> ModelState:
         if state.group is None:
             return state
-        group_shape = state.group.shape
-        x = state.group.reshape(group_shape[0], group_shape[1], self.group_order * self.dim_per_frame)
-        x = self.block(x, pos=self._positions(state.pos, group_shape[1]), pad_mask=state.mask)
-        state.group = x.view(group_shape)
+        with record_function("tetra_global/platonic_block"):
+            group_shape = state.group.shape
+            x = state.group.reshape(group_shape[0], group_shape[1], self.group_order * self.dim_per_frame)
+            x = self.block(x, pos=self._positions(state.pos, group_shape[1]), pad_mask=state.mask)
+            state.group = x.view(group_shape)
         if state.mask is not None:
             state.group = state.group.masked_fill(state.mask[..., None, None], 0.0)
         return state
@@ -1446,22 +1477,24 @@ class TrivialGlobalLayer(nn.Module):
         if self.geometry_bias is not None:
             if state.geom is None or state.geom.features is None:
                 raise RuntimeError("Dense geometry features are required for scalar geometry bias")
-            attn_bias = self.geometry_bias.forward_from_features(
-                geom_features=state.geom.features,
-                coords_len=state.geom.coords_len,
+            with record_function("trivial_global/dense_geometry_bias"):
+                attn_bias = self.geometry_bias.forward_from_features(
+                    geom_features=state.geom.features,
+                    coords_len=state.geom.coords_len,
+                    pad_mask=state.mask,
+                    seq_len=state.scalar.shape[1],
+                    sigma=state.sigma,
+                    out_dtype=state.scalar.dtype,
+                )
+        with record_function("trivial_global/adaln_mha_block"):
+            state.scalar = self.block(
+                state.scalar,
+                state.cond_emb,
                 pad_mask=state.mask,
-                seq_len=state.scalar.shape[1],
+                attn_head_bias=attn_bias,
+                mha_positions=self._positions(state.pos, state.scalar.shape[1]) if self.mha_position_mode == "rope" else None,
                 sigma=state.sigma,
-                out_dtype=state.scalar.dtype,
             )
-        state.scalar = self.block(
-            state.scalar,
-            state.cond_emb,
-            pad_mask=state.mask,
-            attn_head_bias=attn_bias,
-            mha_positions=self._positions(state.pos, state.scalar.shape[1]) if self.mha_position_mode == "rope" else None,
-            sigma=state.sigma,
-        )
         if state.mask is not None:
             state.scalar = state.scalar.masked_fill(state.mask[..., None], 0.0)
         return state
@@ -1474,7 +1507,8 @@ class HybridBlock(nn.Module):
 
     def forward(self, state: ModelState) -> ModelState:
         for layer in self.sublayers:
-            state = layer(state)
+            with record_function(f"hybrid_layer/{type(layer).__name__}"):
+                state = layer(state)
         return state
 
 
@@ -1737,28 +1771,31 @@ class HybridTransformerTrunk(nn.Module):
             and not self.needs_dense_geometry
             and lattice is None
         ):
-            atom_pad_mask = pad_mask[:, : coords.shape[1]] if pad_mask is not None else None
-            return build_triton_nonperiodic_knn_geometry_cache(
-                coords,
-                pad_mask=atom_pad_mask,
-                k_neighbors=self.k_neighbors,
-                rbf_dim=self.rbf_dim,
-                cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
-                seq_len=seq_len,
-                strict=self.geometry_builder_strict,
-            )
+            with record_function("hybrid_geom/triton_nonperiodic_knn_cache"):
+                atom_pad_mask = pad_mask[:, : coords.shape[1]] if pad_mask is not None else None
+                return build_triton_nonperiodic_knn_geometry_cache(
+                    coords,
+                    pad_mask=atom_pad_mask,
+                    k_neighbors=self.k_neighbors,
+                    rbf_dim=self.rbf_dim,
+                    cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
+                    seq_len=seq_len,
+                    strict=self.geometry_builder_strict,
+                )
         if self.geometry_builder == "triton_nonperiodic" and self.geometry_builder_strict:
             raise RuntimeError("triton_nonperiodic geometry can only be used for nonperiodic compact-only geometry")
-        geom = self.compute_geometry_features(coords=coords, pad_mask=pad_mask, lattice=lattice)
-        return build_geometry_cache(
-            geom,
-            coords_len=coords.shape[1],
-            seq_len=seq_len,
-            k_neighbors=self.k_neighbors,
-            pad_mask=pad_mask,
-            rbf_dim=self.rbf_dim,
-            cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
-        )
+        with record_function("hybrid_geom/dense_geometry_features"):
+            geom = self.compute_geometry_features(coords=coords, pad_mask=pad_mask, lattice=lattice)
+        with record_function("hybrid_geom/dense_to_compact_cache"):
+            return build_geometry_cache(
+                geom,
+                coords_len=coords.shape[1],
+                seq_len=seq_len,
+                k_neighbors=self.k_neighbors,
+                pad_mask=pad_mask,
+                rbf_dim=self.rbf_dim,
+                cutoff=float(self.rbf_cutoff) if self.rbf_cutoff is not None else None,
+            )
 
     def collect_sg_diagnostics(self) -> dict[str, float]:
         metrics: dict[str, float] = {}
@@ -1799,15 +1836,17 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"pad_mask shape {tuple(pad_mask.shape)} does not match x {tuple(x.shape)}")
         if self.geometry_adapter is not None and coords is None:
             raise ValueError("coords must be provided when geometry_adapter is configured")
-        geom = (
-            self._build_geom_cache(coords=coords, pad_mask=pad_mask, lattice=lattice, seq_len=x.shape[1])
-            if coords is not None and self.requires_geometry_cache
-            else None
-        )
+        with record_function("hybrid_trunk/build_geom_cache"):
+            geom = (
+                self._build_geom_cache(coords=coords, pad_mask=pad_mask, lattice=lattice, seq_len=x.shape[1])
+                if coords is not None and self.requires_geometry_cache
+                else None
+            )
         scalar = x if self.stream_type == "scalar" else None
         group = None
         if self.stream_type == "tetra":
-            group = self._lift_tetra_input(x, pad_mask, geom)
+            with record_function("hybrid_trunk/lift_tetra_input"):
+                group = self._lift_tetra_input(x, pad_mask, geom)
         state = ModelState(
             pos=coords if coords is not None else x.new_zeros(x.shape[0], x.shape[1], 3),
             mask=pad_mask,
@@ -1817,8 +1856,9 @@ class HybridTransformerTrunk(nn.Module):
             cond_emb=cond_emb,
             sigma=sigma,
         )
-        for block in self.blocks:
-            state = block(state)
+        with record_function("hybrid_trunk/blocks"):
+            for block in self.blocks:
+                state = block(state)
         if self.stream_type == "scalar":
             if state.scalar is None:
                 raise RuntimeError("Scalar hybrid trunk lost scalar state")
@@ -1837,9 +1877,10 @@ class HybridTransformerTrunk(nn.Module):
             if self.group_readout_proj is None:
                 raise RuntimeError("group_readout_proj is not configured for group_mean tetra readout")
             scalar_out = self.group_readout_proj(state.group.mean(dim=2))
-        out = self.norm_out(scalar_out)
-        if pad_mask is not None:
-            out = out.masked_fill(pad_mask[..., None], 0.0)
+        with record_function("hybrid_trunk/final_norm"):
+            out = self.norm_out(scalar_out)
+            if pad_mask is not None:
+                out = out.masked_fill(pad_mask[..., None], 0.0)
         if return_output:
             return HybridTrunkOutput(scalar=out, group=state.group, stream_type=self.stream_type)
         return out

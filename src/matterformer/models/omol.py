@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 from matterformer.geometry import NonPeriodicGeometryAdapter
 from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk, HybridTrunkOutput
@@ -112,6 +113,7 @@ class MatterformerOMolForceField(nn.Module):
         pair_hidden_dim: int = 128,
         pair_n_rbf: int = 16,
         pair_rbf_max: float = 6.0,
+        force_head_mode: str = "auto",
     ) -> None:
         super().__init__()
         self.max_atomic_number = int(max_atomic_number)
@@ -120,6 +122,18 @@ class MatterformerOMolForceField(nn.Module):
         self.pair_rbf_max = float(pair_rbf_max)
         self.hybrid_config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.stream_type = self.hybrid_config.stream_type
+        force_head_mode = str(force_head_mode).lower().replace("-", "_")
+        if force_head_mode == "auto":
+            force_head_mode = "tetra_vector" if self.stream_type == "tetra" else "pairwise"
+        if force_head_mode in {"equivariant", "equivariant_pairwise", "scalar_pairwise"}:
+            force_head_mode = "pairwise"
+        if force_head_mode in {"direct_3d", "direct_scalar", "mlp3d", "non_equivariant"}:
+            force_head_mode = "direct"
+        if self.stream_type == "scalar" and force_head_mode not in {"pairwise", "direct"}:
+            raise ValueError("Scalar OMol force_head_mode must be one of {'auto', 'pairwise', 'direct'}")
+        if self.stream_type == "tetra" and force_head_mode not in {"tetra_vector"}:
+            raise ValueError("Tetra OMol force_head_mode currently supports only {'auto', 'tetra_vector'}")
+        self.force_head_mode = force_head_mode
 
         self.atom_embedding = nn.Embedding(self.max_atomic_number + 1, d_model, padding_idx=0)
         nn.init.normal_(self.atom_embedding.weight, std=1.0 / math.sqrt(d_model))
@@ -147,13 +161,27 @@ class MatterformerOMolForceField(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, 1),
         )
-        self.scalar_force_head = nn.Sequential(
-            nn.Linear(2 * d_model + self.pair_n_rbf, pair_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(pair_hidden_dim, 1),
-        )
-        nn.init.zeros_(self.scalar_force_head[-1].weight)
-        nn.init.zeros_(self.scalar_force_head[-1].bias)
+        if self.stream_type == "scalar" and self.force_head_mode == "pairwise":
+            self.scalar_force_head = nn.Sequential(
+                nn.Linear(2 * d_model + self.pair_n_rbf, pair_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(pair_hidden_dim, 1),
+            )
+            nn.init.zeros_(self.scalar_force_head[-1].weight)
+            nn.init.zeros_(self.scalar_force_head[-1].bias)
+        else:
+            self.scalar_force_head = None
+        if self.stream_type == "scalar" and self.force_head_mode == "direct":
+            self.scalar_direct_force_head = nn.Sequential(
+                nn.LayerNorm(d_model + 3),
+                nn.Linear(d_model + 3, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 3),
+            )
+            nn.init.normal_(self.scalar_direct_force_head[-1].weight, std=1e-3)
+            nn.init.zeros_(self.scalar_direct_force_head[-1].bias)
+        else:
+            self.scalar_direct_force_head = None
 
         if self.stream_type == "tetra":
             group = PLATONIC_GROUPS[str(self.hybrid_config.tetra.get("group", "tetrahedron")).lower()]
@@ -194,29 +222,45 @@ class MatterformerOMolForceField(nn.Module):
         return torch.exp(-gamma * (pair_dist.unsqueeze(-1) - centers.view(1, 1, 1, -1)).square())
 
     def _scalar_forces(self, trunk_out: torch.Tensor, coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
-        geom = self.trunk.compute_geometry_features(coords=coords, pad_mask=pad_mask, lattice=None)
-        rbf = self._distance_rbf(geom.pair_dist)
-        batch_size, num_atoms = trunk_out.shape[:2]
-        hi = trunk_out[:, :, None, :].expand(batch_size, num_atoms, num_atoms, -1)
-        hj = trunk_out[:, None, :, :].expand(batch_size, num_atoms, num_atoms, -1)
-        pair_input = torch.cat([hi, hj, rbf.to(dtype=trunk_out.dtype)], dim=-1)
-        weights = self.scalar_force_head(pair_input).squeeze(-1)
-        weights = weights.masked_fill(~geom.pair_mask, 0.0)
-        weights = weights - torch.diag_embed(torch.diagonal(weights, dim1=-2, dim2=-1))
-        forces = (weights[..., None].to(dtype=geom.pair_delta.dtype) * geom.pair_delta).sum(dim=2)
-        forces = forces.masked_fill(pad_mask[..., None], 0.0)
-        forces = forces - _masked_mean(forces, pad_mask)
-        return forces.masked_fill(pad_mask[..., None], 0.0)
+        if self.scalar_force_head is None:
+            raise RuntimeError("Pairwise scalar force head is not configured")
+        with record_function("omol/force_pairwise_dense_geometry"):
+            geom = self.trunk.compute_geometry_features(coords=coords, pad_mask=pad_mask, lattice=None)
+            rbf = self._distance_rbf(geom.pair_dist)
+        with record_function("omol/force_pairwise_pair_materialization"):
+            batch_size, num_atoms = trunk_out.shape[:2]
+            hi = trunk_out[:, :, None, :].expand(batch_size, num_atoms, num_atoms, -1)
+            hj = trunk_out[:, None, :, :].expand(batch_size, num_atoms, num_atoms, -1)
+            pair_input = torch.cat([hi, hj, rbf.to(dtype=trunk_out.dtype)], dim=-1)
+        with record_function("omol/force_pairwise_mlp_and_reduce"):
+            weights = self.scalar_force_head(pair_input).squeeze(-1)
+            weights = weights.masked_fill(~geom.pair_mask, 0.0)
+            weights = weights - torch.diag_embed(torch.diagonal(weights, dim1=-2, dim2=-1))
+            forces = (weights[..., None].to(dtype=geom.pair_delta.dtype) * geom.pair_delta).sum(dim=2)
+            forces = forces.masked_fill(pad_mask[..., None], 0.0)
+            forces = forces - _masked_mean(forces, pad_mask)
+            return forces.masked_fill(pad_mask[..., None], 0.0)
+
+    def _scalar_direct_forces(self, trunk_out: torch.Tensor, coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        if self.scalar_direct_force_head is None:
+            raise RuntimeError("Direct scalar force head is not configured")
+        with record_function("omol/force_direct_3d_head"):
+            head_input = torch.cat([trunk_out, coords.to(dtype=trunk_out.dtype)], dim=-1)
+            forces = self.scalar_direct_force_head(head_input)
+            forces = forces.masked_fill(pad_mask[..., None], 0.0)
+            forces = forces - _masked_mean(forces, pad_mask)
+            return forces.masked_fill(pad_mask[..., None], 0.0)
 
     def _tetra_forces(self, group_out: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
         if self.group_force_head is None:
             raise RuntimeError("Tetra force head is not configured")
-        local_vectors = self.group_force_head(group_out)
-        rotations = self._group_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
-        vectors = torch.einsum("gij,bngi->bngj", rotations, local_vectors).mean(dim=2)
-        vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
-        vectors = vectors - _masked_mean(vectors, pad_mask)
-        return vectors.masked_fill(pad_mask[..., None], 0.0)
+        with record_function("omol/force_tetra_vector_head"):
+            local_vectors = self.group_force_head(group_out)
+            rotations = self._group_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+            vectors = torch.einsum("gij,bngi->bngj", rotations, local_vectors).mean(dim=2)
+            vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
+            vectors = vectors - _masked_mean(vectors, pad_mask)
+            return vectors.masked_fill(pad_mask[..., None], 0.0)
 
     def forward(
         self,
@@ -227,41 +271,49 @@ class MatterformerOMolForceField(nn.Module):
         charge: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        pad_mask = pad_mask.bool()
-        centered_coords = _center_coords(coords, pad_mask)
-        atomic_numbers = atomic_numbers.clamp(min=0, max=self.max_atomic_number)
-        token_features = self.atom_embedding(atomic_numbers)
-        token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
-        token_features = self.charge_spin(token_features, charge=charge, spin=spin, pad_mask=pad_mask)
-        token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
-        sigma = torch.ones(atomic_numbers.shape[0], device=atomic_numbers.device, dtype=coords.dtype)
+        with record_function("omol/input_embed_condition"):
+            pad_mask = pad_mask.bool()
+            centered_coords = _center_coords(coords, pad_mask)
+            atomic_numbers = atomic_numbers.clamp(min=0, max=self.max_atomic_number)
+            token_features = self.atom_embedding(atomic_numbers)
+            token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
+            token_features = self.charge_spin(token_features, charge=charge, spin=spin, pad_mask=pad_mask)
+            token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
+            sigma = torch.ones(atomic_numbers.shape[0], device=atomic_numbers.device, dtype=coords.dtype)
 
         if self.stream_type == "tetra":
-            trunk_result = self.trunk(
-                token_features,
-                None,
-                pad_mask=pad_mask,
-                coords=centered_coords,
-                sigma=sigma,
-                return_output=True,
-            )
+            with record_function("omol/trunk_tetra"):
+                trunk_result = self.trunk(
+                    token_features,
+                    None,
+                    pad_mask=pad_mask,
+                    coords=centered_coords,
+                    sigma=sigma,
+                    return_output=True,
+                )
             if not isinstance(trunk_result, HybridTrunkOutput) or trunk_result.group is None:
                 raise RuntimeError("Tetra OMol model requires group output from the hybrid trunk")
             atom_out = trunk_result.scalar
             forces = self._tetra_forces(trunk_result.group[:, : centered_coords.shape[1]], pad_mask)
         else:
-            atom_out = self.trunk(
-                token_features,
-                None,
-                pad_mask=pad_mask,
-                coords=centered_coords,
-                sigma=sigma,
-            )
-            forces = self._scalar_forces(atom_out[:, : centered_coords.shape[1]], centered_coords, pad_mask)
+            with record_function("omol/trunk_scalar"):
+                atom_out = self.trunk(
+                    token_features,
+                    None,
+                    pad_mask=pad_mask,
+                    coords=centered_coords,
+                    sigma=sigma,
+                )
+            atom_features = atom_out[:, : centered_coords.shape[1]]
+            if self.force_head_mode == "direct":
+                forces = self._scalar_direct_forces(atom_features, centered_coords, pad_mask)
+            else:
+                forces = self._scalar_forces(atom_features, centered_coords, pad_mask)
 
-        atom_out = atom_out[:, : centered_coords.shape[1]].masked_fill(pad_mask[..., None], 0.0)
-        per_atom_energy = self.energy_head(atom_out).squeeze(-1).masked_fill(pad_mask, 0.0)
-        energy = per_atom_energy.double().sum(dim=1).to(dtype=atom_out.dtype)
+        with record_function("omol/energy_head"):
+            atom_out = atom_out[:, : centered_coords.shape[1]].masked_fill(pad_mask[..., None], 0.0)
+            per_atom_energy = self.energy_head(atom_out).squeeze(-1).masked_fill(pad_mask, 0.0)
+            energy = per_atom_energy.double().sum(dim=1).to(dtype=atom_out.dtype)
         return {"energy": energy, "forces": forces.to(dtype=atom_out.dtype)}
 
     def collect_sg_diagnostics(self) -> dict[str, float]:

@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 
 def _canonicalize_mha_position_mode(mode: str) -> str:
@@ -223,52 +224,60 @@ class RotaryMultiheadAttention(nn.Module):
         if positions is None:
             raise ValueError("positions must be provided when mha_position_mode='rope'")
         batch_size, num_tokens, _ = query.shape
-        q = F.linear(
-            query,
-            self.in_proj_weight[: self.embed_dim],
-            None if self.in_proj_bias is None else self.in_proj_bias[: self.embed_dim],
-        )
-        if self.rope_use_key:
-            k = F.linear(
+        with record_function("rotary_mha/qkv_linear"):
+            q = F.linear(
                 query,
-                self.in_proj_weight[self.embed_dim : 2 * self.embed_dim],
-                None if self.in_proj_bias is None else self.in_proj_bias[self.embed_dim : 2 * self.embed_dim],
+                self.in_proj_weight[: self.embed_dim],
+                None if self.in_proj_bias is None else self.in_proj_bias[: self.embed_dim],
             )
-        else:
-            k = torch.ones_like(q)
-        v = F.linear(
-            query,
-            self.in_proj_weight[2 * self.embed_dim :],
-            None if self.in_proj_bias is None else self.in_proj_bias[2 * self.embed_dim :],
-        )
-        q = self._split_heads(q)
-        k = self._split_heads(k)
-        v = self._split_heads(v)
-        q, k = self.rope(q, k, positions)
+            if self.rope_use_key:
+                k = F.linear(
+                    query,
+                    self.in_proj_weight[self.embed_dim : 2 * self.embed_dim],
+                    None if self.in_proj_bias is None else self.in_proj_bias[self.embed_dim : 2 * self.embed_dim],
+                )
+            else:
+                k = torch.ones_like(q)
+            v = F.linear(
+                query,
+                self.in_proj_weight[2 * self.embed_dim :],
+                None if self.in_proj_bias is None else self.in_proj_bias[2 * self.embed_dim :],
+            )
+        with record_function("rotary_mha/split_heads"):
+            q = self._split_heads(q)
+            k = self._split_heads(k)
+            v = self._split_heads(v)
+        with record_function("rotary_mha/rope_qk"):
+            q, k = self.rope(q, k, positions)
         if self.rope_on_values:
-            v = self.rope._apply_rotary(v, positions)
+            with record_function("rotary_mha/rope_values"):
+                v = self.rope._apply_rotary(v, positions)
 
-        additive_mask = self._coerce_attn_mask(
-            attn_mask,
-            batch_size=batch_size,
-            num_tokens=num_tokens,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        key_bias = self._key_padding_bias(key_padding_mask, dtype=q.dtype, device=q.device)
-        if key_bias is not None:
-            additive_mask = key_bias if additive_mask is None else additive_mask + key_bias
+        with record_function("rotary_mha/mask_build"):
+            additive_mask = self._coerce_attn_mask(
+                attn_mask,
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            key_bias = self._key_padding_bias(key_padding_mask, dtype=q.dtype, device=q.device)
+            if key_bias is not None:
+                additive_mask = key_bias if additive_mask is None else additive_mask + key_bias
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=additive_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        with record_function("rotary_mha/sdpa"):
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=additive_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         if self.rope_on_values:
-            attn_out = self.rope._apply_rotary(attn_out, positions, inverse=True)
-        return self.out_proj(self._merge_heads(attn_out)), None
+            with record_function("rotary_mha/inverse_rope_values"):
+                attn_out = self.rope._apply_rotary(attn_out, positions, inverse=True)
+        with record_function("rotary_mha/out_proj"):
+            return self.out_proj(self._merge_heads(attn_out)), None
 
 
 

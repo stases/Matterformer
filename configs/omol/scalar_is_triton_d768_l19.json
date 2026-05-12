@@ -1,0 +1,55 @@
+{
+  "num_blocks": 19,
+  "stream_type": "scalar",
+  "block_mix": [1, 0, 1],
+  "order_policy": "explicit",
+  "explicit_orders": [["trivial", "simplicial"]],
+  "scalar_dim": 768,
+  "simplicial": {
+    "target": "scalar",
+    "k_neighbors": 16,
+    "num_heads": 12,
+    "head_dim": null,
+    "geometry": {
+      "builder": "triton_nonperiodic",
+      "strict": true
+    },
+    "bias": {
+      "kind": "spherical_low_rank",
+      "angle_rank": 16,
+      "channels_by_l": {"0": 2, "1": 3, "2": 1},
+      "radial_basis_dim": 32,
+      "radial_cutoff": 6.0,
+      "hidden_dim": 128,
+      "use_radial_uv": true,
+      "use_angle": true,
+      "radial_gate_init": 0.05,
+      "angle_gate_init": 0.05
+    },
+    "message": {
+      "enabled": false,
+      "rank": 16
+    },
+    "kernel": {
+      "backend": "triton_knn",
+      "precision": "tf32",
+      "strict": true
+    }
+  },
+  "trivial": {
+    "target": "scalar",
+    "attention": {
+      "kind": "mha",
+      "num_heads": 12,
+      "position_encoding": "none",
+      "mha_position_mode": "rope",
+      "mha_rope_freq_sigma": 4.0,
+      "mha_rope_learned_freqs": true,
+      "mha_rope_use_key": false,
+      "mha_rope_on_values": true
+    },
+    "ffn": {
+      "ffn_mult": 4
+    }
+  }
+}

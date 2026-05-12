@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from matterformer.geometry.adapters import GeometryFeatures, NonPeriodicGeometryAdapter
 from matterformer.geometry.cache import GeometryCache
@@ -273,14 +274,15 @@ def build_triton_nonperiodic_knn_geometry_cache(
     if fallback_reason is not None:
         if strict:
             raise RuntimeError(f"triton_nonperiodic kNN geometry is unavailable: {fallback_reason}")
-        return _dense_nonperiodic_knn_geometry_cache(
-            coords,
-            pad_mask=pad_mask,
-            k_neighbors=k_neighbors,
-            rbf_dim=rbf_dim,
-            cutoff=cutoff,
-            seq_len=seq_len,
-        )
+        with record_function("triton_knn/fallback_dense_geometry"):
+            return _dense_nonperiodic_knn_geometry_cache(
+                coords,
+                pad_mask=pad_mask,
+                k_neighbors=k_neighbors,
+                rbf_dim=rbf_dim,
+                cutoff=cutoff,
+                seq_len=seq_len,
+            )
 
     coords_f = coords.float().contiguous()
     batch_size, num_atoms = coords_f.shape[:2]
@@ -301,21 +303,22 @@ def build_triton_nonperiodic_knn_geometry_cache(
     dist2 = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.float32)
 
     grid = (batch_size * num_atoms,)
-    _nonperiodic_knn_topk_kernel[grid](
-        coords_f,
-        pad,
-        neighbor_idx_i32,
-        neighbor_mask,
-        dist2,
-        num_atoms=num_atoms,
-        k_neighbors=k_neighbors,
-        HAS_PAD_MASK=pad_mask is not None,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        BLOCK_MERGE=block_merge,
-        num_warps=4,
-        num_stages=1,
-    )
+    with record_function("triton_knn/topk_kernel"):
+        _nonperiodic_knn_topk_kernel[grid](
+            coords_f,
+            pad,
+            neighbor_idx_i32,
+            neighbor_mask,
+            dist2,
+            num_atoms=num_atoms,
+            k_neighbors=k_neighbors,
+            HAS_PAD_MASK=pad_mask is not None,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            BLOCK_MERGE=block_merge,
+            num_warps=4,
+            num_stages=1,
+        )
 
     rel = torch.empty((batch_size, num_atoms, k_neighbors, 3), device=coords.device, dtype=torch.float32)
     dist = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.float32)
@@ -325,31 +328,34 @@ def build_triton_nonperiodic_knn_geometry_cache(
     rbf_max = float(cutoff) if cutoff is not None else 1.0
     rbf_delta = rbf_max / max(rbf_dim - 1, 1)
     rbf_gamma = 1.0 / max(rbf_delta * rbf_delta, 1e-6)
-    _nonperiodic_knn_features_kernel[grid](
-        coords_f,
-        neighbor_idx_i32,
-        neighbor_mask,
-        dist2,
-        rel,
-        dist,
-        unit,
-        rbf,
-        num_atoms=num_atoms,
-        k_neighbors=k_neighbors,
-        rbf_dim=rbf_dim,
-        rbf_delta=float(rbf_delta),
-        rbf_gamma=float(rbf_gamma),
-        BLOCK_K=block_k,
-        BLOCK_R=block_r,
-        num_warps=4,
-        num_stages=1,
-    )
-    pair_mask = neighbor_mask[:, :, :, None] & neighbor_mask[:, :, None, :]
+    with record_function("triton_knn/features_kernel"):
+        _nonperiodic_knn_features_kernel[grid](
+            coords_f,
+            neighbor_idx_i32,
+            neighbor_mask,
+            dist2,
+            rel,
+            dist,
+            unit,
+            rbf,
+            num_atoms=num_atoms,
+            k_neighbors=k_neighbors,
+            rbf_dim=rbf_dim,
+            rbf_delta=float(rbf_delta),
+            rbf_gamma=float(rbf_gamma),
+            BLOCK_K=block_k,
+            BLOCK_R=block_r,
+            num_warps=4,
+            num_stages=1,
+        )
+    with record_function("triton_knn/pair_mask_pack"):
+        pair_mask = neighbor_mask[:, :, :, None] & neighbor_mask[:, :, None, :]
+        neighbor_idx = neighbor_idx_i32.to(dtype=torch.long)
     return GeometryCache(
         features=None,
         coords_len=num_atoms,
         seq_len=int(seq_len),
-        neighbor_idx=neighbor_idx_i32.to(dtype=torch.long),
+        neighbor_idx=neighbor_idx,
         neighbor_mask=neighbor_mask,
         rel=rel,
         dist=dist,
