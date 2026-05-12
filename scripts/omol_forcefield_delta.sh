@@ -80,6 +80,7 @@ else
   export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
 fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "[error] PYTHON_BIN is not executable: $PYTHON_BIN" >&2
