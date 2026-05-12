@@ -1003,6 +1003,58 @@ def test_scalar_compact_simplicial_triton_accepts_variable_num_atoms_cuda():
 
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
+    reason="scalar compact Triton stride parity requires CUDA and Triton",
+)
+def test_scalar_compact_simplicial_triton_accepts_noncontiguous_qkv_cuda():
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    batch_size, num_heads, num_tokens, k_neighbors, head_dim = 2, 3, 8, 4, 16
+    q_scale = head_dim**-0.5
+    base_kwargs = {"device": device, "dtype": torch.float32}
+    base_tensors = [torch.randn(batch_size, num_tokens, num_heads, head_dim, **base_kwargs) for _ in range(5)]
+
+    def make_leaf(base: torch.Tensor) -> torch.Tensor:
+        leaf = base.clone().transpose(1, 2).detach().requires_grad_(True)
+        assert leaf.shape == (batch_size, num_heads, num_tokens, head_dim)
+        assert not leaf.is_contiguous()
+        return leaf
+
+    ref_tensors = [make_leaf(tensor) for tensor in base_tensors]
+    tri_tensors = [make_leaf(tensor) for tensor in base_tensors]
+    base_idx = torch.arange(num_tokens, device=device)[:, None]
+    offsets = torch.arange(k_neighbors, device=device)[None, :]
+    neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors, device=device) > 0.25).contiguous()
+    neighbor_mask[..., 0] = True
+    neighbor_mask[0, 2, :] = False
+
+    ref = compact_simplicial_attention_torch(
+        *ref_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        q_scale=q_scale,
+    )
+    actual = compact_simplicial_attention_triton(
+        *tri_tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        precision="ieee_fp32",
+        strict=True,
+        q_scale=q_scale,
+    )
+    assert torch.allclose(actual, ref, atol=5e-4, rtol=5e-4)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    actual.backward(grad)
+    for actual_tensor, ref_tensor in zip(tri_tensors, ref_tensors):
+        assert actual_tensor.grad is not None
+        assert ref_tensor.grad is not None
+        assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and TRITON_COMPACT_SIMPLICIAL_AVAILABLE),
     reason="compact Triton simplicial parity requires CUDA and Triton",
 )
 @pytest.mark.parametrize("with_message", [False, True])

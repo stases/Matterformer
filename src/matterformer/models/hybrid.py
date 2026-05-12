@@ -440,12 +440,14 @@ def compact_simplicial_attention_torch(
     unit: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     k1_n = _gather_neighbor_heads(k1, neighbor_idx)
     v1_n = _gather_neighbor_heads(v1, neighbor_idx)
     k2_n = _gather_neighbor_heads(k2, neighbor_idx)
     v2_n = _gather_neighbor_heads(v2, neighbor_idx)
-    scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q, k1_n, k2_n).float()
+    q_eff = q * float(q_scale)
+    scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q_eff, k1_n, k2_n).float()
     if bias is not None:
         if bias.u is not None and bias.v is not None and bias.gate is not None:
             scores = scores + bias.gate[:, :, :, None, None].float() * (
@@ -527,6 +529,7 @@ def compact_simplicial_attention_triton(
     precision: str = "bf16_tc",
     debug_torch_backward: bool = False,
     strict: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     """Compact-kNN Triton backend entrypoint with Torch fallback."""
 
@@ -579,6 +582,7 @@ def compact_simplicial_attention_triton(
             unit=unit,
             dropout_p=dropout_p,
             training=training,
+            q_scale=q_scale,
         )
 
     if bias is None:
@@ -595,6 +599,7 @@ def compact_simplicial_attention_triton(
             precision=precision,
             debug_torch_backward=debug_torch_backward,
             strict=strict,
+            q_scale=q_scale,
         )
     return triton_compact_simplicial_attention(
         q,
@@ -623,6 +628,7 @@ def compact_simplicial_attention_triton(
         precision=precision,
         debug_torch_backward=debug_torch_backward,
         strict=strict,
+        q_scale=q_scale,
     )
 
 
@@ -901,7 +907,7 @@ class CompactSimplicialAttention(nn.Module):
     def forward(self, x_atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
         with record_function("compact_simplicial/in_proj_split"):
             q, k1, v1, k2, v2 = self.in_proj(x_atoms).chunk(5, dim=-1)
-            q = self._split(q) * self.scale
+            q = self._split(q)
             k1 = self._split(k1)
             v1 = self._split(v1)
             k2 = self._split(k2)
@@ -928,6 +934,7 @@ class CompactSimplicialAttention(nn.Module):
                     precision=self.precision,
                     debug_torch_backward=self.debug_torch_backward,
                     strict=self.strict_triton,
+                    q_scale=self.scale,
                 )
         else:
             with record_function("compact_simplicial/torch_attention"):
@@ -943,6 +950,7 @@ class CompactSimplicialAttention(nn.Module):
                     unit=geom.unit,
                     dropout_p=self.dropout,
                     training=self.training,
+                    q_scale=self.scale,
                 )
         with record_function("compact_simplicial/out_proj"):
             return self.out_proj(self._merge(out))

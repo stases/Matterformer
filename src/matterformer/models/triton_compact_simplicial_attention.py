@@ -138,12 +138,14 @@ def compact_simplicial_attention_torch_reference(
     message_basis: torch.Tensor | None = None,
     dropout_p: float = 0.0,
     training: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     k1_n = _gather_neighbor_heads(k1, neighbor_idx)
     v1_n = _gather_neighbor_heads(v1, neighbor_idx)
     k2_n = _gather_neighbor_heads(k2, neighbor_idx)
     v2_n = _gather_neighbor_heads(v2, neighbor_idx)
-    scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q, k1_n, k2_n).float()
+    q_eff = q * float(q_scale)
+    scores = torch.einsum("bhnd,bhnjd,bhnkd->bhnjk", q_eff, k1_n, k2_n).float()
     if u is not None and v_bias is not None and gate is not None:
         scores = scores + gate[:, :, :, None, None].float() * (
             u[:, :, :, :, None].float() + v_bias[:, :, :, None, :].float()
@@ -211,6 +213,27 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         lse_ptr,
         num_heads,
         num_atoms,
+        q_scale,
+        q_stride_b,
+        q_stride_h,
+        q_stride_n,
+        q_stride_d,
+        k1_stride_b,
+        k1_stride_h,
+        k1_stride_n,
+        k1_stride_d,
+        v1_stride_b,
+        v1_stride_h,
+        v1_stride_n,
+        v1_stride_d,
+        k2_stride_b,
+        k2_stride_h,
+        k2_stride_n,
+        k2_stride_d,
+        v2_stride_b,
+        v2_stride_h,
+        v2_stride_n,
+        v2_stride_d,
         head_dim: tl.constexpr,
         k_neighbors: tl.constexpr,
         angle_rank: tl.constexpr,
@@ -247,24 +270,49 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         valid = (tl.load(neighbor_mask_ptr + n_base + offs_k, mask=k_mask, other=0) > 0) & k_mask
         safe_idx = tl.where(valid, raw_idx, 0)
 
-        q = tl.load(q_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0)
+        q = tl.load(
+            q_ptr
+            + batch_idx * q_stride_b
+            + head_idx * q_stride_h
+            + atom_idx * q_stride_n
+            + offs_d * q_stride_d,
+            mask=d_mask,
+            other=0.0,
+        )
+        q = q * q_scale
         k1 = tl.load(
-            k1_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            k1_ptr
+            + batch_idx * k1_stride_b
+            + head_idx * k1_stride_h
+            + safe_idx[:, None] * k1_stride_n
+            + offs_d[None, :] * k1_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         k2 = tl.load(
-            k2_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            k2_ptr
+            + batch_idx * k2_stride_b
+            + head_idx * k2_stride_h
+            + safe_idx[:, None] * k2_stride_n
+            + offs_d[None, :] * k2_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         v1 = tl.load(
-            v1_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            v1_ptr
+            + batch_idx * v1_stride_b
+            + head_idx * v1_stride_h
+            + safe_idx[:, None] * v1_stride_n
+            + offs_d[None, :] * v1_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         v2 = tl.load(
-            v2_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            v2_ptr
+            + batch_idx * v2_stride_b
+            + head_idx * v2_stride_h
+            + safe_idx[:, None] * v2_stride_n
+            + offs_d[None, :] * v2_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -435,6 +483,27 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         dmessage_basis_ptr,
         num_heads,
         num_atoms,
+        q_scale,
+        q_stride_b,
+        q_stride_h,
+        q_stride_n,
+        q_stride_d,
+        k1_stride_b,
+        k1_stride_h,
+        k1_stride_n,
+        k1_stride_d,
+        v1_stride_b,
+        v1_stride_h,
+        v1_stride_n,
+        v1_stride_d,
+        k2_stride_b,
+        k2_stride_h,
+        k2_stride_n,
+        k2_stride_d,
+        v2_stride_b,
+        v2_stride_h,
+        v2_stride_n,
+        v2_stride_d,
         head_dim: tl.constexpr,
         k_neighbors: tl.constexpr,
         angle_rank: tl.constexpr,
@@ -471,28 +540,53 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         valid = (tl.load(neighbor_mask_ptr + n_base + offs_k, mask=k_mask, other=0) > 0) & k_mask
         safe_idx = tl.where(valid, raw_idx, 0)
 
-        q = tl.load(q_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0)
+        q = tl.load(
+            q_ptr
+            + batch_idx * q_stride_b
+            + head_idx * q_stride_h
+            + atom_idx * q_stride_n
+            + offs_d * q_stride_d,
+            mask=d_mask,
+            other=0.0,
+        )
+        q = q * q_scale
         go = tl.load(grad_out_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         out = tl.load(out_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
         lse = tl.load(lse_ptr + bh_idx * num_atoms + atom_idx).to(tl.float32)
 
         k1 = tl.load(
-            k1_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            k1_ptr
+            + batch_idx * k1_stride_b
+            + head_idx * k1_stride_h
+            + safe_idx[:, None] * k1_stride_n
+            + offs_d[None, :] * k1_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         k2 = tl.load(
-            k2_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            k2_ptr
+            + batch_idx * k2_stride_b
+            + head_idx * k2_stride_h
+            + safe_idx[:, None] * k2_stride_n
+            + offs_d[None, :] * k2_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         v1 = tl.load(
-            v1_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            v1_ptr
+            + batch_idx * v1_stride_b
+            + head_idx * v1_stride_h
+            + safe_idx[:, None] * v1_stride_n
+            + offs_d[None, :] * v1_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         v2 = tl.load(
-            v2_ptr + (bh_idx * num_atoms + safe_idx[:, None]) * head_dim + offs_d[None, :],
+            v2_ptr
+            + batch_idx * v2_stride_b
+            + head_idx * v2_stride_h
+            + safe_idx[:, None] * v2_stride_n
+            + offs_d[None, :] * v2_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
@@ -654,7 +748,7 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
         ds = tl.where(pair_valid, ds, 0.0)
 
         tmp_q = tl.dot(ds, k2, input_precision=INPUT_PRECISION)
-        dq = tl.sum(tmp_q * k1, axis=0)
+        dq = tl.sum(tmp_q * k1, axis=0) * q_scale
         tl.store(dq_ptr + (bh_idx * num_atoms + atom_idx) * head_dim + offs_d, dq, mask=d_mask)
 
         dk1 = tl.dot(ds, k2, input_precision=INPUT_PRECISION) * q[None, :]
@@ -794,6 +888,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         message_basis: torch.Tensor,
         precision: str,
         debug_torch_backward: bool,
+        q_scale: float,
         angle_c0: int,
         angle_c1: int,
         angle_c2: int,
@@ -853,6 +948,27 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             lse,
             num_heads,
             num_atoms,
+            float(q_scale),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k1.stride(0),
+            k1.stride(1),
+            k1.stride(2),
+            k1.stride(3),
+            v1.stride(0),
+            v1.stride(1),
+            v1.stride(2),
+            v1.stride(3),
+            k2.stride(0),
+            k2.stride(1),
+            k2.stride(2),
+            k2.stride(3),
+            v2.stride(0),
+            v2.stride(1),
+            v2.stride(2),
+            v2.stride(3),
             head_dim=head_dim,
             k_neighbors=k_neighbors,
             angle_rank=angle_rank,
@@ -897,6 +1013,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         )
         ctx.precision = str(precision)
         ctx.debug_torch_backward = bool(debug_torch_backward)
+        ctx.q_scale = float(q_scale)
         ctx.has_radial_bias = has_radial_bias
         ctx.has_expanded_angle = has_expanded_angle
         ctx.has_compact_angle = has_compact_angle
@@ -1016,6 +1133,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
                     message_left=local_msg_left,
                     message_right=local_msg_right,
                     message_basis=local_msg_basis,
+                    q_scale=ctx.q_scale,
                 )
                 grads = torch.autograd.grad(ref, inputs, grad_out, allow_unused=True)
             dq = dk1 = dv1 = dk2 = dv2 = du = dvb = dgate = dleft = dright = dleft_coeff = dright_coeff = dagate = dml = dmr = dmb = None
@@ -1059,6 +1177,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
 
         batch_size, num_heads, num_atoms, head_dim = q.shape
@@ -1070,11 +1189,11 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
         input_precision = _precision_kernel_config(ctx.precision)
         grad_out = grad_out.contiguous()
         grad_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
-        dq = torch.empty_like(q, dtype=grad_dtype)
-        dk1 = torch.zeros_like(k1, dtype=grad_dtype)
-        dv1 = torch.zeros_like(v1, dtype=grad_dtype)
-        dk2 = torch.zeros_like(k2, dtype=grad_dtype)
-        dv2 = torch.zeros_like(v2, dtype=grad_dtype)
+        dq = torch.empty(q.shape, device=q.device, dtype=grad_dtype)
+        dk1 = torch.zeros(k1.shape, device=k1.device, dtype=grad_dtype)
+        dv1 = torch.zeros(v1.shape, device=v1.device, dtype=grad_dtype)
+        dk2 = torch.zeros(k2.shape, device=k2.device, dtype=grad_dtype)
+        dv2 = torch.zeros(v2.shape, device=v2.device, dtype=grad_dtype)
         du = torch.empty_like(u, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(u)
         dvb = torch.empty_like(v_bias, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(v_bias)
         dgate = torch.empty_like(gate, dtype=grad_dtype) if ctx.has_radial_bias else torch.empty_like(gate)
@@ -1140,6 +1259,27 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             dmb,
             num_heads,
             num_atoms,
+            ctx.q_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k1.stride(0),
+            k1.stride(1),
+            k1.stride(2),
+            k1.stride(3),
+            v1.stride(0),
+            v1.stride(1),
+            v1.stride(2),
+            v1.stride(3),
+            k2.stride(0),
+            k2.stride(1),
+            k2.stride(2),
+            k2.stride(3),
+            v2.stride(0),
+            v2.stride(1),
+            v2.stride(2),
+            v2.stride(3),
             head_dim=head_dim,
             k_neighbors=k_neighbors,
             angle_rank=ctx.angle_rank,
@@ -1179,6 +1319,7 @@ class _TritonCompactSimplicialAttentionFunction(torch.autograd.Function):
             dml if ctx.has_message else None,
             dmr if ctx.has_message else None,
             dmb if ctx.has_message else None,
+            None,
             None,
             None,
             None,
@@ -1289,6 +1430,7 @@ def triton_compact_simplicial_attention(
     precision: str = "bf16_tc",
     debug_torch_backward: bool = False,
     strict: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     precision = normalize_compact_simplicial_precision(precision)
     reason = _unavailable_reason(
@@ -1334,6 +1476,7 @@ def triton_compact_simplicial_attention(
             message_basis=message_basis,
             dropout_p=dropout_p,
             training=training,
+            q_scale=q_scale,
         )
     empty_float = q.new_empty(0)
     u_tensor = u.contiguous() if u is not None and v_bias is not None and gate is not None else empty_float
@@ -1379,11 +1522,11 @@ def triton_compact_simplicial_attention(
         else empty_float
     )
     return _TritonCompactSimplicialAttentionFunction.apply(
-        q.contiguous(),
-        k1.contiguous(),
-        v1.contiguous(),
-        k2.contiguous(),
-        v2.contiguous(),
+        q,
+        k1,
+        v1,
+        k2,
+        v2,
         neighbor_idx.contiguous(),
         neighbor_mask.contiguous(),
         unit_tensor,
@@ -1400,6 +1543,7 @@ def triton_compact_simplicial_attention(
         message_basis_tensor,
         precision,
         bool(debug_torch_backward),
+        float(q_scale),
         angle_c0,
         angle_c1,
         angle_c2,
