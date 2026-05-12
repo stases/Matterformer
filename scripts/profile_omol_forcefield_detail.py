@@ -33,7 +33,7 @@ from scripts.train_omol_forcefield import (
 NON_TRITON_NOTES = [
     "scalar MHA/RoPE: PyTorch Linear/trig/einsum plus torch scaled_dot_product_attention, not a custom Matterformer Triton kernel",
     "scalar S bias: radial/angle coefficient MLPs are PyTorch modules",
-    "scalar S angle representation: compact coefficients are expanded to [B,H,N,K,R] before the scalar Triton kernel unless the config/kernel path is changed",
+    "scalar S angle representation: compact coefficients are fused in the scalar Triton kernel when representation=compact; expanded configs still materialize [B,H,N,K,R]",
     "dense scalar geometry bias: any trivial layer with position_encoding != none requires dense [B,N,N] geometry",
     "direct 3D force head: PyTorch MLP, small and no dense pair materialization",
     "energy head, FFNs, LayerNorms, AdamW optimizer: standard PyTorch/cuBLAS kernels",
@@ -69,6 +69,7 @@ def _print_run_summary(args: argparse.Namespace, model: MatterformerOMolForceFie
     print("=== OMol profile run ===")
     print(f"device={args.device_resolved} bf16={args.bf16} matmul={args.float32_matmul_precision}")
     print(f"hybrid_config={args.hybrid_config_json}")
+    print(f"replay_same_batch={args.replay_same_batch}")
     print(f"stream_type={model.stream_type} force_head_mode={model.force_head_mode}")
     print(f"layer_counts={json.dumps(_model_layer_counts(model), sort_keys=True)}")
     print(
@@ -97,6 +98,15 @@ def _next_batch(loader_iter, loader):
     except StopIteration:
         loader_iter = iter(loader)
         return next(loader_iter), loader_iter
+
+
+def _select_batch(*, loader_iter, loader, replay_batch, replay_same_batch: bool):
+    if replay_same_batch and replay_batch is not None:
+        return replay_batch, loader_iter, replay_batch
+    batch, loader_iter = _next_batch(loader_iter, loader)
+    if replay_same_batch:
+        replay_batch = batch
+    return batch, loader_iter, replay_batch
 
 
 def _train_step(
@@ -201,9 +211,15 @@ def main(args: argparse.Namespace) -> None:
     _print_run_summary(args, model)
 
     loader_iter = iter(train_loader)
+    replay_batch = None
     warmup_metrics: list[dict[str, float]] = []
     for step in range(args.warmup_steps):
-        batch, loader_iter = _next_batch(loader_iter, train_loader)
+        batch, loader_iter, replay_batch = _select_batch(
+            loader_iter=loader_iter,
+            loader=train_loader,
+            replay_batch=replay_batch,
+            replay_same_batch=args.replay_same_batch,
+        )
         metrics = _train_step(model=model, criterion=criterion, optimizer=optimizer, batch=batch, device=device, args=args)
         warmup_metrics.append(metrics)
         print(
@@ -226,7 +242,12 @@ def main(args: argparse.Namespace) -> None:
         with_stack=args.with_stack,
     ) as prof:
         for step in range(args.profile_steps):
-            batch, loader_iter = _next_batch(loader_iter, train_loader)
+            batch, loader_iter, replay_batch = _select_batch(
+                loader_iter=loader_iter,
+                loader=train_loader,
+                replay_batch=replay_batch,
+                replay_same_batch=args.replay_same_batch,
+            )
             metrics = _train_step(
                 model=model,
                 criterion=criterion,
@@ -244,6 +265,13 @@ def main(args: argparse.Namespace) -> None:
                 f"mem_gb={metrics.get('max_mem_allocated_gb', 0.0):.3f}"
             )
 
+    avg: dict[str, float] | None = None
+    if profiled_metrics:
+        avg = {
+            key: sum(metric.get(key, 0.0) for metric in profiled_metrics) / len(profiled_metrics)
+            for key in profiled_metrics[0]
+        }
+
     if args.output_dir is not None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -253,12 +281,22 @@ def main(args: argparse.Namespace) -> None:
             handle.write(_profiler_table(prof, sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total", row_limit=args.row_limit))
             handle.write("\n\n")
             handle.write(_profiler_table(prof, sort_by="self_cuda_memory_usage" if torch.cuda.is_available() else "self_cpu_memory_usage", row_limit=args.row_limit))
+        if avg is not None:
+            with (output_dir / "omol_profile_metrics.json").open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "avg_profiled_steps": avg,
+                        "profiled_steps": profiled_metrics,
+                        "warmup_steps": warmup_metrics,
+                        "replay_same_batch": bool(args.replay_same_batch),
+                        "hybrid_config_json": str(args.hybrid_config_json),
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
 
-    if profiled_metrics:
-        avg = {
-            key: sum(metric.get(key, 0.0) for metric in profiled_metrics) / len(profiled_metrics)
-            for key in profiled_metrics[0]
-        }
+    if avg is not None:
         print("=== averaged profiled steps ===")
         for key in sorted(avg):
             print(f"{key}: {avg[key]:.6g}")
@@ -293,6 +331,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--profile-steps", type=int, default=3)
+    parser.add_argument("--replay-same-batch", action="store_true")
     parser.add_argument("--normalizer-rmsd", type=float, default=1.433569)
     parser.add_argument("--energy-weight", type=float, default=10.0)
     parser.add_argument("--force-weight", type=float, default=10.0)
