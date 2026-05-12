@@ -727,11 +727,8 @@ class CompactSimplicialGeometryBias(nn.Module):
                 assert self.u_mlp is not None and self.v_mlp is not None and self.gate is not None
                 u = self.u_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
                 v = self.v_mlp(edge_features).permute(0, 3, 1, 2).to(dtype=dtype)
-                u = u.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
-                v = v.masked_fill(~geom.neighbor_mask[:, None, :, :], 0.0)
                 gate = self.gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         left = right = angle_gate = left_compact = right_compact = None
-        edge_mask = geom.neighbor_mask[:, None, :, :, None]
         if self.use_angle:
             with record_function("simplicial_bias/angle_coeff_mlp"):
                 assert self.left_mlp is not None and self.right_mlp is not None and self.angle_gate is not None
@@ -753,15 +750,11 @@ class CompactSimplicialGeometryBias(nn.Module):
                 with record_function("simplicial_bias/angle_compact_pack"):
                     left_compact = left_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
                     right_compact = right_coeff.permute(0, 3, 1, 2, 4).contiguous().to(dtype=dtype)
-                    left_compact = left_compact.masked_fill(~edge_mask, 0.0)
-                    right_compact = right_compact.masked_fill(~edge_mask, 0.0)
             else:
                 with record_function("simplicial_bias/angle_expand_spherical"):
                     assert basis is not None
                     left = _expand_spherical_coefficients(left_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
                     right = _expand_spherical_coefficients(right_coeff, basis=basis, channels_by_l=self.channels_by_l).to(dtype=dtype)
-                    left = left.masked_fill(~edge_mask, 0.0)
-                    right = right.masked_fill(~edge_mask, 0.0)
             angle_gate = self.angle_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
         message_left = message_right = message_basis = None
         if self.message_enabled:
@@ -797,8 +790,6 @@ class CompactSimplicialGeometryBias(nn.Module):
                     basis=basis,
                     channels_by_l=self.message_channels_by_l,
                 ).to(dtype=dtype)
-                message_left = message_left.masked_fill(~edge_mask, 0.0)
-                message_right = message_right.masked_fill(~edge_mask, 0.0)
                 message_gate = self.message_gate.to(dtype=dtype).expand(batch_size, -1, num_atoms)
                 message_left = message_left * message_gate[:, :, :, None, None]
                 message_basis = self.message_basis.to(dtype=dtype)

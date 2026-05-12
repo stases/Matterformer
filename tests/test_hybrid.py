@@ -656,6 +656,56 @@ def test_scalar_compact_spherical_coefficients_match_expanded_reference():
         assert torch.allclose(actual_tensor.grad, ref_tensor.grad, atol=1e-5, rtol=1e-5)
 
 
+def test_compact_simplicial_attention_ignores_invalid_bias_entries():
+    torch.manual_seed(15)
+    batch_size, num_heads, num_tokens, k_neighbors, head_dim, rank = 2, 2, 6, 4, 8, 8
+    kwargs = {"dtype": torch.float64, "requires_grad": True}
+    tensors = [torch.randn(batch_size, num_heads, num_tokens, head_dim, **kwargs) for _ in range(5)]
+    base_idx = torch.arange(num_tokens)[:, None]
+    offsets = torch.arange(k_neighbors)[None, :]
+    neighbor_idx = ((base_idx + offsets + 1) % num_tokens).expand(batch_size, -1, -1).contiguous()
+    neighbor_mask = (torch.rand(batch_size, num_tokens, k_neighbors) > 0.35).contiguous()
+    neighbor_mask[..., 0] = True
+    neighbor_mask[1, 2, :] = False
+    raw_bias = CompactSimplicialBias(
+        u=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        v=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, **kwargs),
+        gate=torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        angle_left=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        angle_right=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        angle_gate=torch.randn(batch_size, num_heads, num_tokens, **kwargs),
+        message_left=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        message_right=torch.randn(batch_size, num_heads, num_tokens, k_neighbors, rank, **kwargs),
+        message_basis=torch.randn(num_heads, rank, head_dim, **kwargs),
+    )
+    edge_mask = neighbor_mask[:, None, :, :]
+    edge_rank_mask = edge_mask[..., None]
+    masked_bias = CompactSimplicialBias(
+        u=raw_bias.u.masked_fill(~edge_mask, 0.0),
+        v=raw_bias.v.masked_fill(~edge_mask, 0.0),
+        gate=raw_bias.gate,
+        angle_left=raw_bias.angle_left.masked_fill(~edge_rank_mask, 0.0),
+        angle_right=raw_bias.angle_right.masked_fill(~edge_rank_mask, 0.0),
+        angle_gate=raw_bias.angle_gate,
+        message_left=raw_bias.message_left.masked_fill(~edge_rank_mask, 0.0),
+        message_right=raw_bias.message_right.masked_fill(~edge_rank_mask, 0.0),
+        message_basis=raw_bias.message_basis,
+    )
+    raw = compact_simplicial_attention_torch(
+        *tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=raw_bias,
+    )
+    masked = compact_simplicial_attention_torch(
+        *tensors,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        bias=masked_bias,
+    )
+    assert torch.allclose(raw, masked, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and TRITON_GROUPED_COMPACT_SIMPLICIAL_AVAILABLE),
     reason="grouped compact Triton simplicial parity requires CUDA and Triton",
