@@ -49,6 +49,28 @@ def test_dynamic_sampler_respects_max_atoms():
         assert sum(dataset.get_num_atoms(idx) for idx in batch) <= 6 or len(batch) == 1
 
 
+def test_dynamic_sampler_bucketed_mode_is_deterministic_and_valid():
+    dataset = SyntheticOMolDataset(num_samples=24, seed=3, min_atoms=2, max_atoms=9)
+    sampler = OMolDynamicBatchSampler(
+        dataset,
+        max_batch_size=6,
+        max_atoms=18,
+        shuffle=True,
+        seed=7,
+        batching_mode="bucketed",
+        bucket_window_size=12,
+        bucket_shuffle_groups=3,
+    )
+    first = list(sampler)
+    sampler.set_epoch(0)
+    second = list(sampler)
+    assert first == second
+    assert sorted(idx for batch in first for idx in batch) == list(range(len(dataset)))
+    for batch in first:
+        assert len(batch) <= 6
+        assert sum(dataset.get_num_atoms(idx) for idx in batch) <= 18 or len(batch) == 1
+
+
 def test_fairchem_dataset_does_not_require_fairchem(tmp_path):
     with pytest.raises(ValueError, match="No .aselmdb files found"):
         FairChemOMolDataset(tmp_path)

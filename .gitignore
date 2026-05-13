@@ -49,3 +49,6 @@ tmp_MOF/
 # Local Codex chat history exports
 .codex
 codex_history_md/
+codex_export/
+llm_exports/
+diff/

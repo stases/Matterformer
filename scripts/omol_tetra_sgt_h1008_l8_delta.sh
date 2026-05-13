@@ -6,9 +6,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --job-name=omol_SgT_h1008
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=16
 #SBATCH --time=5-00:00:00
-#SBATCH --mem=224000M
+#SBATCH --mem=64G
 #SBATCH --output=/home/thadziv/matterformer_jobs/job_outputs/slurm_output_%A_omol_SgT_h1008.out
 
 set -euo pipefail

@@ -348,9 +348,15 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
+        batching_mode: str = "random",
+        bucket_window_size: int = 4096,
+        bucket_shuffle_groups: int = 8,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
+        batching_mode = str(batching_mode).lower().replace("-", "_")
+        if batching_mode not in {"random", "bucketed"}:
+            raise ValueError("batching_mode must be one of {'random', 'bucketed'}")
         self.dataset = dataset
         self.max_batch_size = int(max_batch_size)
         self.max_atoms = None if max_atoms is None else int(max_atoms)
@@ -358,6 +364,9 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
+        self.batching_mode = batching_mode
+        self.bucket_window_size = max(1, int(bucket_window_size))
+        self.bucket_shuffle_groups = max(1, int(bucket_shuffle_groups))
         self.epoch = 0
         self._atom_count_cache: dict[int, int] = {}
 
@@ -387,6 +396,29 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         self._atom_count_cache[idx] = count
         return count
 
+    def _ordered_indices(self, size: int) -> list[int]:
+        if not self.shuffle:
+            return list(range(size))
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(size, generator=generator).tolist()
+        if self.batching_mode == "random":
+            return indices
+
+        ordered: list[int] = []
+        for start in range(0, size, self.bucket_window_size):
+            window = indices[start : start + self.bucket_window_size]
+            window.sort(key=lambda idx: (self._get_num_atoms(int(idx)), int(idx)))
+            if self.bucket_shuffle_groups > 1 and len(window) > 1:
+                group_size = max(1, math.ceil(len(window) / self.bucket_shuffle_groups))
+                groups = [window[idx : idx + group_size] for idx in range(0, len(window), group_size)]
+                for group_idx in torch.randperm(len(groups), generator=generator).tolist():
+                    ordered.extend(groups[int(group_idx)])
+            else:
+                ordered.extend(window)
+        return ordered
+
     def __len__(self) -> int:
         if self.max_atoms is None:
             return max(1, math.ceil(len(self.dataset) / self.max_batch_size))
@@ -395,12 +427,7 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
 
     def __iter__(self):
         size = len(self.dataset)
-        if self.shuffle:
-            generator = torch.Generator()
-            generator.manual_seed(self.seed + self.epoch)
-            indices = torch.randperm(size, generator=generator).tolist()
-        else:
-            indices = list(range(size))
+        indices = self._ordered_indices(size)
 
         batch: list[int] = []
         atom_total = 0

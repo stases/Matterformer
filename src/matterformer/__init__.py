@@ -31,6 +31,7 @@ from matterformer.geometry.adapters import (
 )
 from matterformer.models.geom_drugs import GeomDrugsEDMModel
 from matterformer.models.mof_stage1 import MOFStage1EDMModel
+from matterformer.models.allscaip import MatterformerAllScAIPDirectForceField
 from matterformer.models.omol import MatterformerOMolForceField
 from matterformer.models.qm9 import QM9EDMModel, QM9RegressionModel
 from matterformer.models.embeddings import (
@@ -73,6 +74,7 @@ __all__ = [
     "MaskEmbedder",
     "MhaFactorizedGeometryBias",
     "MatterformerOMolForceField",
+    "MatterformerAllScAIPDirectForceField",
     "NonPeriodicGeometryAdapter",
     "PeriodicGeometryAdapter",
     "QM9Batch",

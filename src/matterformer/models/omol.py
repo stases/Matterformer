@@ -8,8 +8,8 @@ from torch import nn
 from torch.profiler import record_function
 
 from matterformer.geometry import NonPeriodicGeometryAdapter
-from matterformer.models.hybrid import HybridConfig, HybridTransformerTrunk, HybridTrunkOutput
-from matterformer.models.platonic import PLATONIC_GROUPS
+from matterformer.models.hybrid import HybridConfig, HybridFlatTrunkOutput, HybridTransformerTrunk, HybridTrunkOutput
+from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicLinear
 
 
 def _masked_mean(value: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
@@ -21,6 +21,22 @@ def _masked_mean(value: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
 def _center_coords(coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
     centered = coords - _masked_mean(coords, pad_mask)
     return centered.masked_fill(pad_mask[..., None], 0.0)
+
+
+def _segment_mean_flat(
+    value: torch.Tensor,
+    batch_index: torch.Tensor,
+    num_graphs: int,
+    *,
+    counts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out = value.new_zeros((int(num_graphs), *value.shape[1:]))
+    out.index_add_(0, batch_index, value)
+    if counts is None:
+        counts = torch.bincount(batch_index, minlength=int(num_graphs))
+    denom_shape = (int(num_graphs),) + (1,) * (value.ndim - 1)
+    denom = counts.to(device=value.device, dtype=value.dtype).clamp_min(1).view(denom_shape)
+    return out / denom
 
 
 class ScalarFourierEmbedding(nn.Module):
@@ -93,6 +109,53 @@ class ChargeSpinConditioning(nn.Module):
             raise RuntimeError("concat_project is not configured")
         return self.concat_project(torch.cat([token_features, mixed_nodes], dim=-1))
 
+    def forward_flat(
+        self,
+        token_features: torch.Tensor,
+        *,
+        charge: torch.Tensor | None,
+        spin: torch.Tensor | None,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        if self.mode == "off":
+            return token_features
+        if self.charge_embedding is None or self.spin_embedding is None or self.mix is None:
+            raise RuntimeError("Charge/spin conditioning is not configured")
+        if charge is None:
+            charge = torch.zeros(int(num_graphs), device=token_features.device, dtype=torch.float32)
+        if spin is None:
+            spin = torch.zeros(int(num_graphs), device=token_features.device, dtype=torch.float32)
+        charge_emb = self.charge_embedding(charge.to(device=token_features.device, dtype=torch.float32))
+        spin_emb = self.spin_embedding(spin.to(device=token_features.device, dtype=torch.float32))
+        mixed = torch.nn.functional.silu(self.mix(torch.cat([charge_emb, spin_emb], dim=-1)))
+        mixed_nodes = mixed.to(dtype=token_features.dtype)[batch_index]
+        if self.mode == "add":
+            return token_features + mixed_nodes
+        if self.concat_project is None:
+            raise RuntimeError("concat_project is not configured")
+        return self.concat_project(torch.cat([token_features, mixed_nodes], dim=-1))
+
+
+class _Sin(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return torch.sin(value)
+
+
+def _readout_activation(name: str | None) -> nn.Module:
+    value = "gelu" if name is None else str(name).lower()
+    if value == "gelu":
+        return nn.GELU()
+    if value == "silu":
+        return nn.SiLU()
+    if value == "relu":
+        return nn.ReLU()
+    if value == "mish":
+        return nn.Mish()
+    if value == "sin":
+        return _Sin()
+    raise ValueError("readout_activation must be one of {'gelu', 'silu', 'relu', 'mish', 'sin'}")
+
 
 class MatterformerOMolForceField(nn.Module):
     """Matterformer direct energy/force model for OMol-style padded batches."""
@@ -114,6 +177,9 @@ class MatterformerOMolForceField(nn.Module):
         pair_n_rbf: int = 16,
         pair_rbf_max: float = 6.0,
         force_head_mode: str = "auto",
+        readout_head_mode: str = "dense",
+        readout_activation: str | None = None,
+        runtime_mode: str = "padded",
     ) -> None:
         super().__init__()
         self.max_atomic_number = int(max_atomic_number)
@@ -122,6 +188,9 @@ class MatterformerOMolForceField(nn.Module):
         self.pair_rbf_max = float(pair_rbf_max)
         self.hybrid_config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.stream_type = self.hybrid_config.stream_type
+        self.runtime_mode = str(runtime_mode).lower().replace("-", "_")
+        if self.runtime_mode not in {"padded", "internal_flat_tetra"}:
+            raise ValueError("runtime_mode must be one of {'padded', 'internal_flat_tetra'}")
         force_head_mode = str(force_head_mode).lower().replace("-", "_")
         if force_head_mode == "auto":
             force_head_mode = "tetra_vector" if self.stream_type == "tetra" else "pairwise"
@@ -134,6 +203,16 @@ class MatterformerOMolForceField(nn.Module):
         if self.stream_type == "tetra" and force_head_mode not in {"tetra_vector"}:
             raise ValueError("Tetra OMol force_head_mode currently supports only {'auto', 'tetra_vector'}")
         self.force_head_mode = force_head_mode
+        readout_head_mode = str(readout_head_mode).lower().replace("-", "_")
+        if readout_head_mode in {"mlp", "legacy"}:
+            readout_head_mode = "dense"
+        if readout_head_mode in {"platonic", "platonic_ffn", "platonic_readout"}:
+            readout_head_mode = "platonic"
+        if readout_head_mode not in {"dense", "platonic"}:
+            raise ValueError("readout_head_mode must be one of {'dense', 'platonic'}")
+        if readout_head_mode == "platonic" and self.stream_type != "tetra":
+            raise ValueError("readout_head_mode='platonic' requires stream_type='tetra'")
+        self.readout_head_mode = readout_head_mode
 
         self.atom_embedding = nn.Embedding(self.max_atomic_number + 1, d_model, padding_idx=0)
         nn.init.normal_(self.atom_embedding.weight, std=1.0 / math.sqrt(d_model))
@@ -154,12 +233,21 @@ class MatterformerOMolForceField(nn.Module):
             norm_affine_when_no_adaln=True,
             use_final_norm=True,
         )
+        if self.runtime_mode == "internal_flat_tetra" and not self.trunk.supports_flat_tetra:
+            raise ValueError(
+                "runtime_mode='internal_flat_tetra' requires a pure tetra-global trunk "
+                "with input_lift.kind='scalar_copy'"
+            )
         self._materialize_unused_distance_bias_lazy_modules()
-        self.energy_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, 1),
+        self.energy_head = (
+            None
+            if self.readout_head_mode == "platonic"
+            else nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 1),
+            )
         )
         if self.stream_type == "scalar" and self.force_head_mode == "pairwise":
             self.scalar_force_head = nn.Sequential(
@@ -183,21 +271,54 @@ class MatterformerOMolForceField(nn.Module):
         else:
             self.scalar_direct_force_head = None
 
+        self.platonic_scalar_readout = None
+        self.platonic_vector_readout = None
         if self.stream_type == "tetra":
             group = PLATONIC_GROUPS[str(self.hybrid_config.tetra.get("group", "tetrahedron")).lower()]
             dim_per_frame = int(self.hybrid_config.tetra_dim_per_frame or 0)
-            self.group_force_head = nn.Sequential(
-                nn.LayerNorm(dim_per_frame),
-                nn.Linear(dim_per_frame, d_model),
-                nn.SiLU(),
-                nn.Linear(d_model, 3),
-            )
-            nn.init.zeros_(self.group_force_head[-1].weight)
-            nn.init.zeros_(self.group_force_head[-1].bias)
-            self.register_buffer("_group_rotations", group.elements, persistent=False)
+            if self.readout_head_mode == "platonic":
+                readout_cfg = dict(self.hybrid_config.readout)
+                activation_name = (
+                    readout_activation
+                    or readout_cfg.get("activation")
+                    or readout_cfg.get("readout_activation")
+                    or self.hybrid_config.tetra.get("readout_activation")
+                    or self.hybrid_config.tetra.get("activation")
+                    or "gelu"
+                )
+                readout_ffn = bool(readout_cfg.get("ffn", True))
+                if readout_ffn:
+                    self.platonic_scalar_readout = nn.Sequential(
+                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        _readout_activation(str(activation_name)),
+                        PlatonicLinear(d_model, group.G, solid=group.name),
+                    )
+                    self.platonic_vector_readout = nn.Sequential(
+                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        _readout_activation(str(activation_name)),
+                        PlatonicLinear(d_model, group.G * 3, solid=group.name),
+                    )
+                else:
+                    self.platonic_scalar_readout = PlatonicLinear(d_model, group.G, solid=group.name)
+                    self.platonic_vector_readout = PlatonicLinear(d_model, group.G * 3, solid=group.name)
+                self.group_force_head = None
+                self.register_buffer("_platonic_readout_rotations", group.elements, persistent=False)
+                self.register_buffer("_group_rotations", torch.empty(0), persistent=False)
+            else:
+                self.group_force_head = nn.Sequential(
+                    nn.LayerNorm(dim_per_frame),
+                    nn.Linear(dim_per_frame, d_model),
+                    nn.SiLU(),
+                    nn.Linear(d_model, 3),
+                )
+                nn.init.zeros_(self.group_force_head[-1].weight)
+                nn.init.zeros_(self.group_force_head[-1].bias)
+                self.register_buffer("_group_rotations", group.elements, persistent=False)
+                self.register_buffer("_platonic_readout_rotations", torch.empty(0), persistent=False)
         else:
             self.group_force_head = None
             self.register_buffer("_group_rotations", torch.empty(0), persistent=False)
+            self.register_buffer("_platonic_readout_rotations", torch.empty(0), persistent=False)
 
         self.register_buffer("_rbf_centers", torch.linspace(0.0, self.pair_rbf_max, self.pair_n_rbf), persistent=False)
         delta = self.pair_rbf_max / max(self.pair_n_rbf - 1, 1)
@@ -262,6 +383,143 @@ class MatterformerOMolForceField(nn.Module):
             vectors = vectors - _masked_mean(vectors, pad_mask)
             return vectors.masked_fill(pad_mask[..., None], 0.0)
 
+    def _tetra_forces_flat(
+        self,
+        group_out: torch.Tensor,
+        *,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+        counts: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.group_force_head is None:
+            raise RuntimeError("Tetra force head is not configured")
+        with record_function("omol/force_tetra_vector_head_flat"):
+            local_vectors = self.group_force_head(group_out)
+            rotations = self._group_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+            vectors = torch.einsum("gij,ngi->ngj", rotations, local_vectors).mean(dim=1)
+            centered = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
+            return centered
+
+    def _platonic_tetra_readout(
+        self,
+        group_out: torch.Tensor,
+        pad_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.platonic_scalar_readout is None or self.platonic_vector_readout is None:
+            raise RuntimeError("Platonic OMol readout is not configured")
+        with record_function("omol/platonic_scalar_vector_readout"):
+            batch_size, num_atoms, group_order, channels = group_out.shape
+            hidden = group_out.reshape(batch_size, num_atoms, group_order * channels)
+            scalar_raw = self.platonic_scalar_readout(hidden).view(batch_size, num_atoms, group_order, 1)
+            per_atom_energy = scalar_raw.mean(dim=2).squeeze(-1).masked_fill(pad_mask, 0.0)
+
+            local_vectors = self.platonic_vector_readout(hidden).view(batch_size, num_atoms, group_order, 3)
+            rotations = self._platonic_readout_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+            vectors = torch.einsum("gij,bngj->bni", rotations, local_vectors) / float(group_order)
+            vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
+            vectors = vectors - _masked_mean(vectors, pad_mask)
+            return per_atom_energy, vectors.masked_fill(pad_mask[..., None], 0.0)
+
+    def _platonic_tetra_readout_flat(
+        self,
+        group_out: torch.Tensor,
+        *,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+        counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.platonic_scalar_readout is None or self.platonic_vector_readout is None:
+            raise RuntimeError("Platonic OMol readout is not configured")
+        with record_function("omol/platonic_scalar_vector_readout_flat"):
+            num_atoms, group_order, channels = group_out.shape
+            hidden = group_out.reshape(num_atoms, group_order * channels)
+            scalar_raw = self.platonic_scalar_readout(hidden).view(num_atoms, group_order, 1)
+            per_atom_energy = scalar_raw.mean(dim=1).squeeze(-1)
+
+            local_vectors = self.platonic_vector_readout(hidden).view(num_atoms, group_order, 3)
+            rotations = self._platonic_readout_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
+            vectors = torch.einsum("gij,ngj->ni", rotations, local_vectors) / float(group_order)
+            centered = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
+            return per_atom_energy, centered
+
+    def _forward_flat_tetra_from_padded(
+        self,
+        atomic_numbers: torch.Tensor,
+        coords: torch.Tensor,
+        pad_mask: torch.Tensor,
+        *,
+        charge: torch.Tensor | None,
+        spin: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        if self.stream_type != "tetra" or not self.trunk.supports_flat_tetra:
+            raise RuntimeError("internal_flat_tetra runtime requires a supported pure tetra trunk")
+        with record_function("omol/input_flatten_condition"):
+            valid = ~pad_mask
+            batch_size, num_slots = atomic_numbers.shape
+            flat_index = valid.nonzero(as_tuple=False)
+            if flat_index.numel() == 0:
+                return {
+                    "energy": coords.new_zeros(batch_size),
+                    "forces": coords.new_zeros(batch_size, num_slots, 3),
+                }
+            batch_index = flat_index[:, 0]
+            num_atoms = valid.sum(dim=1)
+            counts_i32 = num_atoms.to(device=coords.device, dtype=torch.int32)
+            cu_seqlens = torch.zeros(batch_size + 1, device=coords.device, dtype=torch.int32)
+            cu_seqlens[1:] = torch.cumsum(counts_i32, dim=0)
+            max_seqlen = int(num_atoms.max().item()) if num_atoms.numel() > 0 else 0
+            atomic_flat = atomic_numbers[valid].clamp(min=0, max=self.max_atomic_number)
+            coords_flat = coords[valid]
+            center = _segment_mean_flat(coords_flat, batch_index, batch_size, counts=num_atoms)
+            centered_coords = coords_flat - center[batch_index]
+            token_features = self.atom_embedding(atomic_flat)
+            token_features = self.charge_spin.forward_flat(
+                token_features,
+                charge=charge,
+                spin=spin,
+                batch_index=batch_index,
+                num_graphs=batch_size,
+            )
+
+        with record_function("omol/trunk_tetra_flat"):
+            trunk_result = self.trunk.forward_flat_tetra(
+                token_features,
+                coords=centered_coords,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                return_output=True,
+            )
+        if not isinstance(trunk_result, HybridFlatTrunkOutput) or trunk_result.group is None:
+            raise RuntimeError("Flat tetra OMol model requires group output from the hybrid trunk")
+        if self.readout_head_mode == "platonic":
+            per_atom_energy, forces_flat = self._platonic_tetra_readout_flat(
+                trunk_result.group,
+                batch_index=batch_index,
+                num_graphs=batch_size,
+                counts=num_atoms,
+            )
+            atom_dtype = trunk_result.group.dtype
+        else:
+            atom_out = trunk_result.scalar
+            forces_flat = self._tetra_forces_flat(
+                trunk_result.group,
+                batch_index=batch_index,
+                num_graphs=batch_size,
+                counts=num_atoms,
+            )
+            if self.energy_head is None:
+                raise RuntimeError("Dense OMol energy head is not configured")
+            with record_function("omol/energy_head_flat"):
+                per_atom_energy = self.energy_head(atom_out).squeeze(-1)
+            atom_dtype = atom_out.dtype
+        forces = coords.new_zeros((batch_size, num_slots, 3), dtype=forces_flat.dtype)
+        forces[valid] = forces_flat
+        with record_function("omol/energy_sum_flat"):
+            energy = per_atom_energy.new_zeros(batch_size, dtype=torch.float64)
+            energy.index_add_(0, batch_index, per_atom_energy.double())
+            energy = energy.to(dtype=atom_dtype)
+        return {"energy": energy, "forces": forces.to(dtype=atom_dtype)}
+
     def forward(
         self,
         atomic_numbers: torch.Tensor,
@@ -273,6 +531,14 @@ class MatterformerOMolForceField(nn.Module):
     ) -> dict[str, torch.Tensor]:
         with record_function("omol/input_embed_condition"):
             pad_mask = pad_mask.bool()
+            if self.runtime_mode == "internal_flat_tetra":
+                return self._forward_flat_tetra_from_padded(
+                    atomic_numbers,
+                    coords,
+                    pad_mask,
+                    charge=charge,
+                    spin=spin,
+                )
             centered_coords = _center_coords(coords, pad_mask)
             atomic_numbers = atomic_numbers.clamp(min=0, max=self.max_atomic_number)
             token_features = self.atom_embedding(atomic_numbers)
@@ -293,8 +559,14 @@ class MatterformerOMolForceField(nn.Module):
                 )
             if not isinstance(trunk_result, HybridTrunkOutput) or trunk_result.group is None:
                 raise RuntimeError("Tetra OMol model requires group output from the hybrid trunk")
+            group_atoms = trunk_result.group[:, : centered_coords.shape[1]]
+            if self.readout_head_mode == "platonic":
+                per_atom_energy, forces = self._platonic_tetra_readout(group_atoms, pad_mask)
+                with record_function("omol/energy_sum"):
+                    energy = per_atom_energy.double().sum(dim=1).to(dtype=per_atom_energy.dtype)
+                return {"energy": energy, "forces": forces.to(dtype=per_atom_energy.dtype)}
             atom_out = trunk_result.scalar
-            forces = self._tetra_forces(trunk_result.group[:, : centered_coords.shape[1]], pad_mask)
+            forces = self._tetra_forces(group_atoms, pad_mask)
         else:
             with record_function("omol/trunk_scalar"):
                 atom_out = self.trunk(
@@ -311,6 +583,8 @@ class MatterformerOMolForceField(nn.Module):
                 forces = self._scalar_forces(atom_features, centered_coords, pad_mask)
 
         with record_function("omol/energy_head"):
+            if self.energy_head is None:
+                raise RuntimeError("Dense OMol energy head is not configured")
             atom_out = atom_out[:, : centered_coords.shape[1]].masked_fill(pad_mask[..., None], 0.0)
             per_atom_energy = self.energy_head(atom_out).squeeze(-1).masked_fill(pad_mask, 0.0)
             energy = per_atom_energy.double().sum(dim=1).to(dtype=atom_out.dtype)

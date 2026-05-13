@@ -179,6 +179,59 @@ class PlatonicAttention(nn.Module):
             out_bnhd[valid] = out_unpad
         return out_bnhd.transpose(1, 2).contiguous()
 
+    def _sdpa_attention_flat(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs: list[torch.Tensor] = []
+        starts = cu_seqlens[:-1].detach().cpu().tolist()
+        ends = cu_seqlens[1:].detach().cpu().tolist()
+        for start, end in zip(starts, ends):
+            start_i = int(start)
+            end_i = int(end)
+            if end_i <= start_i:
+                continue
+            out = F.scaled_dot_product_attention(
+                q[start_i:end_i].transpose(0, 1).unsqueeze(0),
+                k[start_i:end_i].transpose(0, 1).unsqueeze(0),
+                v[start_i:end_i].transpose(0, 1).unsqueeze(0),
+                dropout_p=self.dropout if self.training else 0.0,
+            )
+            outputs.append(out.squeeze(0).transpose(0, 1).contiguous())
+        if not outputs:
+            return torch.zeros_like(q)
+        return torch.cat(outputs, dim=0)
+
+    def _flash_attention_flat(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        if int(max_seqlen) == 0 or q.shape[0] == 0:
+            return torch.zeros_like(q)
+        if flash_attn_varlen_func is None or not q.is_cuda:
+            return self._sdpa_attention_flat(q, k, v, cu_seqlens)
+        orig_dtype = q.dtype
+        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32)
+        return flash_attn_varlen_func(
+            q.contiguous().to(torch.bfloat16),
+            k.contiguous().to(torch.bfloat16),
+            v.contiguous().to(torch.bfloat16),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=int(max_seqlen),
+            max_seqlen_k=int(max_seqlen),
+            dropout_p=self.dropout if self.training else 0.0,
+            causal=False,
+        ).to(orig_dtype)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -212,6 +265,34 @@ class PlatonicAttention(nn.Module):
             out = self.rope(out, pos, inverse=True)
         return self.out_proj(out.reshape(batch_size, num_tokens, self.d_model))
 
+    def forward_flat(
+        self,
+        x: torch.Tensor,
+        *,
+        pos: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        q = self._split(self.q_proj(x))
+        v = self._split(self.v_proj(x))
+        k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
+        q = self.rope(q, pos)
+        k = self.rope(k, pos)
+        if self.rope_on_values:
+            v = self.rope(v, pos)
+        num_tokens = x.shape[0]
+        q = q.reshape(num_tokens, self.num_heads, self.head_dim)
+        k = k.reshape(num_tokens, self.num_heads, self.head_dim)
+        v = v.reshape(num_tokens, self.num_heads, self.head_dim)
+        if self.attention_backend == "flash":
+            out = self._flash_attention_flat(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen))
+        else:
+            out = self._sdpa_attention_flat(q, k, v, cu_seqlens)
+        out = out.contiguous().view(num_tokens, self.group_order, self.heads_per_frame, self.head_dim)
+        if self.rope_on_values:
+            out = self.rope(out, pos, inverse=True)
+        return self.out_proj(out.reshape(num_tokens, self.d_model))
+
 
 class PlatonicBlock(nn.Module):
     def __init__(
@@ -230,6 +311,7 @@ class PlatonicBlock(nn.Module):
         use_key: bool = False,
         rope_on_values: bool = True,
         attention_backend: str = "sdpa",
+        layer_scale_init_value: float | None = None,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -256,6 +338,21 @@ class PlatonicBlock(nn.Module):
         self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name)
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
+        if layer_scale_init_value is None:
+            self.gamma_1 = None
+            self.gamma_2 = None
+        else:
+            init = float(layer_scale_init_value)
+            self.gamma_1 = nn.Parameter(init * torch.ones(self.channels_per_group))
+            self.gamma_2 = nn.Parameter(init * torch.ones(self.channels_per_group))
+
+    def _apply_layer_scale(self, x: torch.Tensor, gamma: torch.Tensor | None) -> torch.Tensor:
+        if gamma is None:
+            return x
+        shape = x.shape
+        x = x.view(*shape[:-1], self.group_order, self.channels_per_group)
+        x = x * gamma.to(device=x.device, dtype=x.dtype)
+        return x.reshape(shape)
 
     def forward(
         self,
@@ -264,6 +361,29 @@ class PlatonicBlock(nn.Module):
         pos: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.dropout(self.attn(self.norm1(x), pos=pos, pad_mask=pad_mask))
-        x = x + self.dropout(self.linear2(self.activation(self.linear1(self.norm2(x)))))
+        attn_out = self.dropout(self.attn(self.norm1(x), pos=pos, pad_mask=pad_mask))
+        x = x + self._apply_layer_scale(attn_out, self.gamma_1)
+        ffn_out = self.dropout(self.linear2(self.activation(self.linear1(self.norm2(x)))))
+        x = x + self._apply_layer_scale(ffn_out, self.gamma_2)
+        return x
+
+    def forward_flat(
+        self,
+        x: torch.Tensor,
+        *,
+        pos: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        attn_out = self.dropout(
+            self.attn.forward_flat(
+                self.norm1(x),
+                pos=pos,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        )
+        x = x + self._apply_layer_scale(attn_out, self.gamma_1)
+        ffn_out = self.dropout(self.linear2(self.activation(self.linear1(self.norm2(x)))))
+        x = x + self._apply_layer_scale(ffn_out, self.gamma_2)
         return x

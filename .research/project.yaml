@@ -1,0 +1,10 @@
+project: Matterformer
+wiki_project_page: projects/matterformer.md
+default_artifact_root_env: RESEARCH_ARTIFACT_ROOT
+local_path: /home/thadziv/GitHub/Matterformer
+remote: https://github.com/stases/Matterformer
+main_models: []
+main_baselines: []
+main_datasets: []
+current_focus: ""
+

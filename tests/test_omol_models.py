@@ -89,6 +89,89 @@ def test_omol_tetra_model_forward_backward():
     criterion(outputs, batch).loss.backward()
 
 
+def test_omol_internal_flat_tetra_matches_padded_runtime():
+    torch.manual_seed(12)
+    batch = _batch()
+    padded = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        runtime_mode="padded",
+    )
+    with torch.no_grad():
+        padded.group_force_head[-1].weight.normal_(std=1e-3)
+        padded.group_force_head[-1].bias.normal_(std=1e-3)
+    flat = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        runtime_mode="internal_flat_tetra",
+    )
+    flat.load_state_dict(padded.state_dict())
+    padded.eval()
+    flat.eval()
+
+    with torch.no_grad():
+        padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+    padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
+    assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_platonic_tetra_readout_flat_matches_padded_runtime():
+    torch.manual_seed(13)
+    batch = _batch()
+    padded = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="padded",
+    )
+    flat = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_tetra",
+    )
+    flat.load_state_dict(padded.state_dict())
+    padded.eval()
+    flat.eval()
+
+    with torch.no_grad():
+        padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+    padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
+    assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
 def test_omol_loss_normalization_and_metrics():
     batch = _batch()
     refs = torch.zeros(119)

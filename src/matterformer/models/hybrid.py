@@ -209,6 +209,13 @@ class HybridTrunkOutput:
     stream_type: Literal["scalar", "tetra"]
 
 
+@dataclass(frozen=True)
+class HybridFlatTrunkOutput:
+    scalar: torch.Tensor
+    group: torch.Tensor | None
+    stream_type: Literal["tetra"]
+
+
 def _diag_rms(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().float().pow(2).mean().sqrt()
 
@@ -238,6 +245,19 @@ def _rbf(dist: torch.Tensor, rbf_dim: int, cutoff: float | None = None) -> torch
     delta = max_dist / max(int(rbf_dim) - 1, 1)
     gamma = 1.0 / max(delta * delta, 1e-6)
     return torch.exp(-gamma * (dist[..., None] - centers.view(*((1,) * dist.ndim), -1)).square())
+
+
+def _activation_from_name(name: str):
+    value = str(name).lower().replace("-", "_")
+    if value == "gelu":
+        return F.gelu
+    if value in {"silu", "swish"}:
+        return F.silu
+    if value == "relu":
+        return F.relu
+    if value == "sin":
+        return torch.sin
+    raise ValueError(f"Unsupported tetra activation {name!r}")
 
 
 def _normalize_channels_by_l(rank: int, value: Any = None) -> dict[int, int]:
@@ -1412,6 +1432,14 @@ class GroupFramewiseSimplicialLayer(nn.Module):
             PlatonicLinear(hidden, d_group, solid=solid),
         )
         self.dropout = nn.Dropout(dropout)
+        layer_scale_init = config.get("layer_scale_init_value", None)
+        if layer_scale_init is None:
+            self.register_parameter("attn_layer_scale", None)
+            self.register_parameter("mlp_layer_scale", None)
+        else:
+            scale_shape = (1, 1, self.group_order, self.dim_per_frame)
+            self.attn_layer_scale = nn.Parameter(torch.full(scale_shape, float(layer_scale_init)))
+            self.mlp_layer_scale = nn.Parameter(torch.full(scale_shape, float(layer_scale_init)))
         self.last_diagnostics: dict[str, torch.Tensor] = {}
 
     def forward(self, state: ModelState) -> ModelState:
@@ -1427,10 +1455,20 @@ class GroupFramewiseSimplicialLayer(nn.Module):
             atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
             attn_in = self.norm1(atoms_flat).view_as(atoms)
             attn_delta = self.dropout(self.attn(attn_in, state.geom))
+            if self.attn_layer_scale is not None:
+                attn_delta = attn_delta * self.attn_layer_scale.to(
+                    device=attn_delta.device,
+                    dtype=attn_delta.dtype,
+                )
             atoms = atoms + attn_delta
         with record_function("group_simplicial_layer/mlp_residual"):
             atoms_flat = atoms.reshape(atoms.shape[0], atoms.shape[1], self.group_order * self.dim_per_frame)
             mlp_delta = self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+            if self.mlp_layer_scale is not None:
+                mlp_delta = mlp_delta * self.mlp_layer_scale.to(
+                    device=mlp_delta.device,
+                    dtype=mlp_delta.dtype,
+                )
             atoms = atoms + mlp_delta
         input_rms = _diag_rms(atoms_before)
         attn_delta_rms = _diag_rms(attn_delta)
@@ -1491,6 +1529,8 @@ class TetraPlatonicGlobalLayer(nn.Module):
             use_key=bool(config.get("use_key", False)),
             rope_on_values=bool(config.get("rope_on_values", True)),
             attention_backend=str(config.get("attention_backend", "sdpa")),
+            activation=_activation_from_name(str(config.get("activation", "gelu"))),
+            layer_scale_init_value=config.get("layer_scale_init_value", None),
         )
 
     @staticmethod
@@ -1511,6 +1551,24 @@ class TetraPlatonicGlobalLayer(nn.Module):
         if state.mask is not None:
             state.group = state.group.masked_fill(state.mask[..., None, None], 0.0)
         return state
+
+    def forward_flat(
+        self,
+        group: torch.Tensor,
+        *,
+        pos: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        with record_function("tetra_global/platonic_block_flat"):
+            if group.ndim != 3 or group.shape[1:] != (self.group_order, self.dim_per_frame):
+                raise ValueError(
+                    f"Expected flat group tensor [N, {self.group_order}, {self.dim_per_frame}], "
+                    f"got {tuple(group.shape)}"
+                )
+            x = group.reshape(group.shape[0], self.group_order * self.dim_per_frame)
+            x = self.block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            return x.view_as(group)
 
 
 class TrivialGlobalLayer(nn.Module):
@@ -1824,6 +1882,15 @@ class HybridTransformerTrunk(nn.Module):
             for layer in block.sublayers
         )
         self.requires_geometry_cache = self.needs_compact_geometry or self.needs_dense_geometry
+        self.supports_flat_tetra = (
+            self.stream_type == "tetra"
+            and self.input_lift_kind == "scalar_copy"
+            and all(
+                isinstance(layer, TetraPlatonicGlobalLayer)
+                for block in self.blocks
+                for layer in block.sublayers
+            )
+        )
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
@@ -1865,6 +1932,54 @@ class HybridTransformerTrunk(nn.Module):
         if pad_mask is not None:
             group = group.masked_fill(pad_mask[..., None, None], 0.0)
         return group
+
+    def forward_flat_tetra(
+        self,
+        x: torch.Tensor,
+        *,
+        coords: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        return_output: bool = False,
+    ) -> torch.Tensor | HybridFlatTrunkOutput:
+        if not self.supports_flat_tetra:
+            raise RuntimeError(
+                "forward_flat_tetra is only available for pure tetra-global trunks "
+                "with input_lift.kind='scalar_copy'"
+            )
+        if self.group_input_proj is None:
+            raise RuntimeError("group_input_proj is not configured for tetra stream")
+        if x.ndim != 2 or x.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected flat tetra trunk input [N, {self.input_dim}], got {tuple(x.shape)}")
+        if coords.shape != (x.shape[0], 3):
+            raise ValueError(f"Expected flat coords [N, 3], got {tuple(coords.shape)} for x {tuple(x.shape)}")
+
+        cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        with record_function("hybrid_trunk_flat/lift_tetra_input"):
+            group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
+        with record_function("hybrid_trunk_flat/blocks"):
+            for block in self.blocks:
+                for layer in block.sublayers:
+                    if not isinstance(layer, TetraPlatonicGlobalLayer):
+                        raise RuntimeError("forward_flat_tetra encountered a non-tetra layer")
+                    group = layer.forward_flat(
+                        group,
+                        pos=coords,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=int(max_seqlen),
+                    )
+        if self.readout_kind == "platonic_ffn":
+            scalar_out = group.reshape(group.shape[0], self.d_model)
+            if return_output:
+                return HybridFlatTrunkOutput(scalar=scalar_out, group=group, stream_type=self.stream_type)
+            return scalar_out
+        if self.group_readout_proj is None:
+            raise RuntimeError("group_readout_proj is not configured for group_mean tetra readout")
+        with record_function("hybrid_trunk_flat/final_norm"):
+            scalar_out = self.norm_out(self.group_readout_proj(group.mean(dim=1)))
+        if return_output:
+            return HybridFlatTrunkOutput(scalar=scalar_out, group=group, stream_type=self.stream_type)
+        return scalar_out
 
     def compute_geometry_features(
         self,

@@ -6,6 +6,11 @@ from matterformer.models.attention import (
     SimplicialLowRankMessageResidual,
     TwoSimplicialAttention,
 )
+from matterformer.models.allscaip import (
+    DEFAULT_ALLSCAIP_DIRECT_CONFIG,
+    MatterformerAllScAIPDirectForceField,
+    build_allscaip_direct_config,
+)
 from matterformer.models.embeddings import (
     FourierCoordEmbedder,
     LatticeEmbedder,
@@ -53,6 +58,7 @@ from matterformer.models.transformer import (
 
 __all__ = [
     "GeometryBiasBuilder",
+    "DEFAULT_ALLSCAIP_DIRECT_CONFIG",
     "LearnedNullConditioning",
     "CrystalHeads",
     "FourierCoordEmbedder",
@@ -72,6 +78,7 @@ __all__ = [
     "MaskEmbedder",
     "MhaFactorizedGeometryBias",
     "MatterformerOMolForceField",
+    "MatterformerAllScAIPDirectForceField",
     "QM9EDMModel",
     "QM9RegressionModel",
     "RegularAttention",
@@ -92,6 +99,7 @@ __all__ = [
     "TokenEmbedder",
     "TwoSimplicialAttention",
     "build_geometry_cache",
+    "build_allscaip_direct_config",
     "compact_simplicial_attention_torch",
     "compact_simplicial_attention_triton",
     "expand_hybrid_schedule",
