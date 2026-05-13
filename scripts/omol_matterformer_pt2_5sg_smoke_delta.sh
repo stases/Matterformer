@@ -46,7 +46,7 @@ export BUCKET_SHUFFLE_GROUPS="${BUCKET_SHUFFLE_GROUPS:-8}"
 export VALIDATION_MODE="${VALIDATION_MODE:-heldout}"
 
 export MAX_EPOCHS="${MAX_EPOCHS:-20}"
-export MAX_STEPS="${MAX_STEPS:-200}"
+export MAX_STEPS="${MAX_STEPS:-0}"
 export LR="${LR:-5e-4}"
 export WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 export WARMUP_STEPS="${WARMUP_STEPS:-2000}"
@@ -74,7 +74,7 @@ export PROFILE_STEPS="${PROFILE_STEPS:-5}"
 export PROFILE_WARMUP_STEPS="${PROFILE_WARMUP_STEPS:-0}"
 export SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-0}"
 
-export RUN_SLUG="${RUN_SLUG:-matterformer-pt2-h1920-l8-plus5sg-k16-ls1e-4-ffn2-actsin-ractsin-ema0.99-wd1e-5-smoke-n20000-bf16-flat-hybrid-sharedframe-platonichead}"
+export RUN_SLUG="${RUN_SLUG:-matterformer-pt2-h1920-l8-plus5sg-k16-ls1e-4-ffn2-actsin-ractsin-ema0.99-wd1e-5-20ep-n20000-bf16-flat-hybrid-sharedframe-platonichead}"
 export WANDB_PROJECT="${WANDB_PROJECT:-matterformer_omol_4m}"
 export WANDB_GROUP="${WANDB_GROUP:-matterformer_pt2_plus5sg_k16_smoke_bf16_flat_hybrid_sharedframe_platonichead}"
 
