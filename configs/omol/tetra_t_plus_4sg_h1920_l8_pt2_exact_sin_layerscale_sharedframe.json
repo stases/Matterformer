@@ -1,0 +1,72 @@
+{
+  "num_blocks": 8,
+  "stream_type": "tetra",
+  "block_mix": [0, 1, 0],
+  "order_policy": "explicit",
+  "explicit_orders": [
+    ["tetra"],
+    ["tetra"],
+    ["simplicial", "tetra"],
+    ["simplicial", "tetra"],
+    ["tetra"],
+    ["tetra"],
+    ["simplicial", "tetra"],
+    ["simplicial", "tetra"]
+  ],
+  "scalar_dim": 1920,
+  "tetra_dim_per_frame": 160,
+  "simplicial": {
+    "target": "group",
+    "k_neighbors": 16,
+    "num_heads": 5,
+    "head_dim": 32,
+    "projection_mode": "shared_frame",
+    "layer_scale_init_value": 0.0001,
+    "bias": {
+      "kind": "spherical_low_rank",
+      "representation": "compact",
+      "angle_rank": 32,
+      "channels_by_l": {"0": 5, "1": 4, "2": 3},
+      "radial_basis_dim": 32,
+      "radial_cutoff": 6.0,
+      "hidden_dim": 256,
+      "radial_gate_init": 0.02,
+      "angle_gate_init": 0.02,
+      "use_radial_uv": true,
+      "use_angle": true
+    },
+    "message": {
+      "enabled": false,
+      "rank": 16
+    },
+    "geometry": {
+      "builder": "triton_nonperiodic",
+      "strict": true
+    },
+    "kernel": {
+      "backend": "triton_grouped",
+      "precision": "tf32",
+      "strict": true
+    }
+  },
+  "tetra": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "heads_per_frame": 5,
+    "rope_sigma": 2.0,
+    "learned_freqs": true,
+    "freq_init": "random",
+    "use_key": false,
+    "rope_on_values": true,
+    "attention_backend": "flash",
+    "activation": "sin",
+    "ffn_mult": 2,
+    "layer_scale_init_value": 0.0001
+  },
+  "input_lift": {
+    "kind": "scalar_copy"
+  },
+  "readout": {
+    "kind": "platonic_ffn"
+  }
+}
