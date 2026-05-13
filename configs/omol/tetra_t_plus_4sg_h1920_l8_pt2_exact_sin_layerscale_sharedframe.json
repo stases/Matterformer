@@ -1,17 +1,21 @@
 {
-  "num_blocks": 8,
+  "num_blocks": 12,
   "stream_type": "tetra",
   "block_mix": [0, 1, 0],
   "order_policy": "explicit",
   "explicit_orders": [
     ["tetra"],
     ["tetra"],
-    ["simplicial", "tetra"],
-    ["simplicial", "tetra"],
     ["tetra"],
     ["tetra"],
-    ["simplicial", "tetra"],
-    ["simplicial", "tetra"]
+    ["simplicial"],
+    ["simplicial"],
+    ["tetra"],
+    ["tetra"],
+    ["tetra"],
+    ["tetra"],
+    ["simplicial"],
+    ["simplicial"]
   ],
   "scalar_dim": 1920,
   "tetra_dim_per_frame": 160,
