@@ -73,6 +73,7 @@ ENERGY_WEIGHT="${ENERGY_WEIGHT:-10}"
 FORCE_WEIGHT="${FORCE_WEIGHT:-10}"
 TRAIN_AUGMENTATION="${TRAIN_AUGMENTATION:-o3}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1}"
+SKIP_LOSS_ABOVE="${SKIP_LOSS_ABOVE:-0}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
 EMA_WARMUP_STEPS="${EMA_WARMUP_STEPS:-5000}"
 BF16="${BF16:-0}"
@@ -282,6 +283,7 @@ echo "float32_matmul_prec:     $FLOAT32_MATMUL_PRECISION"
 echo "compile:                 $COMPILE"
 echo "compile_mode:            $COMPILE_MODE"
 echo "grad_clip_norm:          $GRAD_CLIP_NORM"
+echo "skip_loss_above:         $SKIP_LOSS_ABOVE"
 echo "ema_decay:               $EMA_DECAY"
 echo "ema_warmup_steps:        $EMA_WARMUP_STEPS"
 echo "flops_coef:              $FLOPS_COEF"
@@ -346,6 +348,7 @@ echo "============================================================"
   --force-weight "$FORCE_WEIGHT" \
   --train-augmentation "$TRAIN_AUGMENTATION" \
   --grad-clip-norm "$GRAD_CLIP_NORM" \
+  --skip-loss-above "$SKIP_LOSS_ABOVE" \
   --ema-decay "$EMA_DECAY" \
   --ema-warmup-steps "$EMA_WARMUP_STEPS" \
   --float32-matmul-precision "$FLOAT32_MATMUL_PRECISION" \

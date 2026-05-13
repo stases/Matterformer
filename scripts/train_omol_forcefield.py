@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, is_dataclass
@@ -662,6 +663,7 @@ def main(args: argparse.Namespace) -> None:
     tokens_seen = 0
     padded_tokens_seen = 0
     train_seconds_seen = 0.0
+    skipped_updates = 0
 
     if args.resume_checkpoint is not None and args.warm_start_checkpoint is not None:
         raise ValueError("Only one of --resume-checkpoint or --warm-start-checkpoint may be set")
@@ -761,6 +763,40 @@ def main(args: argparse.Namespace) -> None:
                     )
                     output = criterion(predictions, batch)
             optimizer.zero_grad(set_to_none=True)
+            loss_value = float(output.loss.detach().float().item())
+            skip_reason = ""
+            if not math.isfinite(loss_value):
+                skip_reason = "nonfinite_loss"
+            elif args.skip_loss_above > 0.0 and loss_value > args.skip_loss_above:
+                skip_reason = "loss_above_threshold"
+            if skip_reason:
+                step_seconds = time.perf_counter() - step_start
+                global_step += 1
+                skipped_updates += 1
+                batch_graphs = int(batch.energy.shape[0])
+                batch_real_atoms = int(batch.num_atoms.sum().item())
+                batch_padded_slots = int(batch.atomic_numbers.numel())
+                tokens_seen += batch_real_atoms
+                padded_tokens_seen += batch_padded_slots
+                train_seconds_seen += step_seconds
+                skip_metrics = {
+                    "trainer/global_step": float(global_step),
+                    "trainer/epoch": float(epoch),
+                    "trainer/skipped_updates": float(skipped_updates),
+                    "trainer/skip_loss_value": loss_value,
+                    "trainer/skip_threshold": float(args.skip_loss_above),
+                    "trainer/skip_graphs": float(batch_graphs),
+                    "trainer/skip_atoms": float(batch_real_atoms),
+                    "trainer/skip_padded_tokens": float(batch_padded_slots),
+                    "trainer/skip_step_seconds": float(step_seconds),
+                }
+                log_metrics(run, {}, prefix="skip", step=global_step, extra=skip_metrics)
+                print(
+                    f"skip_update step={global_step:07d} reason={skip_reason} "
+                    f"loss={loss_value:.6g} threshold={args.skip_loss_above:.6g}"
+                )
+                data_wait_start = time.perf_counter()
+                continue
             with timer.phase("backward"):
                 output.loss.backward()
             with timer.phase("optimizer"):
@@ -986,6 +1022,12 @@ if __name__ == "__main__":
     parser.add_argument("--force-weight", type=float, default=10.0)
     parser.add_argument("--energy-loss", type=str, default="per_atom_mae", choices=["mae", "per_atom_mae"])
     parser.add_argument("--force-loss", type=str, default="l2norm", choices=["mae", "l2norm"])
+    parser.add_argument(
+        "--skip-loss-above",
+        type=float,
+        default=0.0,
+        help="Skip backward/optimizer/scheduler update when scalar train loss exceeds this value; <=0 disables.",
+    )
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=8)
