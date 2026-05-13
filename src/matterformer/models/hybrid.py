@@ -10,7 +10,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
-from matterformer.geometry.cache import GeometryCache
+from matterformer.geometry.cache import FlatGeometryCache, GeometryCache
 from matterformer.geometry.triton_nonperiodic_knn import build_triton_nonperiodic_knn_geometry_cache
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.platonic.layers import GroupLayerNorm
@@ -1210,6 +1210,30 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             return out.view(batch_size, num_atoms, self.group_order, self.dim_per_frame)
         return self.out_proj(out_group)
 
+    def _project_in_flat(
+        self,
+        x_group: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_atoms, group_order, channels = x_group.shape
+        if group_order != self.group_order or channels != self.dim_per_frame:
+            raise ValueError(
+                f"Expected flat group tensor [N, {self.group_order}, {self.dim_per_frame}], "
+                f"got {tuple(x_group.shape)}"
+            )
+        if self.projection_mode == "group_linear":
+            projected = self.in_proj(x_group.reshape(num_atoms, self.group_order * self.dim_per_frame))
+            projected = projected.view(num_atoms, self.group_order, 5 * self.inner_dim)
+        else:
+            projected = self.in_proj(x_group)
+        return tuple(projected.chunk(5, dim=-1))  # type: ignore[return-value]
+
+    def _project_out_flat(self, out_group: torch.Tensor) -> torch.Tensor:
+        num_atoms = out_group.shape[0]
+        if self.projection_mode == "group_linear":
+            out = self.out_proj(out_group.reshape(num_atoms, self.group_order * self.inner_dim))
+            return out.view(num_atoms, self.group_order, self.dim_per_frame)
+        return self.out_proj(out_group)
+
     def _record_diagnostics(
         self,
         *,
@@ -1386,6 +1410,82 @@ class GroupFramewiseSimplicialAttention(nn.Module):
             out = out_g.permute(0, 3, 1, 2, 4).contiguous().view(batch_size, num_atoms, group_order, self.inner_dim)
             return self._project_out(out)
 
+    def forward_flat(self, x_group_atoms: torch.Tensor, geom: FlatGeometryCache) -> torch.Tensor:
+        num_atoms, group_order, _ = x_group_atoms.shape
+        with record_function("group_simplicial_flat/in_proj"):
+            q, k1, v1, k2, v2 = self._project_in_flat(x_group_atoms)
+
+        def split_group_b1(tensor: torch.Tensor) -> torch.Tensor:
+            return (
+                tensor.reshape(num_atoms, group_order, self.num_heads, self.head_dim)
+                .permute(1, 2, 0, 3)
+                .unsqueeze(0)
+                .contiguous()
+            )
+
+        with record_function("group_simplicial_flat/split_heads_b1"):
+            q_g = split_group_b1(q) * self.scale
+            k1_g = split_group_b1(k1)
+            v1_g = split_group_b1(v1)
+            k2_g = split_group_b1(k2)
+            v2_g = split_group_b1(v2)
+
+        geom_b = geom.as_single_batch_geometry_cache()
+        if self.backend in {"triton_grouped", "triton_sg"}:
+            with record_function("group_simplicial_flat/bias_build"):
+                bias = self.bias(geom_b, dtype=x_group_atoms.dtype)
+            with record_function("group_simplicial_flat/triton_grouped_attention_b1"):
+                out_g = triton_grouped_compact_simplicial_attention(
+                    q_g,
+                    k1_g,
+                    v1_g,
+                    k2_g,
+                    v2_g,
+                    neighbor_idx=geom_b.neighbor_idx,
+                    neighbor_mask=geom_b.neighbor_mask,
+                    u=bias.u,
+                    v_bias=bias.v,
+                    gate=bias.gate,
+                    angle_left=bias.angle_left,
+                    angle_right=bias.angle_right,
+                    unit=geom_b.unit,
+                    angle_left_coeff=bias.angle_left_coeff,
+                    angle_right_coeff=bias.angle_right_coeff,
+                    angle_channels_by_l=bias.angle_channels_by_l,
+                    angle_rank=bias.angle_rank,
+                    angle_gate=bias.angle_gate,
+                    message_left=bias.message_left,
+                    message_right=bias.message_right,
+                    message_basis=bias.message_basis,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                    precision=self.precision,
+                    debug_torch_backward=self.debug_torch_backward,
+                    strict=self.strict_triton,
+                )
+        else:
+            with record_function("group_simplicial_flat/torch_or_ungrouped_attention_b1"):
+                out_b = self(x_group_atoms.unsqueeze(0), geom_b)
+            return out_b.squeeze(0)
+
+        self._record_diagnostics(
+            q_g=q_g,
+            k1_g=k1_g,
+            v1_g=v1_g,
+            k2_g=k2_g,
+            v2_g=v2_g,
+            bias=bias,
+            out_g=out_g,
+        )
+        with record_function("group_simplicial_flat/out_proj"):
+            out = (
+                out_g.squeeze(0)
+                .permute(2, 0, 1, 3)
+                .contiguous()
+                .view(num_atoms, group_order, self.inner_dim)
+            )
+            return self._project_out_flat(out)
+
 
 class GroupFramewiseSimplicialLayer(nn.Module):
     requires_geometry_cache = True
@@ -1493,6 +1593,54 @@ class GroupFramewiseSimplicialLayer(nn.Module):
             group = group.masked_fill(state.mask[..., None, None], 0.0)
         state.group = group
         return state
+
+    def forward_flat(self, group: torch.Tensor, geom: FlatGeometryCache) -> torch.Tensor:
+        if group.ndim != 3 or group.shape[1:] != (self.group_order, self.dim_per_frame):
+            raise ValueError(
+                f"Expected flat group [N, {self.group_order}, {self.dim_per_frame}], "
+                f"got {tuple(group.shape)}"
+            )
+        atoms = group
+        atoms_before = atoms
+        with record_function("group_simplicial_layer_flat/attention_residual"):
+            atoms_flat = atoms.reshape(atoms.shape[0], self.group_order * self.dim_per_frame)
+            attn_in = self.norm1(atoms_flat).view_as(atoms)
+            attn_delta = self.dropout(self.attn.forward_flat(attn_in, geom))
+            if self.attn_layer_scale is not None:
+                scale = self.attn_layer_scale.to(device=attn_delta.device, dtype=attn_delta.dtype).view(
+                    1,
+                    self.group_order,
+                    self.dim_per_frame,
+                )
+                attn_delta = attn_delta * scale
+            atoms = atoms + attn_delta
+        with record_function("group_simplicial_layer_flat/mlp_residual"):
+            atoms_flat = atoms.reshape(atoms.shape[0], self.group_order * self.dim_per_frame)
+            mlp_delta = self.dropout(self.mlp(self.norm2(atoms_flat)).view_as(atoms))
+            if self.mlp_layer_scale is not None:
+                scale = self.mlp_layer_scale.to(device=mlp_delta.device, dtype=mlp_delta.dtype).view(
+                    1,
+                    self.group_order,
+                    self.dim_per_frame,
+                )
+                mlp_delta = mlp_delta * scale
+            atoms = atoms + mlp_delta
+        input_rms = _diag_rms(atoms_before)
+        attn_delta_rms = _diag_rms(attn_delta)
+        mlp_delta_rms = _diag_rms(mlp_delta)
+        diagnostics = dict(self.attn.last_diagnostics)
+        diagnostics.update(
+            {
+                "input_rms": input_rms,
+                "attn_delta_rms": attn_delta_rms,
+                "mlp_delta_rms": mlp_delta_rms,
+                "output_rms": _diag_rms(atoms),
+                "attn_delta_ratio": attn_delta_rms / input_rms.clamp_min(1e-12),
+                "mlp_delta_ratio": mlp_delta_rms / input_rms.clamp_min(1e-12),
+            }
+        )
+        self.last_diagnostics = diagnostics
+        return atoms
 
 
 class TetraPlatonicGlobalLayer(nn.Module):
@@ -1891,6 +2039,17 @@ class HybridTransformerTrunk(nn.Module):
                 for layer in block.sublayers
             )
         )
+        self.supports_flat_hybrid = (
+            self.stream_type == "tetra"
+            and self.input_lift_kind == "scalar_copy"
+            and not self.local_moment_enabled
+            and not self.needs_dense_geometry
+            and all(
+                isinstance(layer, (TetraPlatonicGlobalLayer, GroupFramewiseSimplicialLayer))
+                for block in self.blocks
+                for layer in block.sublayers
+            )
+        )
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
@@ -1976,6 +2135,60 @@ class HybridTransformerTrunk(nn.Module):
         if self.group_readout_proj is None:
             raise RuntimeError("group_readout_proj is not configured for group_mean tetra readout")
         with record_function("hybrid_trunk_flat/final_norm"):
+            scalar_out = self.norm_out(self.group_readout_proj(group.mean(dim=1)))
+        if return_output:
+            return HybridFlatTrunkOutput(scalar=scalar_out, group=group, stream_type=self.stream_type)
+        return scalar_out
+
+    def forward_flat_hybrid(
+        self,
+        x: torch.Tensor,
+        *,
+        coords: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        flat_geom: FlatGeometryCache | None,
+        return_output: bool = False,
+    ) -> torch.Tensor | HybridFlatTrunkOutput:
+        if not self.supports_flat_hybrid:
+            raise RuntimeError(
+                "forward_flat_hybrid requires a tetra trunk with input_lift.kind='scalar_copy' "
+                "and only TetraPlatonicGlobalLayer / GroupFramewiseSimplicialLayer sublayers"
+            )
+        if self.group_input_proj is None:
+            raise RuntimeError("group_input_proj is not configured for tetra stream")
+        if x.ndim != 2 or x.shape[-1] != self.input_dim:
+            raise ValueError(f"Expected flat hybrid trunk input [N, {self.input_dim}], got {tuple(x.shape)}")
+        if coords.shape != (x.shape[0], 3):
+            raise ValueError(f"Expected flat coords [N, 3], got {tuple(coords.shape)} for x {tuple(x.shape)}")
+
+        cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        with record_function("hybrid_trunk_flat_hybrid/lift_tetra_input"):
+            group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
+        with record_function("hybrid_trunk_flat_hybrid/blocks"):
+            for block in self.blocks:
+                for layer in block.sublayers:
+                    if isinstance(layer, TetraPlatonicGlobalLayer):
+                        group = layer.forward_flat(
+                            group,
+                            pos=coords,
+                            cu_seqlens=cu_seqlens,
+                            max_seqlen=int(max_seqlen),
+                        )
+                    elif isinstance(layer, GroupFramewiseSimplicialLayer):
+                        if flat_geom is None:
+                            raise RuntimeError("Flat hybrid S_g layer requires a flat geometry cache")
+                        group = layer.forward_flat(group, flat_geom)
+                    else:
+                        raise RuntimeError(f"forward_flat_hybrid encountered unsupported layer {type(layer).__name__}")
+        if self.readout_kind == "platonic_ffn":
+            scalar_out = group.reshape(group.shape[0], self.d_model)
+            if return_output:
+                return HybridFlatTrunkOutput(scalar=scalar_out, group=group, stream_type=self.stream_type)
+            return scalar_out
+        if self.group_readout_proj is None:
+            raise RuntimeError("group_readout_proj is not configured for group_mean tetra readout")
+        with record_function("hybrid_trunk_flat_hybrid/final_norm"):
             scalar_out = self.norm_out(self.group_readout_proj(group.mean(dim=1)))
         if return_output:
             return HybridFlatTrunkOutput(scalar=scalar_out, group=group, stream_type=self.stream_type)

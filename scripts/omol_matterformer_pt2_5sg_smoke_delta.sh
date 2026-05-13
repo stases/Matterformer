@@ -15,9 +15,9 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/thadziv/GitHub/Matterformer}"
 
-export HYBRID_CONFIG_JSON="${HYBRID_CONFIG_JSON:-$REPO_ROOT/configs/omol/tetra_t_plus_5sg_h1920_l8_pt2_exact_sin_layerscale.json}"
+export HYBRID_CONFIG_JSON="${HYBRID_CONFIG_JSON:-$REPO_ROOT/configs/omol/tetra_t_plus_5sg_h1920_l8_pt2_exact_sin_layerscale_sharedframe.json}"
 export MODEL_BACKEND="${MODEL_BACKEND:-matterformer}"
-export OMOL_RUNTIME_MODE="${OMOL_RUNTIME_MODE:-padded}"
+export OMOL_RUNTIME_MODE="${OMOL_RUNTIME_MODE:-internal_flat_hybrid}"
 
 export D_MODEL="${D_MODEL:-1920}"
 export N_HEADS="${N_HEADS:-60}"
@@ -34,8 +34,8 @@ export BATCH_SIZE="${BATCH_SIZE:-64}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
 export MAX_GRAPHS_PER_BATCH="${MAX_GRAPHS_PER_BATCH:-999999}"
 export MAX_GRAPHS_PER_BATCH_VAL="${MAX_GRAPHS_PER_BATCH_VAL:-999999}"
-export MAX_ATOMS_PER_BATCH="${MAX_ATOMS_PER_BATCH:-12000}"
-export MAX_ATOMS_PER_BATCH_VAL="${MAX_ATOMS_PER_BATCH_VAL:-12000}"
+export MAX_ATOMS_PER_BATCH="${MAX_ATOMS_PER_BATCH:-20000}"
+export MAX_ATOMS_PER_BATCH_VAL="${MAX_ATOMS_PER_BATCH_VAL:-20000}"
 export MAX_EDGES_PER_BATCH="${MAX_EDGES_PER_BATCH:-4000000}"
 export MAX_EDGES_PER_BATCH_VAL="${MAX_EDGES_PER_BATCH_VAL:-4000000}"
 export NUM_WORKERS="${NUM_WORKERS:-16}"
@@ -74,8 +74,8 @@ export PROFILE_STEPS="${PROFILE_STEPS:-5}"
 export PROFILE_WARMUP_STEPS="${PROFILE_WARMUP_STEPS:-0}"
 export SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-0}"
 
-export RUN_SLUG="${RUN_SLUG:-matterformer-pt2-h1920-l8-plus5sg-k16-ls1e-4-ffn2-actsin-ractsin-ema0.99-wd1e-5-smoke-n12000-bf16-platonichead}"
+export RUN_SLUG="${RUN_SLUG:-matterformer-pt2-h1920-l8-plus5sg-k16-ls1e-4-ffn2-actsin-ractsin-ema0.99-wd1e-5-smoke-n20000-bf16-flat-hybrid-sharedframe-platonichead}"
 export WANDB_PROJECT="${WANDB_PROJECT:-matterformer_omol_4m}"
-export WANDB_GROUP="${WANDB_GROUP:-matterformer_pt2_plus5sg_k16_smoke_bf16_platonichead}"
+export WANDB_GROUP="${WANDB_GROUP:-matterformer_pt2_plus5sg_k16_smoke_bf16_flat_hybrid_sharedframe_platonichead}"
 
 exec "$REPO_ROOT/scripts/omol_forcefield_delta.sh"

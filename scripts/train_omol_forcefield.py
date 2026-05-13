@@ -1004,7 +1004,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--readout-head-mode", type=str, default="dense", choices=["dense", "platonic"])
     parser.add_argument("--readout-activation", type=str, default=None, choices=["gelu", "silu", "relu", "mish", "sin"])
-    parser.add_argument("--omol-runtime-mode", type=str, default="padded", choices=["padded", "internal_flat_tetra"])
+    parser.add_argument(
+        "--omol-runtime-mode",
+        type=str,
+        default="padded",
+        choices=["padded", "internal_flat_tetra", "internal_flat_hybrid"],
+    )
     parser.add_argument("--allscaip-config-json", type=str, default=None)
     parser.add_argument("--allscaip-strict-config-json", type=str, default=None)
     parser.add_argument("--allscaip-hidden-size", type=int, default=128)

@@ -8,6 +8,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from matterformer.geometry import NonPeriodicGeometryAdapter
+from matterformer.geometry.cache import flatten_padded_geometry_cache
 from matterformer.models.hybrid import HybridConfig, HybridFlatTrunkOutput, HybridTransformerTrunk, HybridTrunkOutput
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicLinear
 
@@ -189,8 +190,8 @@ class MatterformerOMolForceField(nn.Module):
         self.hybrid_config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.stream_type = self.hybrid_config.stream_type
         self.runtime_mode = str(runtime_mode).lower().replace("-", "_")
-        if self.runtime_mode not in {"padded", "internal_flat_tetra"}:
-            raise ValueError("runtime_mode must be one of {'padded', 'internal_flat_tetra'}")
+        if self.runtime_mode not in {"padded", "internal_flat_tetra", "internal_flat_hybrid"}:
+            raise ValueError("runtime_mode must be one of {'padded', 'internal_flat_tetra', 'internal_flat_hybrid'}")
         force_head_mode = str(force_head_mode).lower().replace("-", "_")
         if force_head_mode == "auto":
             force_head_mode = "tetra_vector" if self.stream_type == "tetra" else "pairwise"
@@ -237,6 +238,11 @@ class MatterformerOMolForceField(nn.Module):
             raise ValueError(
                 "runtime_mode='internal_flat_tetra' requires a pure tetra-global trunk "
                 "with input_lift.kind='scalar_copy'"
+            )
+        if self.runtime_mode == "internal_flat_hybrid" and not self.trunk.supports_flat_hybrid:
+            raise ValueError(
+                "runtime_mode='internal_flat_hybrid' requires a tetra trunk with input_lift.kind='scalar_copy' "
+                "and only tetra-global / group-framewise simplicial sublayers"
             )
         self._materialize_unused_distance_bias_lazy_modules()
         self.energy_head = (
@@ -451,7 +457,13 @@ class MatterformerOMolForceField(nn.Module):
         charge: torch.Tensor | None,
         spin: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
-        if self.stream_type != "tetra" or not self.trunk.supports_flat_tetra:
+        flat_hybrid = self.runtime_mode == "internal_flat_hybrid"
+        if self.stream_type != "tetra":
+            raise RuntimeError("Internal flat OMol runtime requires a tetra trunk")
+        if flat_hybrid:
+            if not self.trunk.supports_flat_hybrid:
+                raise RuntimeError("internal_flat_hybrid runtime requires a supported flat hybrid trunk")
+        elif not self.trunk.supports_flat_tetra:
             raise RuntimeError("internal_flat_tetra runtime requires a supported pure tetra trunk")
         with record_function("omol/input_flatten_condition"):
             valid = ~pad_mask
@@ -472,6 +484,7 @@ class MatterformerOMolForceField(nn.Module):
             coords_flat = coords[valid]
             center = _segment_mean_flat(coords_flat, batch_index, batch_size, counts=num_atoms)
             centered_coords = coords_flat - center[batch_index]
+            centered_coords_padded = (coords - center[:, None, :]).masked_fill(pad_mask[..., None], 0.0)
             token_features = self.atom_embedding(atomic_flat)
             token_features = self.charge_spin.forward_flat(
                 token_features,
@@ -481,14 +494,43 @@ class MatterformerOMolForceField(nn.Module):
                 num_graphs=batch_size,
             )
 
-        with record_function("omol/trunk_tetra_flat"):
-            trunk_result = self.trunk.forward_flat_tetra(
-                token_features,
-                coords=centered_coords,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                return_output=True,
-            )
+        flat_geom = None
+        if flat_hybrid and self.trunk.needs_compact_geometry:
+            with record_function("omol/flat_hybrid_geometry_cache"):
+                padded_geom = self.trunk._build_geom_cache(
+                    coords=centered_coords_padded,
+                    pad_mask=pad_mask,
+                    lattice=None,
+                    seq_len=num_slots,
+                )
+                if padded_geom is None:
+                    raise RuntimeError("internal_flat_hybrid requires a compact geometry cache")
+                flat_geom = flatten_padded_geometry_cache(
+                    padded_geom,
+                    valid=valid,
+                    batch_index=batch_index,
+                    cu_seqlens=cu_seqlens,
+                )
+                del padded_geom
+
+        with record_function("omol/trunk_flat"):
+            if flat_hybrid:
+                trunk_result = self.trunk.forward_flat_hybrid(
+                    token_features,
+                    coords=centered_coords,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    flat_geom=flat_geom,
+                    return_output=True,
+                )
+            else:
+                trunk_result = self.trunk.forward_flat_tetra(
+                    token_features,
+                    coords=centered_coords,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    return_output=True,
+                )
         if not isinstance(trunk_result, HybridFlatTrunkOutput) or trunk_result.group is None:
             raise RuntimeError("Flat tetra OMol model requires group output from the hybrid trunk")
         if self.readout_head_mode == "platonic":
@@ -531,7 +573,7 @@ class MatterformerOMolForceField(nn.Module):
     ) -> dict[str, torch.Tensor]:
         with record_function("omol/input_embed_condition"):
             pad_mask = pad_mask.bool()
-            if self.runtime_mode == "internal_flat_tetra":
+            if self.runtime_mode in {"internal_flat_tetra", "internal_flat_hybrid"}:
                 return self._forward_flat_tetra_from_padded(
                     atomic_numbers,
                     coords,
