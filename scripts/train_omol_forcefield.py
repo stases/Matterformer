@@ -86,6 +86,111 @@ def collect_allscaip_runtime_config(model: torch.nn.Module) -> dict:
     return config
 
 
+def _parse_name_fragments(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(fragment.strip().lower() for fragment in value.split(",") if fragment.strip())
+
+
+def _uses_muon_update(name: str, parameter: torch.nn.Parameter, args: argparse.Namespace) -> bool:
+    if parameter.ndim < args.muon_min_ndim:
+        return False
+    lowered = name.lower()
+    if args.muon_hidden_only and not lowered.startswith("trunk.blocks."):
+        return False
+    if any(fragment in lowered for fragment in _parse_name_fragments(args.muon_exclude_name_fragments)):
+        return False
+    return True
+
+
+def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
+    optimizer_name = str(args.optimizer).lower()
+    if optimizer_name == "adamw":
+        args.optimizer_resolved = {
+            "name": "adamw",
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "num_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+        }
+        return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    if optimizer_name != "muon":
+        raise ValueError(f"Unknown optimizer {args.optimizer!r}")
+
+    try:
+        from muon import SingleDeviceMuonWithAuxAdam
+    except ImportError as exc:
+        raise RuntimeError(
+            "Muon optimizer is not importable. Install it in the training environment with "
+            "`python -m pip install git+https://github.com/KellerJordan/Muon` or "
+            "`python -m pip install -e /home/thadziv/GitHub/Muon`."
+        ) from exc
+
+    muon_params: list[torch.nn.Parameter] = []
+    adam_params: list[torch.nn.Parameter] = []
+    muon_names: list[str] = []
+    adam_names: list[str] = []
+    for name, parameter in unwrap_model(model).named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if _uses_muon_update(name, parameter, args):
+            muon_params.append(parameter)
+            muon_names.append(name)
+        else:
+            adam_params.append(parameter)
+            adam_names.append(name)
+
+    if not muon_params:
+        raise RuntimeError(
+            "Optimizer muon selected but no parameters matched the Muon group. "
+            "Use --no-muon-hidden-only or adjust --muon-exclude-name-fragments."
+        )
+
+    muon_adam_lr = args.muon_adam_lr if args.muon_adam_lr is not None else args.lr
+    muon_adam_weight_decay = (
+        args.muon_adam_weight_decay if args.muon_adam_weight_decay is not None else args.weight_decay
+    )
+    param_groups: list[dict[str, object]] = [
+        {
+            "params": muon_params,
+            "use_muon": True,
+            "lr": float(args.muon_lr),
+            "momentum": float(args.muon_momentum),
+            "weight_decay": float(args.muon_weight_decay),
+        },
+    ]
+    if adam_params:
+        param_groups.append(
+            {
+                "params": adam_params,
+                "use_muon": False,
+                "lr": float(muon_adam_lr),
+                "betas": (float(args.muon_adam_beta1), float(args.muon_adam_beta2)),
+                "eps": float(args.muon_adam_eps),
+                "weight_decay": float(muon_adam_weight_decay),
+            }
+        )
+
+    args.optimizer_resolved = {
+        "name": "muon",
+        "muon_lr": float(args.muon_lr),
+        "muon_momentum": float(args.muon_momentum),
+        "muon_weight_decay": float(args.muon_weight_decay),
+        "muon_parameters": sum(parameter.numel() for parameter in muon_params),
+        "muon_tensors": len(muon_params),
+        "adam_lr": float(muon_adam_lr),
+        "adam_weight_decay": float(muon_adam_weight_decay),
+        "adam_parameters": sum(parameter.numel() for parameter in adam_params),
+        "adam_tensors": len(adam_params),
+        "muon_hidden_only": bool(args.muon_hidden_only),
+        "muon_min_ndim": int(args.muon_min_ndim),
+        "muon_first_names": muon_names[:12],
+        "adam_first_names": adam_names[:12],
+    }
+    print("optimizer_resolved: " + json.dumps(args.optimizer_resolved, sort_keys=True))
+    return SingleDeviceMuonWithAuxAdam(param_groups)
+
+
 def _config_values_match(actual, expected) -> bool:
     if isinstance(expected, float):
         try:
@@ -648,7 +753,7 @@ def main(args: argparse.Namespace) -> None:
     elif args.compile:
         print("compile: AllScAIP backend skips the outer torch.compile wrapper; use --allscaip-compile to control its internal compile path")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(model, args)
     scheduler = CosineWarmupScheduler(optimizer, warmup=args.warmup_steps, max_iters=args.max_steps)
     run = maybe_init_wandb(args)
 
@@ -1013,6 +1118,38 @@ if __name__ == "__main__":
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"])
+    parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument("--muon-weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--muon-adam-lr",
+        type=float,
+        default=None,
+        help="Aux Adam learning rate for parameters not assigned to Muon; defaults to --lr.",
+    )
+    parser.add_argument(
+        "--muon-adam-weight-decay",
+        type=float,
+        default=None,
+        help="Aux Adam weight decay for parameters not assigned to Muon; defaults to --weight-decay.",
+    )
+    parser.add_argument("--muon-adam-beta1", type=float, default=0.9)
+    parser.add_argument("--muon-adam-beta2", type=float, default=0.95)
+    parser.add_argument("--muon-adam-eps", type=float, default=1e-10)
+    parser.add_argument(
+        "--muon-hidden-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When using Muon, restrict Muon updates to hidden trunk block matrix weights.",
+    )
+    parser.add_argument("--muon-min-ndim", type=int, default=2)
+    parser.add_argument(
+        "--muon-exclude-name-fragments",
+        type=str,
+        default="embed,embedding,head,readout,rope,freq",
+        help="Comma-separated lowercase name fragments excluded from the Muon parameter group.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument("--max-epochs", type=int, default=None)

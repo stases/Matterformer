@@ -67,6 +67,18 @@ MAX_EPOCHS="${MAX_EPOCHS:-20}"
 MAX_STEPS="${MAX_STEPS:-0}"
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
+OPTIMIZER="${OPTIMIZER:-adamw}"
+MUON_LR="${MUON_LR:-0.02}"
+MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0}"
+MUON_ADAM_LR="${MUON_ADAM_LR:-}"
+MUON_ADAM_WEIGHT_DECAY="${MUON_ADAM_WEIGHT_DECAY:-}"
+MUON_ADAM_BETA1="${MUON_ADAM_BETA1:-0.9}"
+MUON_ADAM_BETA2="${MUON_ADAM_BETA2:-0.95}"
+MUON_ADAM_EPS="${MUON_ADAM_EPS:-1e-10}"
+MUON_HIDDEN_ONLY="${MUON_HIDDEN_ONLY:-1}"
+MUON_MIN_NDIM="${MUON_MIN_NDIM:-2}"
+MUON_EXCLUDE_NAME_FRAGMENTS="${MUON_EXCLUDE_NAME_FRAGMENTS:-embed,embedding,head,readout,rope,freq}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 NORMALIZER_RMSD="${NORMALIZER_RMSD:-1.433569}"
 ENERGY_WEIGHT="${ENERGY_WEIGHT:-10}"
@@ -230,6 +242,9 @@ EXTRA_ARGS=()
 [ -n "$ALLSCAIP_CONFIG_JSON" ] && EXTRA_ARGS+=(--allscaip-config-json "$ALLSCAIP_CONFIG_JSON")
 [ -n "$ALLSCAIP_STRICT_CONFIG_JSON" ] && EXTRA_ARGS+=(--allscaip-strict-config-json "$ALLSCAIP_STRICT_CONFIG_JSON")
 [ -n "$ALLSCAIP_FREQUENCY_LIST" ] && EXTRA_ARGS+=(--allscaip-frequency-list "$ALLSCAIP_FREQUENCY_LIST")
+[ "$MUON_HIDDEN_ONLY" = "1" ] && EXTRA_ARGS+=(--muon-hidden-only) || EXTRA_ARGS+=(--no-muon-hidden-only)
+[ -n "$MUON_ADAM_LR" ] && EXTRA_ARGS+=(--muon-adam-lr "$MUON_ADAM_LR")
+[ -n "$MUON_ADAM_WEIGHT_DECAY" ] && EXTRA_ARGS+=(--muon-adam-weight-decay "$MUON_ADAM_WEIGHT_DECAY")
 [ -n "${RESUME_CHECKPOINT:-}" ] && EXTRA_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
 [ -n "${WARM_START_CHECKPOINT:-}" ] && EXTRA_ARGS+=(--warm-start-checkpoint "$WARM_START_CHECKPOINT")
 
@@ -262,6 +277,14 @@ echo "max_epochs:              $MAX_EPOCHS"
 echo "max_steps:               $MAX_STEPS (0 means epoch-limited)"
 echo "lr:                      $LR"
 echo "weight_decay:            $WEIGHT_DECAY"
+echo "optimizer:               $OPTIMIZER"
+echo "muon_lr:                 $MUON_LR"
+echo "muon_momentum:           $MUON_MOMENTUM"
+echo "muon_weight_decay:       $MUON_WEIGHT_DECAY"
+echo "muon_adam_lr:            ${MUON_ADAM_LR:-default_lr}"
+echo "muon_adam_weight_decay:  ${MUON_ADAM_WEIGHT_DECAY:-default_weight_decay}"
+echo "muon_hidden_only:        $MUON_HIDDEN_ONLY"
+echo "muon_min_ndim:           $MUON_MIN_NDIM"
 echo "warmup_steps:            $WARMUP_STEPS"
 echo "normalizer_rmsd:         $NORMALIZER_RMSD"
 echo "train_augmentation:      $TRAIN_AUGMENTATION"
@@ -343,6 +366,15 @@ echo "============================================================"
   --warmup-steps "$WARMUP_STEPS" \
   --lr "$LR" \
   --weight-decay "$WEIGHT_DECAY" \
+  --optimizer "$OPTIMIZER" \
+  --muon-lr "$MUON_LR" \
+  --muon-momentum "$MUON_MOMENTUM" \
+  --muon-weight-decay "$MUON_WEIGHT_DECAY" \
+  --muon-adam-beta1 "$MUON_ADAM_BETA1" \
+  --muon-adam-beta2 "$MUON_ADAM_BETA2" \
+  --muon-adam-eps "$MUON_ADAM_EPS" \
+  --muon-min-ndim "$MUON_MIN_NDIM" \
+  --muon-exclude-name-fragments "$MUON_EXCLUDE_NAME_FRAGMENTS" \
   --normalizer-rmsd "$NORMALIZER_RMSD" \
   --energy-weight "$ENERGY_WEIGHT" \
   --force-weight "$FORCE_WEIGHT" \
