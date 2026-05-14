@@ -47,7 +47,7 @@
       "strict": true
     },
     "kernel": {
-      "backend": "triton",
+      "backend": "triton_grouped",
       "precision": "tf32",
       "strict": true
     }
