@@ -399,7 +399,8 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
-        score = tl.dot(k1 * q[None, :], tl.trans(k2), input_precision=INPUT_PRECISION).to(tl.float32)
+        q_dot = q.to(k1.dtype)
+        score = tl.dot(k1 * q_dot[None, :], tl.trans(k2), input_precision=INPUT_PRECISION).to(tl.float32)
 
         if HAS_RADIAL_BIAS:
             bias_base = (bh_idx * num_atoms + atom_idx) * k_neighbors
@@ -740,7 +741,8 @@ if TRITON_COMPACT_SIMPLICIAL_AVAILABLE:
             other=0.0,
         )
 
-        score = tl.dot(k1 * q[None, :], tl.trans(k2), input_precision=INPUT_PRECISION).to(tl.float32)
+        q_dot = q.to(k1.dtype)
+        score = tl.dot(k1 * q_dot[None, :], tl.trans(k2), input_precision=INPUT_PRECISION).to(tl.float32)
         q = q.to(tl.float32)
         k1 = k1.to(tl.float32)
         k2 = k2.to(tl.float32)
