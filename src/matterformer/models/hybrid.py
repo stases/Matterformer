@@ -1091,6 +1091,163 @@ class SimplicialLocalLayer(nn.Module):
         return state
 
 
+class TetraSharedSimplicialLayer(nn.Module):
+    """Apply the regular scalar simplicial layer independently to each tetra frame.
+
+    This is the "shared S" tetra-stream variant: one CompactSimplicialAttention
+    module and one channel MLP are shared across all group frames. Unlike
+    GroupFramewiseSimplicialLayer, this does not use platonic group-linear
+    projections or the grouped S_g Triton kernel.
+    """
+
+    requires_geometry_cache = True
+
+    def __init__(
+        self,
+        *,
+        group_order: int,
+        dim_per_frame: int,
+        config: dict[str, Any],
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.group_order = int(group_order)
+        self.dim_per_frame = int(dim_per_frame)
+        num_heads = int(config.get("num_heads", 1))
+        self.norm1 = nn.LayerNorm(self.dim_per_frame, eps=eps)
+        self.norm2 = nn.LayerNorm(self.dim_per_frame, eps=eps)
+        self.attn = CompactSimplicialAttention(
+            self.dim_per_frame,
+            num_heads,
+            head_dim=config.get("head_dim"),
+            dropout=dropout,
+            backend=dict(config.get("kernel", {})).get("backend", "triton_knn"),
+            precision=dict(config.get("kernel", {})).get("precision", "bf16_tc"),
+            debug_torch_backward=bool(dict(config.get("kernel", {})).get("debug_torch_backward", False)),
+            strict_triton=bool(dict(config.get("kernel", {})).get("strict", False)),
+            bias_config=dict(config.get("bias", {})),
+            message_config=dict(config.get("message", {})),
+        )
+        hidden = int(self.dim_per_frame * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.dim_per_frame, hidden),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, self.dim_per_frame),
+        )
+        self.dropout = nn.Dropout(dropout)
+        layer_scale_init = config.get("layer_scale_init_value", None)
+        if layer_scale_init is None:
+            self.register_parameter("attn_layer_scale", None)
+            self.register_parameter("mlp_layer_scale", None)
+        else:
+            scale_shape = (1, 1, 1, self.dim_per_frame)
+            self.attn_layer_scale = nn.Parameter(torch.full(scale_shape, float(layer_scale_init)))
+            self.mlp_layer_scale = nn.Parameter(torch.full(scale_shape, float(layer_scale_init)))
+        self.last_diagnostics: dict[str, torch.Tensor] = {}
+
+    def _attention_padded(self, atoms: torch.Tensor, geom: GeometryCache) -> torch.Tensor:
+        batch_size, num_atoms, group_order, channels = atoms.shape
+        if group_order != self.group_order or channels != self.dim_per_frame:
+            raise ValueError(
+                f"Expected group tensor [B, N, {self.group_order}, {self.dim_per_frame}], "
+                f"got {tuple(atoms.shape)}"
+            )
+        atoms_flat = atoms.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * self.group_order,
+            num_atoms,
+            self.dim_per_frame,
+        )
+        geom_group = _repeat_geometry_cache_for_group(geom, self.group_order)
+        out_flat = self.attn(atoms_flat, geom_group)
+        return out_flat.view(batch_size, self.group_order, num_atoms, self.dim_per_frame).permute(0, 2, 1, 3).contiguous()
+
+    def _attention_flat(self, atoms: torch.Tensor, geom: FlatGeometryCache) -> torch.Tensor:
+        num_atoms, group_order, channels = atoms.shape
+        if group_order != self.group_order or channels != self.dim_per_frame:
+            raise ValueError(
+                f"Expected flat group [N, {self.group_order}, {self.dim_per_frame}], "
+                f"got {tuple(atoms.shape)}"
+            )
+        atoms_flat = atoms.permute(1, 0, 2).contiguous()
+        geom_group = _repeat_geometry_cache_for_group(geom.as_single_batch_geometry_cache(), self.group_order)
+        out_flat = self.attn(atoms_flat, geom_group)
+        return out_flat.permute(1, 0, 2).contiguous()
+
+    def _update_diagnostics(self, atoms_before: torch.Tensor, atoms: torch.Tensor, attn_delta: torch.Tensor, mlp_delta: torch.Tensor) -> None:
+        input_rms = _diag_rms(atoms_before)
+        attn_delta_rms = _diag_rms(attn_delta)
+        mlp_delta_rms = _diag_rms(mlp_delta)
+        self.last_diagnostics = {
+            "input_rms": input_rms,
+            "attn_delta_rms": attn_delta_rms,
+            "mlp_delta_rms": mlp_delta_rms,
+            "output_rms": _diag_rms(atoms),
+            "attn_delta_ratio": attn_delta_rms / input_rms.clamp_min(1e-12),
+            "mlp_delta_ratio": mlp_delta_rms / input_rms.clamp_min(1e-12),
+        }
+
+    def forward(self, state: ModelState) -> ModelState:
+        if state.group is None:
+            return state
+        if state.geom is None:
+            raise RuntimeError("TetraSharedSimplicialLayer requires geometry cache")
+        coords_len = state.geom.coords_len
+        group = state.group
+        atoms = group[:, :coords_len, :, :]
+        atoms_before = atoms
+        with record_function("tetra_shared_simplicial/attention_residual"):
+            attn_delta = self.dropout(self._attention_padded(self.norm1(atoms), state.geom))
+            if self.attn_layer_scale is not None:
+                attn_delta = attn_delta * self.attn_layer_scale.to(
+                    device=attn_delta.device,
+                    dtype=attn_delta.dtype,
+                )
+            atoms = atoms + attn_delta
+        with record_function("tetra_shared_simplicial/mlp_residual"):
+            mlp_delta = self.dropout(self.mlp(self.norm2(atoms)))
+            if self.mlp_layer_scale is not None:
+                mlp_delta = mlp_delta * self.mlp_layer_scale.to(device=mlp_delta.device, dtype=mlp_delta.dtype)
+            atoms = atoms + mlp_delta
+        self._update_diagnostics(atoms_before, atoms, attn_delta, mlp_delta)
+        if group.shape[1] == coords_len:
+            group = atoms
+        else:
+            group = torch.cat([atoms, group[:, coords_len:, :, :]], dim=1)
+        if state.mask is not None:
+            group = group.masked_fill(state.mask[..., None, None], 0.0)
+        state.group = group
+        return state
+
+    def forward_flat(self, group: torch.Tensor, geom: FlatGeometryCache) -> torch.Tensor:
+        atoms = group
+        atoms_before = atoms
+        with record_function("tetra_shared_simplicial_flat/attention_residual"):
+            attn_delta = self.dropout(self._attention_flat(self.norm1(atoms), geom))
+            if self.attn_layer_scale is not None:
+                scale = self.attn_layer_scale.to(device=attn_delta.device, dtype=attn_delta.dtype).view(
+                    1,
+                    1,
+                    self.dim_per_frame,
+                )
+                attn_delta = attn_delta * scale
+            atoms = atoms + attn_delta
+        with record_function("tetra_shared_simplicial_flat/mlp_residual"):
+            mlp_delta = self.dropout(self.mlp(self.norm2(atoms)))
+            if self.mlp_layer_scale is not None:
+                scale = self.mlp_layer_scale.to(device=mlp_delta.device, dtype=mlp_delta.dtype).view(
+                    1,
+                    1,
+                    self.dim_per_frame,
+                )
+                mlp_delta = mlp_delta * scale
+            atoms = atoms + mlp_delta
+        self._update_diagnostics(atoms_before, atoms, attn_delta, mlp_delta)
+        return atoms
+
+
 class GroupFramewiseSimplicialAttention(nn.Module):
     def __init__(
         self,
@@ -1941,12 +2098,24 @@ class HybridTransformerTrunk(nn.Module):
         )
 
         blocks: list[HybridBlock] = []
+        simplicial_target = str(self.config.simplicial.get("target", "scalar")).lower().replace("-", "_")
         for block_order in schedule:
             sublayers: list[nn.Module] = []
             for layer_type in block_order:
                 if layer_type == "simplicial":
                     if self.stream_type == "scalar":
                         sublayers.append(SimplicialLocalLayer(d_model, self.config.simplicial, dropout=dropout, mlp_ratio=mlp_ratio))
+                    elif simplicial_target in {"shared", "shared_frame", "regular_shared", "regular_shared_frame"}:
+                        sublayers.append(
+                            TetraSharedSimplicialLayer(
+                                group_order=self.group_order,
+                                dim_per_frame=self.group_dim_per_frame,
+                                config=self.config.simplicial,
+                                dropout=dropout,
+                                mlp_ratio=mlp_ratio,
+                                eps=eps,
+                            )
+                        )
                     else:
                         sublayers.append(
                             GroupFramewiseSimplicialLayer(
@@ -2020,7 +2189,7 @@ class HybridTransformerTrunk(nn.Module):
             blocks.append(HybridBlock(sublayers))
         self.blocks = nn.ModuleList(blocks)
         self.needs_compact_geometry = self.local_moment_enabled or any(
-            isinstance(layer, (SimplicialLocalLayer, GroupFramewiseSimplicialLayer))
+            isinstance(layer, (SimplicialLocalLayer, TetraSharedSimplicialLayer, GroupFramewiseSimplicialLayer))
             for block in self.blocks
             for layer in block.sublayers
         )
@@ -2045,7 +2214,7 @@ class HybridTransformerTrunk(nn.Module):
             and not self.local_moment_enabled
             and not self.needs_dense_geometry
             and all(
-                isinstance(layer, (TetraPlatonicGlobalLayer, GroupFramewiseSimplicialLayer))
+                isinstance(layer, (TetraPlatonicGlobalLayer, TetraSharedSimplicialLayer, GroupFramewiseSimplicialLayer))
                 for block in self.blocks
                 for layer in block.sublayers
             )
@@ -2153,7 +2322,8 @@ class HybridTransformerTrunk(nn.Module):
         if not self.supports_flat_hybrid:
             raise RuntimeError(
                 "forward_flat_hybrid requires a tetra trunk with input_lift.kind='scalar_copy' "
-                "and only TetraPlatonicGlobalLayer / GroupFramewiseSimplicialLayer sublayers"
+                "and only TetraPlatonicGlobalLayer / TetraSharedSimplicialLayer / "
+                "GroupFramewiseSimplicialLayer sublayers"
             )
         if self.group_input_proj is None:
             raise RuntimeError("group_input_proj is not configured for tetra stream")
@@ -2178,6 +2348,10 @@ class HybridTransformerTrunk(nn.Module):
                     elif isinstance(layer, GroupFramewiseSimplicialLayer):
                         if flat_geom is None:
                             raise RuntimeError("Flat hybrid S_g layer requires a flat geometry cache")
+                        group = layer.forward_flat(group, flat_geom)
+                    elif isinstance(layer, TetraSharedSimplicialLayer):
+                        if flat_geom is None:
+                            raise RuntimeError("Flat hybrid shared S layer requires a flat geometry cache")
                         group = layer.forward_flat(group, flat_geom)
                     else:
                         raise RuntimeError(f"forward_flat_hybrid encountered unsupported layer {type(layer).__name__}")

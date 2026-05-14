@@ -82,6 +82,17 @@ def _tetra_plus_sg_config():
     return cfg
 
 
+def _tetra_plus_shared_s_config():
+    cfg = _tetra_plus_sg_config()
+    cfg["simplicial"] = {
+        **cfg["simplicial"],
+        "target": "shared_frame",
+        "kernel": {"backend": "torch", "strict": False},
+    }
+    cfg["simplicial"].pop("projection_mode", None)
+    return cfg
+
+
 def test_omol_scalar_model_forward_backward():
     torch.manual_seed(0)
     batch = _batch()
@@ -263,6 +274,48 @@ def test_omol_internal_flat_hybrid_matches_padded_runtime():
         n_heads=4,
         n_layers=2,
         hybrid_config=_tetra_plus_sg_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_hybrid",
+    )
+    flat.load_state_dict(padded.state_dict())
+    padded.eval()
+    flat.eval()
+
+    with torch.no_grad():
+        padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+    padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
+    assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_internal_flat_hybrid_shared_s_matches_padded_runtime():
+    torch.manual_seed(16)
+    batch = _batch()
+    padded = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=2,
+        hybrid_config=_tetra_plus_shared_s_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="padded",
+    )
+    flat = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=2,
+        hybrid_config=_tetra_plus_shared_s_config(),
         chgspin_mode="add",
         pair_hidden_dim=24,
         pair_n_rbf=8,
