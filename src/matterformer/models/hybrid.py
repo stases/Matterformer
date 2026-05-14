@@ -1118,8 +1118,9 @@ class TetraSharedSimplicialLayer(nn.Module):
         num_heads = int(config.get("num_heads", 1))
         self.norm1 = nn.LayerNorm(self.dim_per_frame, eps=eps)
         self.norm2 = nn.LayerNorm(self.dim_per_frame, eps=eps)
-        self.attn = CompactSimplicialAttention(
+        self.attn = GroupFramewiseSimplicialAttention(
             self.dim_per_frame,
+            self.group_order,
             num_heads,
             head_dim=config.get("head_dim"),
             dropout=dropout,
@@ -1127,6 +1128,7 @@ class TetraSharedSimplicialLayer(nn.Module):
             precision=dict(config.get("kernel", {})).get("precision", "bf16_tc"),
             debug_torch_backward=bool(dict(config.get("kernel", {})).get("debug_torch_backward", False)),
             strict_triton=bool(dict(config.get("kernel", {})).get("strict", False)),
+            projection_mode="shared_frame",
             bias_config=dict(config.get("bias", {})),
             message_config=dict(config.get("message", {})),
         )
@@ -1155,14 +1157,7 @@ class TetraSharedSimplicialLayer(nn.Module):
                 f"Expected group tensor [B, N, {self.group_order}, {self.dim_per_frame}], "
                 f"got {tuple(atoms.shape)}"
             )
-        atoms_flat = atoms.permute(0, 2, 1, 3).contiguous().view(
-            batch_size * self.group_order,
-            num_atoms,
-            self.dim_per_frame,
-        )
-        geom_group = _repeat_geometry_cache_for_group(geom, self.group_order)
-        out_flat = self.attn(atoms_flat, geom_group)
-        return out_flat.view(batch_size, self.group_order, num_atoms, self.dim_per_frame).permute(0, 2, 1, 3).contiguous()
+        return self.attn(atoms, geom)
 
     def _attention_flat(self, atoms: torch.Tensor, geom: FlatGeometryCache) -> torch.Tensor:
         num_atoms, group_order, channels = atoms.shape
@@ -1171,10 +1166,7 @@ class TetraSharedSimplicialLayer(nn.Module):
                 f"Expected flat group [N, {self.group_order}, {self.dim_per_frame}], "
                 f"got {tuple(atoms.shape)}"
             )
-        atoms_flat = atoms.permute(1, 0, 2).contiguous()
-        geom_group = _repeat_geometry_cache_for_group(geom.as_single_batch_geometry_cache(), self.group_order)
-        out_flat = self.attn(atoms_flat, geom_group)
-        return out_flat.permute(1, 0, 2).contiguous()
+        return self.attn.forward_flat(atoms, geom)
 
     def _update_diagnostics(self, atoms_before: torch.Tensor, atoms: torch.Tensor, attn_delta: torch.Tensor, mlp_delta: torch.Tensor) -> None:
         input_rms = _diag_rms(atoms_before)
