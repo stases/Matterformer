@@ -1094,10 +1094,11 @@ class SimplicialLocalLayer(nn.Module):
 class TetraSharedSimplicialLayer(nn.Module):
     """Apply the regular scalar simplicial layer independently to each tetra frame.
 
-    This is the "shared S" tetra-stream variant: one CompactSimplicialAttention
-    module and one channel MLP are shared across all group frames. Unlike
-    GroupFramewiseSimplicialLayer, this does not use platonic group-linear
-    projections or the grouped S_g Triton kernel.
+    This is the "shared S" tetra-stream variant: one shared-frame attention
+    module and one channel MLP are shared across all group frames. It uses the
+    grouped Triton kernel when configured with backend="triton_grouped", but
+    keeps regular per-frame projections and a per-frame MLP rather than
+    platonic group-linear projections.
     """
 
     requires_geometry_cache = True
