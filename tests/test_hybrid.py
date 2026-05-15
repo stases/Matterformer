@@ -274,13 +274,15 @@ def test_platonic_flat_triton_cuda_matches_reference_forward_backward():
 
     out = platonic_attention_flat_triton(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=4, strict=True, precision="tf32")
     ref = platonic_attention_flat_torch_reference(q_ref, k_ref, v_ref, cu_seqlens=cu_seqlens, max_seqlen=4)
-    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    # Triton uses TF32 in the production config, so parity against the torch
+    # reference is checked at kernel-level tolerances rather than exact fp32.
+    torch.testing.assert_close(out, ref, atol=3e-3, rtol=3e-3)
     grad = torch.randn_like(out)
     out.backward(grad)
     ref.backward(grad)
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=4e-3, rtol=4e-3)
 
 
 @pytest.mark.skipif(
@@ -365,15 +367,15 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
         centers=centers,
         gamma=gamma,
     )
-    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out, ref, atol=3e-3, rtol=3e-3)
     grad = torch.randn_like(out)
     out.backward(grad)
     ref.backward(grad)
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=4e-3, rtol=4e-3)
 
 
 def test_trivial_global_layer_position_encoding_modes():
