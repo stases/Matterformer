@@ -23,7 +23,7 @@
       "zero_init": true,
       "gate_init": 0.0,
       "diag_zero": true,
-      "precision": "tf32",
+      "precision": "tf32x3",
       "strict": true
     },
     "activation": "sin",

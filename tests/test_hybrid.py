@@ -233,6 +233,7 @@ def test_platonic_block_flat_triton_backends_match_flash_zero_init():
         solid_name="tetrahedron",
         dropout=0.0,
         attention_backend="triton",
+        attention_bias={"precision": "tf32x3", "strict": True},
     )
     radial = PlatonicBlock(
         d_model=12 * 4,
@@ -272,17 +273,15 @@ def test_platonic_flat_triton_cuda_matches_reference_forward_backward():
     v_ref = v.detach().clone().requires_grad_(True)
     cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
 
-    out = platonic_attention_flat_triton(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=4, strict=True, precision="tf32")
+    out = platonic_attention_flat_triton(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=4, strict=True, precision="tf32x3")
     ref = platonic_attention_flat_torch_reference(q_ref, k_ref, v_ref, cu_seqlens=cu_seqlens, max_seqlen=4)
-    # Triton uses TF32 in the production config, so parity against the torch
-    # reference is checked at kernel-level tolerances rather than exact fp32.
-    torch.testing.assert_close(out, ref, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(out, ref, atol=5e-5, rtol=5e-5)
     grad = torch.randn_like(out)
     out.backward(grad)
     ref.backward(grad)
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
 
 
 @pytest.mark.skipif(
@@ -307,6 +306,7 @@ def test_platonic_block_flat_triton_cuda_matches_flash_backend():
         solid_name="tetrahedron",
         dropout=0.0,
         attention_backend="triton",
+        attention_bias={"precision": "tf32x3", "strict": True},
     ).to(device)
     triton_block.load_state_dict(flash.state_dict())
     x = torch.randn(7, 12 * 4, device=device)
@@ -352,7 +352,7 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
         centers=centers,
         gamma=gamma,
         strict=True,
-        precision="tf32",
+        precision="tf32x3",
     )
     ref = platonic_attention_flat_torch_reference(
         q_ref,
@@ -367,15 +367,15 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
         centers=centers,
         gamma=gamma,
     )
-    torch.testing.assert_close(out, ref, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(out, ref, atol=5e-5, rtol=5e-5)
     grad = torch.randn_like(out)
     out.backward(grad)
     ref.backward(grad)
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=4e-3, rtol=4e-3)
-    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
 
 
 def test_trivial_global_layer_position_encoding_modes():

@@ -278,7 +278,7 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
             p = tl.exp(scores - m_ij[:, None])
             alpha = tl.exp(m_i - m_ij)
             l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p, v)
+            acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=input_precision)
             m_i = m_ij
         acc = acc / tl.maximum(l_i[:, None], 1.0e-20)
         tl.store(
