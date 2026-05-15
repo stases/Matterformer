@@ -770,6 +770,7 @@ def main(args: argparse.Namespace) -> None:
     run = maybe_init_wandb(args)
 
     checkpoint_path = Path(args.output)
+    latest_checkpoint_path = checkpoint_path.with_name("latest.pt")
     if args.save_checkpoint:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     best_val_total = float("inf")
@@ -995,24 +996,25 @@ def main(args: argparse.Namespace) -> None:
                 )
                 val_total = 0.5 * (val_metrics.get("e_mae_per_atom", 0.0) + val_metrics.get("f_mae", 0.0))
                 log_metrics(run, val_metrics, prefix="val", step=global_step, extra={"val/total": val_total})
-                if val_total < best_val_total:
+                is_best = val_total < best_val_total
+                if is_best:
                     best_val_total = val_total
                     best_state_in_memory = clone_model_state_to_cpu(model)
                     best_ema_state_in_memory = None if ema is None else ema.state_dict()
-                    if args.save_checkpoint:
-                        torch.save(
-                            build_checkpoint_payload(
-                                model=model,
-                                ema=ema,
-                                optimizer=optimizer,
-                                scheduler=scheduler,
-                                args=args,
-                                best_val_total=best_val_total,
-                                global_step=global_step,
-                                epoch=epoch,
-                            ),
-                            checkpoint_path,
-                        )
+                if args.save_checkpoint:
+                    payload = build_checkpoint_payload(
+                        model=model,
+                        ema=ema,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        args=args,
+                        best_val_total=best_val_total,
+                        global_step=global_step,
+                        epoch=epoch,
+                    )
+                    torch.save(payload, latest_checkpoint_path)
+                    if is_best:
+                        torch.save(payload, checkpoint_path)
             data_wait_start = time.perf_counter()
 
         train_epoch = {key: value / max(epoch_graphs, 1) for key, value in epoch_totals.items()}
@@ -1035,24 +1037,25 @@ def main(args: argparse.Namespace) -> None:
         bf16_enabled=args.bf16,
     )
     val_total = 0.5 * (val_metrics.get("e_mae_per_atom", 0.0) + val_metrics.get("f_mae", 0.0))
-    if val_total < best_val_total:
+    is_best = val_total < best_val_total
+    if is_best:
         best_val_total = val_total
         best_state_in_memory = clone_model_state_to_cpu(model)
         best_ema_state_in_memory = None if ema is None else ema.state_dict()
-        if args.save_checkpoint:
-            torch.save(
-                build_checkpoint_payload(
-                    model=model,
-                    ema=ema,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                    best_val_total=best_val_total,
-                    global_step=global_step,
-                    epoch=epoch,
-                ),
-                checkpoint_path,
-            )
+    if args.save_checkpoint:
+        payload = build_checkpoint_payload(
+            model=model,
+            ema=ema,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            best_val_total=best_val_total,
+            global_step=global_step,
+            epoch=epoch,
+        )
+        torch.save(payload, latest_checkpoint_path)
+        if is_best:
+            torch.save(payload, checkpoint_path)
     print(
         f"final_val step={global_step:07d} total={val_total:.3f} "
         f"e_mae_per_atom={val_metrics.get('e_mae_per_atom', 0.0):.3f} "
