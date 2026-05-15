@@ -130,12 +130,22 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.o
     adam_params: list[torch.nn.Parameter] = []
     muon_names: list[str] = []
     adam_names: list[str] = []
+    muon_view_counts: dict[str, int] = {}
     for name, parameter in unwrap_model(model).named_parameters():
         if not parameter.requires_grad:
             continue
         if _uses_muon_update(name, parameter, args):
+            muon_view = "default"
+            if (
+                args.muon_platonic_kernel_view == "conv"
+                and name.endswith(".kernel")
+                and parameter.ndim == 3
+            ):
+                setattr(parameter, "_muon_view", "platonic_conv")
+                muon_view = "platonic_conv"
             muon_params.append(parameter)
             muon_names.append(name)
+            muon_view_counts[muon_view] = muon_view_counts.get(muon_view, 0) + 1
         else:
             adam_params.append(parameter)
             adam_names.append(name)
@@ -184,6 +194,8 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.o
         "adam_tensors": len(adam_params),
         "muon_hidden_only": bool(args.muon_hidden_only),
         "muon_min_ndim": int(args.muon_min_ndim),
+        "muon_platonic_kernel_view": str(args.muon_platonic_kernel_view),
+        "muon_view_counts": muon_view_counts,
         "muon_first_names": muon_names[:12],
         "adam_first_names": adam_names[:12],
     }
@@ -1149,6 +1161,16 @@ if __name__ == "__main__":
         type=str,
         default="embed,embedding,head,readout,rope,freq",
         help="Comma-separated lowercase name fragments excluded from the Muon parameter group.",
+    )
+    parser.add_argument(
+        "--muon-platonic-kernel-view",
+        type=str,
+        default="slice",
+        choices=["slice", "conv"],
+        help=(
+            "Muon view for 3D PlatonicLinear kernels. 'slice' keeps [G,out,in] batched "
+            "matrix updates; 'conv' uses [out,G*in] filter-bank updates."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=100_000)

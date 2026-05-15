@@ -79,6 +79,7 @@ MUON_ADAM_EPS="${MUON_ADAM_EPS:-1e-10}"
 MUON_HIDDEN_ONLY="${MUON_HIDDEN_ONLY:-1}"
 MUON_MIN_NDIM="${MUON_MIN_NDIM:-2}"
 MUON_EXCLUDE_NAME_FRAGMENTS="${MUON_EXCLUDE_NAME_FRAGMENTS:-embed,embedding,head,readout,rope,freq}"
+MUON_PLATONIC_KERNEL_VIEW="${MUON_PLATONIC_KERNEL_VIEW:-slice}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 NORMALIZER_RMSD="${NORMALIZER_RMSD:-1.433569}"
 ENERGY_WEIGHT="${ENERGY_WEIGHT:-10}"
@@ -285,6 +286,7 @@ echo "muon_adam_lr:            ${MUON_ADAM_LR:-default_lr}"
 echo "muon_adam_weight_decay:  ${MUON_ADAM_WEIGHT_DECAY:-default_weight_decay}"
 echo "muon_hidden_only:        $MUON_HIDDEN_ONLY"
 echo "muon_min_ndim:           $MUON_MIN_NDIM"
+echo "muon_platonic_view:      $MUON_PLATONIC_KERNEL_VIEW"
 echo "warmup_steps:            $WARMUP_STEPS"
 echo "normalizer_rmsd:         $NORMALIZER_RMSD"
 echo "train_augmentation:      $TRAIN_AUGMENTATION"
@@ -375,6 +377,7 @@ echo "============================================================"
   --muon-adam-eps "$MUON_ADAM_EPS" \
   --muon-min-ndim "$MUON_MIN_NDIM" \
   --muon-exclude-name-fragments "$MUON_EXCLUDE_NAME_FRAGMENTS" \
+  --muon-platonic-kernel-view "$MUON_PLATONIC_KERNEL_VIEW" \
   --normalizer-rmsd "$NORMALIZER_RMSD" \
   --energy-weight "$ENERGY_WEIGHT" \
   --force-weight "$FORCE_WEIGHT" \
