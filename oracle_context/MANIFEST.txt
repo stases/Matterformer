@@ -1,0 +1,75 @@
+Matterformer Fourier PlatonicLinear oracle context bundle
+
+Generated from:
+  repo: /home/thadziv/GitHub/Matterformer
+  commit: f489533
+  date: 2026-05-15
+
+Primary brief:
+  oracle_context/fourier_platonic_linear_oracle_brief.md
+
+Core package metadata:
+  README.md
+  pyproject.toml
+
+Platonic/group implementation:
+  src/matterformer/models/platonic/__init__.py
+  src/matterformer/models/platonic/groups.py
+  src/matterformer/models/platonic/linear.py
+  src/matterformer/models/platonic/layers.py
+  src/matterformer/models/platonic/rope.py
+  src/matterformer/models/platonic/triton_attention.py
+  src/matterformer/models/platonic/io.py
+
+Model wiring and readouts:
+  src/matterformer/models/hybrid.py
+  src/matterformer/models/omol.py
+  src/matterformer/models/qm9.py
+  src/matterformer/models/heads.py
+  src/matterformer/utils/training.py
+
+Training/profiling context:
+  scripts/train_omol_forcefield.py
+  scripts/profile_omol_forcefield_detail.py
+
+Relevant tests:
+  tests/test_hybrid.py
+  tests/test_omol_models.py
+  tests/test_qm9_models.py
+
+Representative OMol tetra configs:
+  configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale.json
+  configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale_triton.json
+  configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale_radialrbf.json
+  configs/omol/tetra_t_only_h1920_l8_pt2.json
+  configs/omol/tetra_t_only_h1920_l8_pt2_exact_sin_layerscale.json
+  configs/omol/tetra_t_only_h1920_l8_pt2_layerscale.json
+  configs/omol/tetra_t_only_h1008_l8_pt2.json
+  configs/omol/tetra_t_only_d768_l8.json
+  configs/omol/tetra_sgt_h1920_l8_pt2.json
+  configs/omol/tetra_sgt_h1008_l8_pt2.json
+  configs/omol/tetra_sgt_d768_l8.json
+  configs/omol/tetra_t_plus_2sg_h1920_l8_pt2_exact_sin_layerscale.json
+  configs/omol/tetra_t_plus_4sg_h1920_l8_pt2_exact_sin_layerscale_sharedframe.json
+  configs/omol/tetra_t_plus_4shareds_h1920_l8_pt2_exact_sin_layerscale.json
+  configs/omol/tetra_t_plus_5sg_h1920_l8_pt2_exact_sin_layerscale.json
+  configs/omol/tetra_t_plus_5sg_h1920_l8_pt2_exact_sin_layerscale_sharedframe.json
+
+Representative QM9 tetra configs:
+  configs/qm9_hybrid/tetra_t_only_d768_l8.json
+  configs/qm9_hybrid/tetra_t_only_d1152_l14_h72.json
+  configs/qm9_hybrid/tetra_t_only_d1536_l16.json
+  configs/qm9_hybrid/tetra_sgt_d768_l8.json
+  configs/qm9_hybrid/tetra_ttsg_d768_l15.json
+  configs/qm9_hybrid/tetra_ttsg_d1152_l15_h72_msg.json
+
+Representative launch scripts:
+  scripts/omol_matterformer_pt2_l16_delta.sh
+  scripts/omol_matterformer_pt2_l16_triton_radialrbf_delta.sh
+  scripts/omol_matterformer_pt2_exact_delta.sh
+  scripts/omol_matterformer_pt2_2sg_smoke_delta.sh
+  scripts/omol_matterformer_pt2_5sg_smoke_delta.sh
+  scripts/omol_tetra_t_only_h1920_l8_delta.sh
+  scripts/omol_tetra_t_only_h1008_l8_delta.sh
+  scripts/omol_tetra_sgt_h1920_l8_delta.sh
+  scripts/omol_tetra_sgt_h1008_l8_delta.sh
