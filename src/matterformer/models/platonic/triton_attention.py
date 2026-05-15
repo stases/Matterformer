@@ -255,45 +255,47 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
         l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
         for block_n in range(0, tl.cdiv(max_seqlen, BLOCK_N)):
-            n = block_n * BLOCK_N + offs_n
-            n_mask = n < seqlen
-            k = tl.load(
-                k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                mask=n_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            v = tl.load(
-                v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                mask=n_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
-            if has_rbf:
-                scores += _radial_bias_tile(
-                    pos_ptr,
-                    rbf_weight_ptr,
-                    gate_ptr,
-                    centers_ptr,
-                    gamma_ptr,
-                    start,
-                    offs_m,
-                    n,
-                    m_mask,
-                    n_mask,
-                    head_idx,
-                    heads_per_frame,
-                    num_rbf,
-                    diag_zero,
-                    BLOCK_M,
-                    BLOCK_N,
+            n_start = block_n * BLOCK_N
+            if n_start < seqlen:
+                n = n_start + offs_n
+                n_mask = n < seqlen
+                k = tl.load(
+                    k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
                 )
-            scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
-            m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
-            p = tl.exp(scores - m_ij[:, None])
-            alpha = tl.exp(m_i - m_ij)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=input_precision)
-            m_i = m_ij
+                v = tl.load(
+                    v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
+                if has_rbf:
+                    scores += _radial_bias_tile(
+                        pos_ptr,
+                        rbf_weight_ptr,
+                        gate_ptr,
+                        centers_ptr,
+                        gamma_ptr,
+                        start,
+                        offs_m,
+                        n,
+                        m_mask,
+                        n_mask,
+                        head_idx,
+                        heads_per_frame,
+                        num_rbf,
+                        diag_zero,
+                        BLOCK_M,
+                        BLOCK_N,
+                    )
+                scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
+                m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
+                p = tl.exp(scores - m_ij[:, None])
+                alpha = tl.exp(m_i - m_ij)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=input_precision)
+                m_i = m_ij
         acc = acc / tl.maximum(l_i[:, None], 1.0e-20)
         tl.store(
             out_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
@@ -385,74 +387,76 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf else 0.0
         gate_factor = 1.0 + gate
         for block_n in range(0, tl.cdiv(max_seqlen, BLOCK_N)):
-            n = block_n * BLOCK_N + offs_n
-            n_mask = n < seqlen
-            k = tl.load(
-                k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                mask=n_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            v = tl.load(
-                v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                mask=n_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
-            base_bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            if has_rbf:
-                pos_i_base = (start + offs_m) * 3
-                pos_j_base = (start + n) * 3
-                xi = tl.load(pos_ptr + pos_i_base + 0, mask=m_mask, other=0.0)[:, None]
-                yi = tl.load(pos_ptr + pos_i_base + 1, mask=m_mask, other=0.0)[:, None]
-                zi = tl.load(pos_ptr + pos_i_base + 2, mask=m_mask, other=0.0)[:, None]
-                xj = tl.load(pos_ptr + pos_j_base + 0, mask=n_mask, other=0.0)[None, :]
-                yj = tl.load(pos_ptr + pos_j_base + 1, mask=n_mask, other=0.0)[None, :]
-                zj = tl.load(pos_ptr + pos_j_base + 2, mask=n_mask, other=0.0)[None, :]
-                dx = xj - xi
-                dy = yj - yi
-                dz = zj - zi
-                dist = tl.sqrt(tl.maximum(dx * dx + dy * dy + dz * dz, 0.0))
-                gamma = tl.load(gamma_ptr).to(tl.float32)
-                for rb in range(0, num_rbf):
-                    center = tl.load(centers_ptr + rb).to(tl.float32)
-                    weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
-                    rho = tl.exp(-gamma * (dist - center) * (dist - center))
-                    base_bias += weight * rho
-                bias = base_bias * gate_factor
-                if diag_zero:
-                    bias = tl.where(offs_m[:, None] == n[None, :], 0.0, bias)
-                scores += bias
-            scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
-            p = tl.exp(scores - lse[:, None])
-            p = tl.where(m_mask[:, None] & n_mask[None, :], p, 0.0)
-            dp = tl.dot(dout, tl.trans(v), input_precision=input_precision).to(tl.float32)
-            ds = p * (dp - delta[:, None])
-            dq += tl.dot(ds, k, input_precision=input_precision) * scale
-            dk = tl.dot(tl.trans(ds), q, input_precision=input_precision) * scale
-            dv = tl.dot(tl.trans(p), dout, input_precision=input_precision)
-            tl.atomic_add(
-                dk_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                dk,
-                sem="relaxed",
-                mask=n_mask[:, None] & d_mask[None, :],
-            )
-            tl.atomic_add(
-                dv_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
-                dv,
-                sem="relaxed",
-                mask=n_mask[:, None] & d_mask[None, :],
-            )
-            if has_rbf:
-                if diag_zero:
-                    ds_bias = tl.where(offs_m[:, None] == n[None, :], 0.0, ds)
-                else:
-                    ds_bias = ds
-                tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
-                for rb in range(0, num_rbf):
-                    center = tl.load(centers_ptr + rb).to(tl.float32)
-                    rho = tl.exp(-gamma * (dist - center) * (dist - center))
-                    grad_w = tl.sum(tl.sum(ds_bias * rho * gate_factor, axis=0), axis=0)
-                    tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf + rb, grad_w, sem="relaxed")
+            n_start = block_n * BLOCK_N
+            if n_start < seqlen:
+                n = n_start + offs_n
+                n_mask = n < seqlen
+                k = tl.load(
+                    k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                v = tl.load(
+                    v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
+                base_bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                if has_rbf:
+                    pos_i_base = (start + offs_m) * 3
+                    pos_j_base = (start + n) * 3
+                    xi = tl.load(pos_ptr + pos_i_base + 0, mask=m_mask, other=0.0)[:, None]
+                    yi = tl.load(pos_ptr + pos_i_base + 1, mask=m_mask, other=0.0)[:, None]
+                    zi = tl.load(pos_ptr + pos_i_base + 2, mask=m_mask, other=0.0)[:, None]
+                    xj = tl.load(pos_ptr + pos_j_base + 0, mask=n_mask, other=0.0)[None, :]
+                    yj = tl.load(pos_ptr + pos_j_base + 1, mask=n_mask, other=0.0)[None, :]
+                    zj = tl.load(pos_ptr + pos_j_base + 2, mask=n_mask, other=0.0)[None, :]
+                    dx = xj - xi
+                    dy = yj - yi
+                    dz = zj - zi
+                    dist = tl.sqrt(tl.maximum(dx * dx + dy * dy + dz * dz, 0.0))
+                    gamma = tl.load(gamma_ptr).to(tl.float32)
+                    for rb in range(0, num_rbf):
+                        center = tl.load(centers_ptr + rb).to(tl.float32)
+                        weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                        rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                        base_bias += weight * rho
+                    bias = base_bias * gate_factor
+                    if diag_zero:
+                        bias = tl.where(offs_m[:, None] == n[None, :], 0.0, bias)
+                    scores += bias
+                scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
+                p = tl.exp(scores - lse[:, None])
+                p = tl.where(m_mask[:, None] & n_mask[None, :], p, 0.0)
+                dp = tl.dot(dout, tl.trans(v), input_precision=input_precision).to(tl.float32)
+                ds = p * (dp - delta[:, None])
+                dq += tl.dot(ds, k, input_precision=input_precision) * scale
+                dk = tl.dot(tl.trans(ds), q, input_precision=input_precision) * scale
+                dv = tl.dot(tl.trans(p), dout, input_precision=input_precision)
+                tl.atomic_add(
+                    dk_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    dk,
+                    sem="relaxed",
+                    mask=n_mask[:, None] & d_mask[None, :],
+                )
+                tl.atomic_add(
+                    dv_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    dv,
+                    sem="relaxed",
+                    mask=n_mask[:, None] & d_mask[None, :],
+                )
+                if has_rbf:
+                    if diag_zero:
+                        ds_bias = tl.where(offs_m[:, None] == n[None, :], 0.0, ds)
+                    else:
+                        ds_bias = ds
+                    tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
+                    for rb in range(0, num_rbf):
+                        center = tl.load(centers_ptr + rb).to(tl.float32)
+                        rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                        grad_w = tl.sum(tl.sum(ds_bias * rho * gate_factor, axis=0), axis=0)
+                        tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf + rb, grad_w, sem="relaxed")
         tl.store(
             dq_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
             dq,
