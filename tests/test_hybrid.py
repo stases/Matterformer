@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from matterformer.geometry import NonPeriodicGeometryAdapter
 from matterformer.models import (
@@ -20,6 +21,12 @@ from matterformer.models import (
     expand_hybrid_schedule,
 )
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
+from matterformer.models.platonic.triton_attention import (
+    TRITON_PLATONIC_ATTENTION_AVAILABLE,
+    platonic_attention_flat_torch_reference,
+    platonic_attention_flat_triton,
+)
+from matterformer.models.platonic.layers import flash_attn_varlen_func
 from matterformer.models.triton_compact_simplicial_attention import TRITON_COMPACT_SIMPLICIAL_AVAILABLE
 from matterformer.models.triton_grouped_compact_simplicial_attention import (
     TRITON_GROUPED_COMPACT_SIMPLICIAL_AVAILABLE,
@@ -99,6 +106,274 @@ def test_platonic_block_dense_shape():
     assert out.shape == x.shape
     out.square().mean().backward()
     assert x.grad is not None
+
+
+def _manual_flat_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    outputs = []
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        q_seg = q[start:end].transpose(0, 1).unsqueeze(0)
+        k_seg = k[start:end].transpose(0, 1).unsqueeze(0)
+        v_seg = v[start:end].transpose(0, 1).unsqueeze(0)
+        out = F.scaled_dot_product_attention(q_seg, k_seg, v_seg, dropout_p=0.0)
+        outputs.append(out.squeeze(0).transpose(0, 1).contiguous())
+    return torch.cat(outputs, dim=0)
+
+
+def test_platonic_flat_attention_reference_matches_sdpa():
+    torch.manual_seed(101)
+    q = torch.randn(5, 3, 4, requires_grad=True)
+    k = torch.randn(5, 3, 4, requires_grad=True)
+    v = torch.randn(5, 3, 4, requires_grad=True)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    ref = platonic_attention_flat_torch_reference(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=3)
+    manual = _manual_flat_sdpa(q, k, v, cu_seqlens)
+    torch.testing.assert_close(ref, manual, atol=1e-6, rtol=1e-6)
+
+    ref.square().sum().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
+def test_platonic_radial_rbf_zero_init_is_noop_and_weight_gets_grad():
+    torch.manual_seed(102)
+    q = torch.randn(6, 4, 4, requires_grad=True)
+    k = torch.randn(6, 4, 4, requires_grad=True)
+    v = torch.randn(6, 4, 4, requires_grad=True)
+    pos = torch.randn(6, 3)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    centers = torch.linspace(0.0, 6.0, 8)
+    gamma = torch.tensor(1.0)
+    rbf_weight = torch.zeros(2, 8, requires_grad=True)
+    gate = torch.zeros(2, requires_grad=True)
+
+    unbiased = platonic_attention_flat_torch_reference(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=3)
+    biased = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=rbf_weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+        diag_zero=True,
+    )
+    torch.testing.assert_close(biased, unbiased, atol=1e-7, rtol=1e-7)
+    biased.square().sum().backward()
+    assert rbf_weight.grad is not None
+    assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
+
+
+def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
+    torch.manual_seed(103)
+    group = PLATONIC_GROUPS["tetrahedron"]
+    num_tokens = 5
+    group_order = group.G
+    heads_per_frame = 2
+    head_dim = 4
+    q = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    k = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    v = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    pos = torch.randn(num_tokens, 3)
+    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    rbf_weight = torch.randn(heads_per_frame, 4) * 0.01
+    gate = torch.zeros(heads_per_frame)
+    centers = torch.linspace(0.0, 6.0, 4)
+    gamma = torch.tensor(0.75)
+
+    out = platonic_attention_flat_torch_reference(
+        q.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        k.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        v.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=num_tokens,
+        pos=pos,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+    ).view(num_tokens, group_order, heads_per_frame, head_dim)
+    perm = group.cayley_table[3]
+    out_perm = platonic_attention_flat_torch_reference(
+        q[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        k[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        v[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=num_tokens,
+        pos=pos,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+    ).view(num_tokens, group_order, heads_per_frame, head_dim)
+    torch.testing.assert_close(out_perm, out[:, perm], atol=1e-6, rtol=1e-6)
+
+
+def test_platonic_block_flat_triton_backends_match_flash_zero_init():
+    torch.manual_seed(104)
+    flash = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="flash",
+    )
+    triton_block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton",
+    )
+    radial = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton_radial_rbf",
+        attention_bias={"kind": "radial_rbf", "num_rbf": 8, "zero_init": True},
+    )
+    triton_block.load_state_dict(flash.state_dict())
+    radial.load_state_dict(flash.state_dict(), strict=False)
+    x = torch.randn(5, 12 * 4)
+    pos = torch.randn(5, 3)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    flash.eval()
+    triton_block.eval()
+    radial.eval()
+    with torch.no_grad():
+        flash_out = flash.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
+        triton_out = triton_block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
+        radial_out = radial.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
+    torch.testing.assert_close(triton_out, flash_out, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(radial_out, triton_out, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+def test_platonic_flat_triton_cuda_matches_reference_forward_backward():
+    torch.manual_seed(105)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+
+    out = platonic_attention_flat_triton(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=4, strict=True, precision="tf32")
+    ref = platonic_attention_flat_torch_reference(q_ref, k_ref, v_ref, cu_seqlens=cu_seqlens, max_seqlen=4)
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE or flash_attn_varlen_func is None,
+    reason="requires CUDA, Triton, and FlashAttention",
+)
+def test_platonic_block_flat_triton_cuda_matches_flash_backend():
+    torch.manual_seed(106)
+    device = torch.device("cuda")
+    flash = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="flash",
+    ).to(device)
+    triton_block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton",
+    ).to(device)
+    triton_block.load_state_dict(flash.state_dict())
+    x = torch.randn(7, 12 * 4, device=device)
+    pos = torch.randn(7, 3, device=device)
+    cu_seqlens = torch.tensor([0, 3, 7], device=device, dtype=torch.int32)
+    flash.eval()
+    triton_block.eval()
+    with torch.no_grad():
+        flash_out = flash.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=4)
+        triton_out = triton_block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=4)
+    torch.testing.assert_close(triton_out, flash_out, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
+    torch.manual_seed(107)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    pos = torch.randn(6, 3, device=device)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+    centers = torch.linspace(0.0, 6.0, 4, device=device)
+    gamma = torch.tensor(0.75, device=device)
+    weight = (torch.randn(2, 4, device=device) * 0.01).requires_grad_(True)
+    gate = torch.zeros(2, device=device, requires_grad=True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    gate_ref = gate.detach().clone().requires_grad_(True)
+
+    out = platonic_attention_flat_triton(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+        strict=True,
+        precision="tf32",
+    )
+    ref = platonic_attention_flat_torch_reference(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=weight_ref,
+        gate=gate_ref,
+        centers=centers,
+        gamma=gamma,
+    )
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=1e-3, rtol=1e-3)
 
 
 def test_trivial_global_layer_position_encoding_modes():

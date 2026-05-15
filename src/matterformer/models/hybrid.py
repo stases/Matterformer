@@ -1827,6 +1827,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
             use_key=bool(config.get("use_key", False)),
             rope_on_values=bool(config.get("rope_on_values", True)),
             attention_backend=str(config.get("attention_backend", "sdpa")),
+            attention_bias=dict(config.get("attention_bias") or {}),
             activation=_activation_from_name(str(config.get("activation", "gelu"))),
             layer_scale_init_value=config.get("layer_scale_init_value", None),
         )

@@ -28,23 +28,28 @@ def _scalar_config(d_model: int = 32):
     }
 
 
-def _tetra_config():
+def _tetra_config(attention_backend: str | None = None, attention_bias: dict | None = None):
+    tetra = {
+        "group": "tetrahedron",
+        "group_order": 12,
+        "heads_per_frame": 1,
+        "rope_sigma": 1.0,
+        "learned_freqs": True,
+        "use_key": False,
+        "rope_on_values": True,
+        "ffn_mult": 2,
+    }
+    if attention_backend is not None:
+        tetra["attention_backend"] = attention_backend
+    if attention_bias is not None:
+        tetra["attention_bias"] = attention_bias
     return {
         "num_blocks": 1,
         "stream_type": "tetra",
         "block_mix": [0, 1, 0],
         "scalar_dim": 24,
         "tetra_dim_per_frame": 2,
-        "tetra": {
-            "group": "tetrahedron",
-            "group_order": 12,
-            "heads_per_frame": 1,
-            "rope_sigma": 1.0,
-            "learned_freqs": True,
-            "use_key": False,
-            "rope_on_values": True,
-            "ffn_mult": 2,
-        },
+        "tetra": tetra,
         "readout": {"kind": "platonic_ffn"},
     }
 
@@ -215,6 +220,66 @@ def test_omol_platonic_tetra_readout_flat_matches_padded_runtime():
     torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
     padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
     assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_internal_flat_tetra_triton_zero_init_matches_flash_flat():
+    torch.manual_seed(131)
+    batch = _batch()
+    flash = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config("flash"),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_tetra",
+    )
+    triton = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config("triton"),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_tetra",
+    )
+    radial = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(
+            "triton_radial_rbf",
+            {"kind": "radial_rbf", "num_rbf": 8, "zero_init": True, "gate_init": 0.0},
+        ),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_tetra",
+    )
+    triton.load_state_dict(flash.state_dict())
+    radial.load_state_dict(flash.state_dict(), strict=False)
+    flash.eval()
+    triton.eval()
+    radial.eval()
+
+    with torch.no_grad():
+        flash_out = flash(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        triton_out = triton(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        radial_out = radial(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(triton_out["energy"], flash_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(triton_out["forces"][valid], flash_out["forces"][valid], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(radial_out["energy"], triton_out["energy"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(radial_out["forces"][valid], triton_out["forces"][valid], atol=1e-6, rtol=1e-6)
 
 
 def test_flat_geometry_cache_has_global_neighbors():
