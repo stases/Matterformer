@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -463,6 +464,249 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
             mask=m_mask[:, None] & d_mask[None, :],
         )
 
+    @triton.jit
+    def _platonic_flat_attention_bwd_dq_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        pos_ptr,
+        cu_ptr,
+        dout_ptr,
+        lse_ptr,
+        delta_ptr,
+        rbf_weight_ptr,
+        gate_ptr,
+        centers_ptr,
+        gamma_ptr,
+        dq_ptr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        max_seqlen: tl.constexpr,
+        scale: tl.constexpr,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        has_rbf: tl.constexpr,
+        diag_zero: tl.constexpr,
+        input_precision: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        batch_idx = tl.program_id(2)
+        start = tl.load(cu_ptr + batch_idx).to(tl.int64)
+        end = tl.load(cu_ptr + batch_idx + 1).to(tl.int64)
+        seqlen = end - start
+        m_start = pid_m * BLOCK_M
+        if m_start >= seqlen:
+            return
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        m_mask = offs_m < seqlen
+        d_mask = offs_d < head_dim
+
+        q = tl.load(
+            q_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            mask=m_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        dout = tl.load(
+            dout_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            mask=m_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        lse = tl.load(lse_ptr + (start + offs_m) * num_heads + head_idx, mask=m_mask, other=0.0).to(tl.float32)
+        delta = tl.load(delta_ptr + (start + offs_m) * num_heads + head_idx, mask=m_mask, other=0.0).to(tl.float32)
+        dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        subhead = head_idx % heads_per_frame
+        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf else 0.0
+        gate_factor = 1.0 + gate
+        for block_n in range(0, tl.cdiv(max_seqlen, BLOCK_N)):
+            n_start = block_n * BLOCK_N
+            if n_start < seqlen:
+                n = n_start + offs_n
+                n_mask = n < seqlen
+                k = tl.load(
+                    k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                v = tl.load(
+                    v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=n_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
+                if has_rbf:
+                    pos_i_base = (start + offs_m) * 3
+                    pos_j_base = (start + n) * 3
+                    xi = tl.load(pos_ptr + pos_i_base + 0, mask=m_mask, other=0.0)[:, None]
+                    yi = tl.load(pos_ptr + pos_i_base + 1, mask=m_mask, other=0.0)[:, None]
+                    zi = tl.load(pos_ptr + pos_i_base + 2, mask=m_mask, other=0.0)[:, None]
+                    xj = tl.load(pos_ptr + pos_j_base + 0, mask=n_mask, other=0.0)[None, :]
+                    yj = tl.load(pos_ptr + pos_j_base + 1, mask=n_mask, other=0.0)[None, :]
+                    zj = tl.load(pos_ptr + pos_j_base + 2, mask=n_mask, other=0.0)[None, :]
+                    dx = xj - xi
+                    dy = yj - yi
+                    dz = zj - zi
+                    dist = tl.sqrt(tl.maximum(dx * dx + dy * dy + dz * dz, 0.0))
+                    gamma = tl.load(gamma_ptr).to(tl.float32)
+                    base_bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                    for rb in range(0, num_rbf):
+                        center = tl.load(centers_ptr + rb).to(tl.float32)
+                        weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                        rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                        base_bias += weight * rho
+                    bias = base_bias * gate_factor
+                    if diag_zero:
+                        bias = tl.where(offs_m[:, None] == n[None, :], 0.0, bias)
+                    scores += bias
+                scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
+                p = tl.exp(scores - lse[:, None])
+                p = tl.where(m_mask[:, None] & n_mask[None, :], p, 0.0)
+                dp = tl.dot(dout, tl.trans(v), input_precision=input_precision).to(tl.float32)
+                ds = p * (dp - delta[:, None])
+                dq += tl.dot(ds, k, input_precision=input_precision) * scale
+        tl.store(
+            dq_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            dq,
+            mask=m_mask[:, None] & d_mask[None, :],
+        )
+
+    @triton.jit
+    def _platonic_flat_attention_bwd_dkv_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        pos_ptr,
+        cu_ptr,
+        dout_ptr,
+        lse_ptr,
+        delta_ptr,
+        rbf_weight_ptr,
+        gate_ptr,
+        centers_ptr,
+        gamma_ptr,
+        dk_ptr,
+        dv_ptr,
+        d_rbf_weight_ptr,
+        d_gate_ptr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        max_seqlen: tl.constexpr,
+        scale: tl.constexpr,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        has_rbf: tl.constexpr,
+        diag_zero: tl.constexpr,
+        input_precision: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        batch_idx = tl.program_id(2)
+        start = tl.load(cu_ptr + batch_idx).to(tl.int64)
+        end = tl.load(cu_ptr + batch_idx + 1).to(tl.int64)
+        seqlen = end - start
+        n_start = pid_n * BLOCK_N
+        if n_start >= seqlen:
+            return
+        offs_m = tl.arange(0, BLOCK_M)
+        n = n_start + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, BLOCK_D)
+        n_mask = n < seqlen
+        d_mask = offs_d < head_dim
+
+        k = tl.load(
+            k_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        v = tl.load(
+            v_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        dk = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        dv = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+        subhead = head_idx % heads_per_frame
+        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf else 0.0
+        gate_factor = 1.0 + gate
+        for block_m in range(0, tl.cdiv(max_seqlen, BLOCK_M)):
+            m_start = block_m * BLOCK_M
+            if m_start < seqlen:
+                m = m_start + offs_m
+                m_mask = m < seqlen
+                q = tl.load(
+                    q_ptr + ((start + m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=m_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                dout = tl.load(
+                    dout_ptr + ((start + m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+                    mask=m_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                lse = tl.load(lse_ptr + (start + m) * num_heads + head_idx, mask=m_mask, other=0.0).to(tl.float32)
+                delta = tl.load(delta_ptr + (start + m) * num_heads + head_idx, mask=m_mask, other=0.0).to(tl.float32)
+                scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
+                base_bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                if has_rbf:
+                    pos_i_base = (start + m) * 3
+                    pos_j_base = (start + n) * 3
+                    xi = tl.load(pos_ptr + pos_i_base + 0, mask=m_mask, other=0.0)[:, None]
+                    yi = tl.load(pos_ptr + pos_i_base + 1, mask=m_mask, other=0.0)[:, None]
+                    zi = tl.load(pos_ptr + pos_i_base + 2, mask=m_mask, other=0.0)[:, None]
+                    xj = tl.load(pos_ptr + pos_j_base + 0, mask=n_mask, other=0.0)[None, :]
+                    yj = tl.load(pos_ptr + pos_j_base + 1, mask=n_mask, other=0.0)[None, :]
+                    zj = tl.load(pos_ptr + pos_j_base + 2, mask=n_mask, other=0.0)[None, :]
+                    dx = xj - xi
+                    dy = yj - yi
+                    dz = zj - zi
+                    dist = tl.sqrt(tl.maximum(dx * dx + dy * dy + dz * dz, 0.0))
+                    gamma = tl.load(gamma_ptr).to(tl.float32)
+                    for rb in range(0, num_rbf):
+                        center = tl.load(centers_ptr + rb).to(tl.float32)
+                        weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                        rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                        base_bias += weight * rho
+                    bias = base_bias * gate_factor
+                    if diag_zero:
+                        bias = tl.where(m[:, None] == n[None, :], 0.0, bias)
+                    scores += bias
+                scores = tl.where(m_mask[:, None] & n_mask[None, :], scores, -float("inf"))
+                p = tl.exp(scores - lse[:, None])
+                p = tl.where(m_mask[:, None] & n_mask[None, :], p, 0.0)
+                dp = tl.dot(dout, tl.trans(v), input_precision=input_precision).to(tl.float32)
+                ds = p * (dp - delta[:, None])
+                dk += tl.dot(tl.trans(ds), q, input_precision=input_precision) * scale
+                dv += tl.dot(tl.trans(p), dout, input_precision=input_precision)
+                if has_rbf:
+                    if diag_zero:
+                        ds_bias = tl.where(m[:, None] == n[None, :], 0.0, ds)
+                    else:
+                        ds_bias = ds
+                    tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
+                    for rb in range(0, num_rbf):
+                        center = tl.load(centers_ptr + rb).to(tl.float32)
+                        rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                        grad_w = tl.sum(tl.sum(ds_bias * rho * gate_factor, axis=0), axis=0)
+                        tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf + rb, grad_w, sem="relaxed")
+        tl.store(
+            dk_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            dk,
+            mask=n_mask[:, None] & d_mask[None, :],
+        )
+        tl.store(
+            dv_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
+            dv,
+            mask=n_mask[:, None] & d_mask[None, :],
+        )
+
 
 class _PlatonicFlatAttentionFunction(torch.autograd.Function):
     @staticmethod
@@ -590,8 +834,8 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
 
         dout = dout.contiguous()
         dq = torch.empty_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
         d_rbf_weight = torch.zeros_like(rbf_weight) if ctx.has_rbf else torch.zeros_like(rbf_weight)
         d_gate = torch.zeros_like(gate) if ctx.has_rbf else torch.zeros_like(gate)
         delta = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
@@ -608,8 +852,66 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         )
         batch_size = int(cu.numel() - 1)
         max_seqlen = int(ctx.max_seqlen)
-        grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
-        _platonic_flat_attention_bwd_kernel[grid](
+        bwd_mode = os.environ.get("MATTERFORMER_PLATONIC_TRITON_BWD", "auto").lower()
+        if bwd_mode not in {"auto", "atomic", "split"}:
+            bwd_mode = "auto"
+        use_atomic_bwd = bwd_mode == "atomic" or (bwd_mode == "auto" and ctx.has_rbf)
+        if use_atomic_bwd:
+            dk.zero_()
+            dv.zero_()
+            grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
+            _platonic_flat_attention_bwd_kernel[grid](
+                q,
+                k,
+                v,
+                pos,
+                cu,
+                dout,
+                lse,
+                delta,
+                rbf_weight,
+                gate,
+                centers,
+                gamma,
+                dq,
+                dk,
+                dv,
+                d_rbf_weight,
+                d_gate,
+                q.shape[1],
+                q.shape[2],
+                max_seqlen,
+                1.0 / math.sqrt(q.shape[2]),
+                ctx.heads_per_frame,
+                int(rbf_weight.shape[-1]) if ctx.has_rbf else 1,
+                ctx.has_rbf,
+                ctx.diag_zero,
+                ctx.precision,
+                BLOCK_M=ctx.block_m,
+                BLOCK_N=ctx.block_n,
+                BLOCK_D=block_d,
+                num_warps=4,
+            )
+            return (
+                dq,
+                dk,
+                dv,
+                None,
+                None,
+                None,
+                d_rbf_weight if ctx.has_rbf else None,
+                d_gate if ctx.has_rbf else None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        dq_grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
+        _platonic_flat_attention_bwd_dq_kernel[dq_grid](
             q,
             k,
             v,
@@ -623,6 +925,34 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             centers,
             gamma,
             dq,
+            q.shape[1],
+            q.shape[2],
+            max_seqlen,
+            1.0 / math.sqrt(q.shape[2]),
+            ctx.heads_per_frame,
+            int(rbf_weight.shape[-1]) if ctx.has_rbf else 1,
+            ctx.has_rbf,
+            ctx.diag_zero,
+            ctx.precision,
+            BLOCK_M=ctx.block_m,
+            BLOCK_N=ctx.block_n,
+            BLOCK_D=block_d,
+            num_warps=4,
+        )
+        dkv_grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_n), q.shape[1], batch_size)
+        _platonic_flat_attention_bwd_dkv_kernel[dkv_grid](
+            q,
+            k,
+            v,
+            pos,
+            cu,
+            dout,
+            lse,
+            delta,
+            rbf_weight,
+            gate,
+            centers,
+            gamma,
             dk,
             dv,
             d_rbf_weight,
