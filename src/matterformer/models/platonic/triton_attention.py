@@ -237,7 +237,10 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         start = tl.load(cu_ptr + batch_idx).to(tl.int64)
         end = tl.load(cu_ptr + batch_idx + 1).to(tl.int64)
         seqlen = end - start
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_start = pid_m * BLOCK_M
+        if m_start >= seqlen:
+            return
+        offs_m = m_start + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_d = tl.arange(0, BLOCK_D)
         m_mask = offs_m < seqlen
@@ -356,7 +359,10 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         start = tl.load(cu_ptr + batch_idx).to(tl.int64)
         end = tl.load(cu_ptr + batch_idx + 1).to(tl.int64)
         seqlen = end - start
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_start = pid_m * BLOCK_M
+        if m_start >= seqlen:
+            return
+        offs_m = m_start + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_d = tl.arange(0, BLOCK_D)
         m_mask = offs_m < seqlen
@@ -463,6 +469,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         pos: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         rbf_weight: torch.Tensor,
         gate: torch.Tensor,
         centers: torch.Tensor,
@@ -500,7 +507,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         gamma = gamma.contiguous()
         total_tokens, num_heads, head_dim = q.shape
         batch_size = int(cu.numel() - 1)
-        max_seqlen = int((cu[1:] - cu[:-1]).max().item()) if batch_size > 0 else 0
+        max_seqlen = int(max_seqlen)
         out = torch.empty_like(q)
         lse = torch.empty((total_tokens, num_heads), device=q.device, dtype=torch.float32)
         block_d = platonic_attention_block_d_for_head_dim(head_dim)
@@ -537,6 +544,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         ctx.precision = normalize_platonic_attention_precision(precision)
         ctx.block_m = int(block_m)
         ctx.block_n = int(block_n)
+        ctx.max_seqlen = max_seqlen
         ctx.has_rbf = bool(has_rbf)
         return out
 
@@ -574,7 +582,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             else:
                 dq, dk, dv = grads
                 dw = dg = None
-            return dq, dk, dv, None, None, dw, dg, None, None, None, None, None, None, None, None
+            return dq, dk, dv, None, None, None, dw, dg, None, None, None, None, None, None, None, None
 
         dout = dout.contiguous()
         dq = torch.empty_like(q)
@@ -595,7 +603,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             num_warps=1,
         )
         batch_size = int(cu.numel() - 1)
-        max_seqlen = int((cu[1:] - cu[:-1]).max().item()) if batch_size > 0 else 0
+        max_seqlen = int(ctx.max_seqlen)
         grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
         _platonic_flat_attention_bwd_kernel[grid](
             q,
@@ -633,6 +641,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             None,
             None,
             d_rbf_weight if ctx.has_rbf else None,
@@ -704,6 +713,7 @@ def platonic_attention_flat_triton(
             v,
             dummy_pos,
             cu_seqlens,
+            int(max_seqlen),
             dummy_weight,
             dummy_gate,
             dummy_centers,
@@ -726,6 +736,7 @@ def platonic_attention_flat_triton(
         v,
         dummy_pos,
         cu_seqlens,
+        int(max_seqlen),
         dummy_weight,
         dummy_gate,
         dummy_centers,
