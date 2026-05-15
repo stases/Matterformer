@@ -5,6 +5,11 @@ import math
 import torch
 
 try:
+    import torch._dynamo as _torch_dynamo
+except ImportError:  # pragma: no cover - older PyTorch without Dynamo.
+    _torch_dynamo = None
+
+try:
     import triton
     import triton.language as tl
 except ImportError:  # pragma: no cover - exercised on CUDA nodes with Triton installed.
@@ -36,6 +41,12 @@ def _next_power_of_2(value: int) -> int:
 
 def platonic_attention_block_d_for_head_dim(head_dim: int) -> int:
     return max(16, _next_power_of_2(int(head_dim)))
+
+
+def _disable_dynamo_if_available(fn):
+    if _torch_dynamo is None:
+        return fn
+    return _torch_dynamo.disable(fn)
 
 
 def _validate_flat_inputs(
@@ -637,6 +648,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         )
 
 
+@_disable_dynamo_if_available
 def platonic_attention_flat_triton(
     q: torch.Tensor,
     k: torch.Tensor,

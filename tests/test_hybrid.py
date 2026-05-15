@@ -378,6 +378,47 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
     torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+def test_platonic_flat_triton_radial_cuda_allows_outer_torch_compile():
+    torch.manual_seed(108)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    pos = torch.randn(6, 3, device=device)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+    centers = torch.linspace(0.0, 6.0, 4, device=device)
+    gamma = torch.tensor(0.75, device=device)
+    weight = (torch.randn(2, 4, device=device) * 0.01).requires_grad_(True)
+    gate = torch.zeros(2, device=device, requires_grad=True)
+
+    def run_attention(q_in, k_in, v_in, weight_in, gate_in):
+        return platonic_attention_flat_triton(
+            q_in,
+            k_in,
+            v_in,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=4,
+            pos=pos,
+            heads_per_frame=2,
+            rbf_weight=weight_in,
+            gate=gate_in,
+            centers=centers,
+            gamma=gamma,
+            strict=True,
+            precision="tf32x3",
+        )
+
+    compiled = torch.compile(run_attention, mode="default")
+    out = compiled(q, k, v, weight, gate)
+    assert out.shape == q.shape
+    out.square().mean().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+    assert weight.grad is not None
+
+
 def test_trivial_global_layer_position_encoding_modes():
     kwargs = dict(
         d_model=8,
