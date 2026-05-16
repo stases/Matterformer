@@ -26,8 +26,16 @@ CHGSPIN_EMB_DIM="${CHGSPIN_EMB_DIM:-}"
 PAIR_HIDDEN_DIM="${PAIR_HIDDEN_DIM:-128}"
 PAIR_N_RBF="${PAIR_N_RBF:-16}"
 PAIR_RBF_MAX="${PAIR_RBF_MAX:-6.0}"
+TETRA_PAIR_FORCE_MODE="${TETRA_PAIR_FORCE_MODE:-off}"
+TETRA_PAIR_K_NEIGHBORS="${TETRA_PAIR_K_NEIGHBORS:-30}"
+TETRA_PAIR_FEATURE_DIM="${TETRA_PAIR_FEATURE_DIM:-128}"
+TETRA_PAIR_ELEMENT_DIM="${TETRA_PAIR_ELEMENT_DIM:-32}"
+TETRA_PAIR_GATE_INIT="${TETRA_PAIR_GATE_INIT:-0.0}"
+TETRA_PAIR_GEOMETRY_STRICT="${TETRA_PAIR_GEOMETRY_STRICT:-0}"
 FORCE_HEAD_MODE="${FORCE_HEAD_MODE:-auto}"
 READOUT_HEAD_MODE="${READOUT_HEAD_MODE:-dense}"
+TETRA_READOUT_MODE="${TETRA_READOUT_MODE:-platonic}"
+TETRA_IRREP_SCALAR_INPUT="${TETRA_IRREP_SCALAR_INPUT:-rho1}"
 READOUT_ACTIVATION="${READOUT_ACTIVATION:-}"
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
@@ -84,6 +92,8 @@ WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 NORMALIZER_RMSD="${NORMALIZER_RMSD:-1.433569}"
 ENERGY_WEIGHT="${ENERGY_WEIGHT:-10}"
 FORCE_WEIGHT="${FORCE_WEIGHT:-10}"
+ENERGY_LOSS="${ENERGY_LOSS:-per_atom_mae}"
+FORCE_LOSS="${FORCE_LOSS:-l2norm}"
 TRAIN_AUGMENTATION="${TRAIN_AUGMENTATION:-o3}"
 GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1}"
 SKIP_LOSS_ABOVE="${SKIP_LOSS_ABOVE:-0}"
@@ -249,6 +259,7 @@ EXTRA_ARGS=()
 [ -n "$MUON_ADAM_WEIGHT_DECAY" ] && EXTRA_ARGS+=(--muon-adam-weight-decay "$MUON_ADAM_WEIGHT_DECAY")
 [ -n "${RESUME_CHECKPOINT:-}" ] && EXTRA_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
 [ -n "${WARM_START_CHECKPOINT:-}" ] && EXTRA_ARGS+=(--warm-start-checkpoint "$WARM_START_CHECKPOINT")
+[ "$TETRA_PAIR_GEOMETRY_STRICT" = "1" ] && EXTRA_ARGS+=(--tetra-pair-geometry-strict) || EXTRA_ARGS+=(--no-tetra-pair-geometry-strict)
 
 echo "============================================================"
 echo "Matterformer OMol Direct Force"
@@ -290,10 +301,20 @@ echo "muon_min_ndim:           $MUON_MIN_NDIM"
 echo "muon_platonic_view:      $MUON_PLATONIC_KERNEL_VIEW"
 echo "warmup_steps:            $WARMUP_STEPS"
 echo "normalizer_rmsd:         $NORMALIZER_RMSD"
+echo "energy_loss:             $ENERGY_LOSS"
+echo "force_loss:              $FORCE_LOSS"
 echo "train_augmentation:      $TRAIN_AUGMENTATION"
 echo "force_head_mode:        $FORCE_HEAD_MODE"
 echo "readout_head_mode:      $READOUT_HEAD_MODE"
+echo "tetra_readout_mode:     $TETRA_READOUT_MODE"
+echo "tetra_irrep_scalar_in:  $TETRA_IRREP_SCALAR_INPUT"
 echo "readout_activation:     ${READOUT_ACTIVATION:-auto}"
+echo "tetra_pair_force_mode:  $TETRA_PAIR_FORCE_MODE"
+echo "tetra_pair_k_neighbors: $TETRA_PAIR_K_NEIGHBORS"
+echo "tetra_pair_feature_dim: $TETRA_PAIR_FEATURE_DIM"
+echo "tetra_pair_element_dim: $TETRA_PAIR_ELEMENT_DIM"
+echo "tetra_pair_gate_init:   $TETRA_PAIR_GATE_INIT"
+echo "tetra_pair_geom_strict: $TETRA_PAIR_GEOMETRY_STRICT"
 echo "allscaip_config_json:   $ALLSCAIP_CONFIG_JSON"
 echo "allscaip_strict_json:   $ALLSCAIP_STRICT_CONFIG_JSON"
 echo "allscaip_hidden_size:    $ALLSCAIP_HIDDEN_SIZE"
@@ -341,8 +362,15 @@ echo "============================================================"
   --pair-hidden-dim "$PAIR_HIDDEN_DIM" \
   --pair-n-rbf "$PAIR_N_RBF" \
   --pair-rbf-max "$PAIR_RBF_MAX" \
+  --tetra-pair-force-mode "$TETRA_PAIR_FORCE_MODE" \
+  --tetra-pair-k-neighbors "$TETRA_PAIR_K_NEIGHBORS" \
+  --tetra-pair-feature-dim "$TETRA_PAIR_FEATURE_DIM" \
+  --tetra-pair-element-dim "$TETRA_PAIR_ELEMENT_DIM" \
+  --tetra-pair-gate-init "$TETRA_PAIR_GATE_INIT" \
   --force-head-mode "$FORCE_HEAD_MODE" \
   --readout-head-mode "$READOUT_HEAD_MODE" \
+  --tetra-readout-mode "$TETRA_READOUT_MODE" \
+  --tetra-irrep-scalar-input "$TETRA_IRREP_SCALAR_INPUT" \
   --omol-runtime-mode "$OMOL_RUNTIME_MODE" \
   --allscaip-hidden-size "$ALLSCAIP_HIDDEN_SIZE" \
   --allscaip-num-layers "$ALLSCAIP_NUM_LAYERS" \
@@ -383,6 +411,8 @@ echo "============================================================"
   --normalizer-rmsd "$NORMALIZER_RMSD" \
   --energy-weight "$ENERGY_WEIGHT" \
   --force-weight "$FORCE_WEIGHT" \
+  --energy-loss "$ENERGY_LOSS" \
+  --force-loss "$FORCE_LOSS" \
   --train-augmentation "$TRAIN_AUGMENTATION" \
   --grad-clip-norm "$GRAD_CLIP_NORM" \
   --skip-loss-above "$SKIP_LOSS_ABOVE" \

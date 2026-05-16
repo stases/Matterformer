@@ -492,8 +492,16 @@ def build_omol_model(args: argparse.Namespace, *, device: torch.device) -> torch
             pair_hidden_dim=args.pair_hidden_dim,
             pair_n_rbf=args.pair_n_rbf,
             pair_rbf_max=args.pair_rbf_max,
+            tetra_pair_force_mode=args.tetra_pair_force_mode,
+            tetra_pair_k_neighbors=args.tetra_pair_k_neighbors,
+            tetra_pair_feature_dim=args.tetra_pair_feature_dim,
+            tetra_pair_element_dim=args.tetra_pair_element_dim,
+            tetra_pair_gate_init=args.tetra_pair_gate_init,
+            tetra_pair_geometry_strict=args.tetra_pair_geometry_strict,
             force_head_mode=args.force_head_mode,
             readout_head_mode=args.readout_head_mode,
+            tetra_readout_mode=args.tetra_readout_mode,
+            tetra_irrep_scalar_input=args.tetra_irrep_scalar_input,
             readout_activation=args.readout_activation,
             runtime_mode=args.omol_runtime_mode,
         ).to(device)
@@ -834,6 +842,8 @@ def main(args: argparse.Namespace) -> None:
     print(
         f"model: backend={args.model_backend} stream_type={getattr(base_model, 'stream_type', 'unknown')} "
         f"readout_head_mode={getattr(base_model, 'readout_head_mode', 'n/a')} "
+        f"tetra_readout_mode={getattr(base_model, 'tetra_readout_mode', 'n/a')} "
+        f"tetra_irrep_scalar_input={getattr(base_model, 'tetra_irrep_scalar_input', 'n/a')} "
         f"parameters={num_parameters} trainable={trainable_parameters} non_trainable={non_trainable_parameters}"
     )
     print(
@@ -1224,12 +1234,20 @@ if __name__ == "__main__":
     parser.add_argument("--pair-hidden-dim", type=int, default=128)
     parser.add_argument("--pair-n-rbf", type=int, default=16)
     parser.add_argument("--pair-rbf-max", type=float, default=6.0)
+    parser.add_argument("--tetra-pair-force-mode", type=str, default="off", choices=["off", "residual"])
+    parser.add_argument("--tetra-pair-k-neighbors", type=int, default=30)
+    parser.add_argument("--tetra-pair-feature-dim", type=int, default=128)
+    parser.add_argument("--tetra-pair-element-dim", type=int, default=32)
+    parser.add_argument("--tetra-pair-gate-init", type=float, default=0.0)
+    parser.add_argument("--tetra-pair-geometry-strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--force-head-mode",
         default="auto",
         choices=["auto", "pairwise", "direct", "direct_3d", "non_equivariant", "tetra_vector"],
     )
     parser.add_argument("--readout-head-mode", type=str, default="dense", choices=["dense", "platonic"])
+    parser.add_argument("--tetra-readout-mode", type=str, default="platonic", choices=["platonic", "irrep"])
+    parser.add_argument("--tetra-irrep-scalar-input", type=str, default="rho1", choices=["rho1", "invariants"])
     parser.add_argument("--readout-activation", type=str, default=None, choices=["gelu", "silu", "relu", "mish", "sin"])
     parser.add_argument(
         "--omol-runtime-mode",

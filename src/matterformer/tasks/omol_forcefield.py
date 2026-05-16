@@ -117,4 +117,8 @@ class OMolDirectForceLoss(nn.Module):
             * 1000.0,
             "f_mae": _masked_component_mae(force_error_ev, force_mask) * 1000.0,
         }
+        extra_diagnostics = predictions.get("diagnostics")
+        if isinstance(extra_diagnostics, dict):
+            for key, value in extra_diagnostics.items():
+                diagnostics[str(key)] = torch.as_tensor(value, device=loss.device).detach()
         return OMolLossOutput(loss=loss, diagnostics=diagnostics)

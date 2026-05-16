@@ -3,6 +3,7 @@ import torch
 from matterformer.data import SyntheticOMolDataset, collate_omol
 from matterformer.geometry.cache import flatten_padded_geometry_cache
 from matterformer.models import MatterformerOMolForceField
+from matterformer.models.platonic import PLATONIC_GROUPS
 from matterformer.tasks import OMolDirectForceLoss, OMolElementReferences
 from matterformer.utils import random_rotation_matrices
 
@@ -220,6 +221,199 @@ def test_omol_platonic_tetra_readout_flat_matches_padded_runtime():
     torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
     padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
     assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_irrep_tetra_readout_flat_matches_padded_runtime():
+    batch = _batch()
+    for scalar_input in ("rho1", "invariants"):
+        torch.manual_seed(17)
+        padded = MatterformerOMolForceField(
+            d_model=24,
+            n_heads=4,
+            n_layers=1,
+            hybrid_config=_tetra_config(),
+            chgspin_mode="add",
+            pair_hidden_dim=24,
+            pair_n_rbf=8,
+            readout_head_mode="platonic",
+            tetra_readout_mode="irrep",
+            tetra_irrep_scalar_input=scalar_input,
+            readout_activation="sin",
+            runtime_mode="padded",
+        )
+        flat = MatterformerOMolForceField(
+            d_model=24,
+            n_heads=4,
+            n_layers=1,
+            hybrid_config=_tetra_config(),
+            chgspin_mode="add",
+            pair_hidden_dim=24,
+            pair_n_rbf=8,
+            readout_head_mode="platonic",
+            tetra_readout_mode="irrep",
+            tetra_irrep_scalar_input=scalar_input,
+            readout_activation="sin",
+            runtime_mode="internal_flat_tetra",
+        )
+        flat.load_state_dict(padded.state_dict())
+        padded.eval()
+        flat.eval()
+
+        with torch.no_grad():
+            padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+            flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+        valid = ~batch.pad_mask
+        torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+        padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
+        assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_irrep_tetra_readout_uses_scalar_and_vector_irreps():
+    torch.manual_seed(18)
+    model = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="off",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        tetra_readout_mode="irrep",
+    )
+    model.eval()
+    group = PLATONIC_GROUPS["tetrahedron"]
+    group_features = torch.randn(2, 4, group.G, 2)
+    pad_mask = torch.zeros(2, 4, dtype=torch.bool)
+
+    energy, forces = model._irrep_tetra_readout(group_features, pad_mask)
+    permutation = group.cayley_table[5, :]
+    energy_perm, forces_perm = model._irrep_tetra_readout(group_features[:, :, permutation], pad_mask)
+    expected_forces = torch.einsum("ji,bnj->bni", group.elements[5], forces)
+
+    torch.testing.assert_close(energy_perm, energy, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(forces_perm, expected_forces, atol=1e-5, rtol=1e-5)
+
+
+def test_omol_tetra_platonic_and_irrep_readouts_are_rotation_equivariant():
+    batch = _batch()
+    rotations = PLATONIC_GROUPS["tetrahedron"].elements.to(dtype=batch.coords.dtype)
+    valid = ~batch.pad_mask
+
+    for readout_mode in ("platonic", "irrep"):
+        scalar_inputs = ("rho1", "invariants") if readout_mode == "irrep" else ("rho1",)
+        for scalar_input in scalar_inputs:
+            for runtime_mode in ("padded", "internal_flat_tetra"):
+                torch.manual_seed(210)
+                model = MatterformerOMolForceField(
+                    d_model=24,
+                    n_heads=4,
+                    n_layers=1,
+                    hybrid_config=_tetra_config(),
+                    chgspin_mode="add",
+                    pair_hidden_dim=24,
+                    pair_n_rbf=8,
+                    readout_head_mode="platonic",
+                    tetra_readout_mode=readout_mode,
+                    tetra_irrep_scalar_input=scalar_input,
+                    readout_activation="sin",
+                    runtime_mode=runtime_mode,
+                )
+                model.eval()
+
+                with torch.no_grad():
+                    base = model(
+                        batch.atomic_numbers,
+                        batch.coords,
+                        batch.pad_mask,
+                        charge=batch.charge,
+                        spin=batch.spin,
+                    )
+                    base_energy = base["energy"]
+                    base_forces = base["forces"]
+
+                    for rotation in rotations:
+                        rotated = model(
+                            batch.atomic_numbers,
+                            batch.coords @ rotation.T,
+                            batch.pad_mask,
+                            charge=batch.charge,
+                            spin=batch.spin,
+                        )
+                        expected_forces = base_forces @ rotation.T
+                        torch.testing.assert_close(rotated["energy"], base_energy, atol=5e-5, rtol=5e-5)
+                        torch.testing.assert_close(
+                            rotated["forces"][valid],
+                            expected_forces[valid],
+                            atol=5e-5,
+                            rtol=5e-5,
+                        )
+
+
+def test_omol_tetra_pair_force_residual_flat_matches_padded_runtime():
+    torch.manual_seed(130)
+    batch = _batch()
+    padded = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        tetra_pair_force_mode="residual",
+        tetra_pair_k_neighbors=2,
+        tetra_pair_feature_dim=8,
+        tetra_pair_element_dim=4,
+        runtime_mode="padded",
+    )
+    flat = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        tetra_pair_force_mode="residual",
+        tetra_pair_k_neighbors=2,
+        tetra_pair_feature_dim=8,
+        tetra_pair_element_dim=4,
+        runtime_mode="internal_flat_tetra",
+    )
+    with torch.no_grad():
+        padded.tetra_pair_force_gate.fill_(1.0)
+    flat.load_state_dict(padded.state_dict())
+    padded.eval()
+    flat.eval()
+
+    with torch.no_grad():
+        padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+    force_sum = flat_out["forces"].masked_fill(batch.pad_mask[..., None], 0.0).sum(dim=1)
+    torch.testing.assert_close(force_sum, torch.zeros_like(force_sum), atol=1e-5, rtol=1e-5)
+    for key in (
+        "pair_force/gate",
+        "pair_force/direct_force_rms",
+        "pair_force/residual_force_rms",
+        "pair_force/residual_to_direct_rms",
+        "pair_force/coeff_rms",
+        "pair_force/coeff_abs_max",
+        "pair_force/knn_cap_fraction",
+        "pair_force/knn_cap_percent",
+    ):
+        assert key in flat_out["diagnostics"]
+        assert torch.isfinite(flat_out["diagnostics"][key])
 
 
 def test_omol_internal_flat_tetra_triton_zero_init_matches_flash_flat():
