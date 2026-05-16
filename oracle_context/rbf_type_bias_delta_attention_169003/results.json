@@ -1,0 +1,103 @@
+{
+  "args": {
+    "attn_graphs": 32,
+    "attn_tokens": 2048,
+    "chgspin_emb_dim": 160,
+    "chgspin_mode": "add",
+    "compile_scope": [
+      "none",
+      "trunk_flat"
+    ],
+    "d_model": 1920,
+    "full_variants": [
+      "flash_fast",
+      "triton_plain",
+      "local_rbf_type_every4",
+      "local_rbf_type_all"
+    ],
+    "head_dim": 32,
+    "heads_per_frame": 5,
+    "hybrid_config_json": "configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale.json",
+    "matmul_precision": "high",
+    "max_atoms_per_graph": 220,
+    "mlp_ratio": 2.0,
+    "n_heads": 60,
+    "n_layers": 16,
+    "num_graphs": 218,
+    "output_json": "oracle_context/rbf_type_bias_delta_attention_169003/results.json",
+    "pair_hidden_dim": 128,
+    "pair_n_rbf": 16,
+    "pair_rbf_max": 6.0,
+    "readout_activation": "sin",
+    "repeats": 3,
+    "skip_full_model": true,
+    "total_atoms": 12000,
+    "warmup": 2
+  },
+  "attention_parity": {
+    "ieee": {
+      "dk_max_abs": 0.0008777379989624023,
+      "dq_max_abs": 7.152557373046875e-07,
+      "drbf_weight_max_abs": 2.5033950805664062e-06,
+      "dtype_bias_max_abs": 1.2218952178955078e-06,
+      "dv_max_abs": 0.0008928775787353516,
+      "forward_max_abs": 5.960464477539062e-07,
+      "precision": "ieee",
+      "triton_available": true,
+      "zero_init_vs_plain_triton_forward_max_abs": 3.5762786865234375e-07
+    },
+    "tf32x3": {
+      "dk_max_abs": 0.0008774995803833008,
+      "dq_max_abs": 1.6689300537109375e-06,
+      "drbf_weight_max_abs": 5.7220458984375e-06,
+      "dtype_bias_max_abs": 1.2218952178955078e-06,
+      "dv_max_abs": 0.0008929967880249023,
+      "forward_max_abs": 7.152557373046875e-07,
+      "precision": "tf32x3",
+      "triton_available": true,
+      "zero_init_vs_plain_triton_forward_max_abs": 2.384185791015625e-07
+    }
+  },
+  "attention_perf": [
+    {
+      "max_ms": 2.459695970173925,
+      "mean_ms": 2.3478123087746403,
+      "median_ms": 2.3236830020323396,
+      "min_ms": 2.2600579541176558,
+      "name": "attention_flash_varlen_bf16",
+      "pass": "fwd_bwd",
+      "peak_allocated_gib": 0.262479305267334
+    },
+    {
+      "max_ms": 2.040447958279401,
+      "mean_ms": 1.7999913349437218,
+      "median_ms": 1.7906850553117692,
+      "min_ms": 1.5688409912399948,
+      "name": "attention_triton_plain_tf32x3",
+      "pass": "fwd_bwd",
+      "peak_allocated_gib": 0.23517560958862305
+    },
+    {
+      "max_ms": 1.870353997219354,
+      "mean_ms": 1.865496354488035,
+      "median_ms": 1.8673190497793257,
+      "min_ms": 1.8588160164654255,
+      "name": "attention_triton_rbf_type4_zero_tf32x3",
+      "pass": "fwd_bwd",
+      "peak_allocated_gib": 0.23519134521484375
+    },
+    {
+      "max_ms": 1.8857269897125661,
+      "mean_ms": 1.8700533352481823,
+      "median_ms": 1.8658770131878555,
+      "min_ms": 1.858556002844125,
+      "name": "attention_triton_rbf_type4_nonzero_tf32x3",
+      "pass": "fwd_bwd",
+      "peak_allocated_gib": 0.23519134521484375
+    }
+  ],
+  "device": "NVIDIA RTX 6000 Ada Generation",
+  "full_model_batch": {},
+  "full_model_perf": [],
+  "matmul_precision": "high"
+}

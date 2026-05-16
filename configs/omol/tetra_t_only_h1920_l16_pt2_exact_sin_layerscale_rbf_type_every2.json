@@ -1,0 +1,47 @@
+{
+  "num_blocks": 16,
+  "stream_type": "tetra",
+  "block_mix": [0, 1, 0],
+  "order_policy": "local_then_global",
+  "scalar_dim": 1920,
+  "tetra_dim_per_frame": 160,
+  "tetra": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "heads_per_frame": 5,
+    "rope_sigma": 2.0,
+    "learned_freqs": true,
+    "freq_init": "random",
+    "use_key": false,
+    "rope_on_values": true,
+    "attention_backend": "flash",
+    "local_attention_mod": {
+      "enabled": true,
+      "backend": "triton_rbf_type_bias",
+      "every": 2,
+      "offset": 1,
+      "kind": "rbf_type_enveloped",
+      "cutoff": 6.0,
+      "num_rbf": 4,
+      "rbf_min": 0.0,
+      "rbf_max": 6.0,
+      "include_type_pair": true,
+      "max_atomic_number": 118,
+      "diag_zero": true,
+      "zero_init": true,
+      "block_m": 16,
+      "block_n": 32,
+      "precision": "tf32x3",
+      "strict": true
+    },
+    "activation": "sin",
+    "ffn_mult": 2,
+    "layer_scale_init_value": 0.0001
+  },
+  "input_lift": {
+    "kind": "scalar_copy"
+  },
+  "readout": {
+    "kind": "platonic_ffn"
+  }
+}

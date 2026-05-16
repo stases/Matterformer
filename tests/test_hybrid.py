@@ -204,6 +204,45 @@ def test_platonic_cheap_radial_zero_init_is_noop_and_weight_gets_grad(radial_bia
     assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
 
 
+def test_platonic_rbf_type_enveloped_zero_init_is_noop_and_weights_get_grad():
+    torch.manual_seed(112)
+    q = torch.randn(6, 4, 4, requires_grad=True)
+    k = torch.randn(6, 4, 4, requires_grad=True)
+    v = torch.randn(6, 4, 4, requires_grad=True)
+    pos = torch.randn(6, 3)
+    atom_types = torch.tensor([1, 6, 8, 1, 7, 6])
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    centers = torch.linspace(0.0, 6.0, 4)
+    gamma = torch.tensor(0.75)
+    rbf_weight = torch.zeros(2, 4, requires_grad=True)
+    type_bias = torch.zeros(9, 9, 2, requires_grad=True)
+
+    unbiased = platonic_attention_flat_torch_reference(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=3)
+    biased = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=2,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=6.0,
+        radial_bias_kind="rbf_type_enveloped",
+        diag_zero=True,
+    )
+    torch.testing.assert_close(biased, unbiased, atol=1e-7, rtol=1e-7)
+    biased.square().sum().backward()
+    assert rbf_weight.grad is not None
+    assert type_bias.grad is not None
+    assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
+    assert torch.count_nonzero(type_bias.grad.abs() > 0) > 0
+
+
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
     torch.manual_seed(103)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -251,6 +290,60 @@ def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation()
     torch.testing.assert_close(out_perm, out[:, perm], atol=1e-6, rtol=1e-6)
 
 
+def test_platonic_rbf_type_enveloped_group_shared_bias_commutes_with_group_permutation():
+    torch.manual_seed(113)
+    group = PLATONIC_GROUPS["tetrahedron"]
+    num_tokens = 5
+    group_order = group.G
+    heads_per_frame = 2
+    head_dim = 4
+    q = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    k = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    v = torch.randn(num_tokens, group_order, heads_per_frame, head_dim)
+    pos = torch.randn(num_tokens, 3)
+    atom_types = torch.tensor([1, 6, 8, 7, 1])
+    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
+    rbf_weight = torch.randn(heads_per_frame, 4) * 0.01
+    type_bias = torch.randn(9, 9, heads_per_frame) * 0.01
+    centers = torch.linspace(0.0, 6.0, 4)
+    gamma = torch.tensor(0.75)
+
+    out = platonic_attention_flat_torch_reference(
+        q.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        k.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        v.reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=num_tokens,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=6.0,
+        radial_bias_kind="rbf_type_enveloped",
+    ).view(num_tokens, group_order, heads_per_frame, head_dim)
+    perm = group.cayley_table[3]
+    out_perm = platonic_attention_flat_torch_reference(
+        q[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        k[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        v[:, perm].reshape(num_tokens, group_order * heads_per_frame, head_dim),
+        cu_seqlens=cu_seqlens,
+        max_seqlen=num_tokens,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=6.0,
+        radial_bias_kind="rbf_type_enveloped",
+    ).view(num_tokens, group_order, heads_per_frame, head_dim)
+    torch.testing.assert_close(out_perm, out[:, perm], atol=1e-6, rtol=1e-6)
+
+
 def test_platonic_block_flat_triton_backends_match_flash_zero_init():
     torch.manual_seed(104)
     flash = PlatonicBlock(
@@ -294,6 +387,77 @@ def test_platonic_block_flat_triton_backends_match_flash_zero_init():
         radial_out = radial.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
     torch.testing.assert_close(triton_out, flash_out, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(radial_out, triton_out, atol=1e-6, rtol=1e-6)
+
+
+def test_platonic_block_flat_torch_rbf_type_bias_matches_triton_zero_init():
+    torch.manual_seed(114)
+    triton_block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton",
+        attention_bias={"precision": "tf32x3", "strict": True},
+    )
+    local = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="torch_rbf_type_bias",
+        attention_bias={
+            "kind": "rbf_type_enveloped",
+            "num_rbf": 4,
+            "cutoff": 6.0,
+            "max_atomic_number": 8,
+            "zero_init": True,
+        },
+    )
+    local_triton = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton_rbf_type_bias",
+        attention_bias={
+            "kind": "rbf_type_enveloped",
+            "num_rbf": 4,
+            "cutoff": 6.0,
+            "max_atomic_number": 8,
+            "zero_init": True,
+        },
+    )
+    local.load_state_dict(triton_block.state_dict(), strict=False)
+    local_triton.load_state_dict(triton_block.state_dict(), strict=False)
+    x = torch.randn(5, 12 * 4)
+    pos = torch.randn(5, 3)
+    atom_types = torch.tensor([1, 6, 8, 1, 7])
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    triton_block.eval()
+    local.eval()
+    local_triton.eval()
+    with torch.no_grad():
+        triton_out = triton_block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
+        local_out = local.forward_flat(
+            x,
+            pos=pos,
+            atom_types=atom_types,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=3,
+        )
+        local_triton_out = local_triton.forward_flat(
+            x,
+            pos=pos,
+            atom_types=atom_types,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=3,
+        )
+    torch.testing.assert_close(local_out, triton_out, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(local_triton_out, triton_out, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
@@ -411,6 +575,75 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
     torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+def test_platonic_flat_triton_rbf_type_cuda_matches_reference_forward_backward():
+    torch.manual_seed(115)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    pos = torch.randn(6, 3, device=device)
+    atom_types = torch.tensor([1, 6, 8, 1, 7, 6], device=device)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+    centers = torch.linspace(0.0, 6.0, 4, device=device)
+    gamma = torch.tensor(0.75, device=device)
+    weight = (torch.randn(2, 4, device=device) * 0.01).requires_grad_(True)
+    type_bias = (torch.randn(9, 9, 2, device=device) * 0.01).requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    type_bias_ref = type_bias.detach().clone().requires_grad_(True)
+
+    out = platonic_attention_flat_triton(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=2,
+        rbf_weight=weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=6.0,
+        max_atomic_number=8,
+        radial_bias_kind="rbf_type_enveloped",
+        strict=True,
+        precision="ieee",
+    )
+    ref = platonic_attention_flat_torch_reference(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=2,
+        rbf_weight=weight_ref,
+        type_bias=type_bias_ref,
+        centers=centers,
+        gamma=gamma,
+        cutoff=6.0,
+        radial_bias_kind="rbf_type_enveloped",
+    )
+    torch.testing.assert_close(out, ref, atol=5e-5, rtol=5e-5)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-5, rtol=5e-5)
+    # The DKV kernel accumulates over tiled softmax probabilities, so dK/dV
+    # have slightly larger absolute drift than the forward pass and parameter
+    # gradients even with IEEE dot precision.
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=1e-3, rtol=1e-4)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=1e-3, rtol=1e-4)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(type_bias.grad, type_bias_ref.grad, atol=5e-5, rtol=5e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
@@ -674,6 +907,42 @@ def test_hybrid_trunk_skips_geometry_cache_for_pure_tetra_global():
 
     assert out.shape == x.shape
     assert adapter.calls == 0
+
+
+def test_hybrid_tetra_scheduled_local_attention_mod_selects_requested_layers():
+    trunk = HybridTransformerTrunk(
+        d_model=24,
+        n_heads=12,
+        n_layers=4,
+        hybrid_config={
+            "stream_type": "tetra",
+            "num_blocks": 4,
+            "block_mix": [0, 1, 0],
+            "tetra_dim_per_frame": 2,
+            "tetra": {
+                "heads_per_frame": 1,
+                "rope_sigma": 1.0,
+                "attention_backend": "flash",
+                "local_attention_mod": {
+                    "enabled": True,
+                    "backend": "torch_rbf_type_bias",
+                    "every": 2,
+                    "offset": 1,
+                    "num_rbf": 4,
+                    "cutoff": 6.0,
+                    "max_atomic_number": 8,
+                },
+            },
+        },
+        geometry_adapter=NonPeriodicGeometryAdapter(),
+    )
+    backends = [
+        layer.block.attn.attention_backend
+        for block in trunk.blocks
+        for layer in block.sublayers
+        if hasattr(layer, "block")
+    ]
+    assert backends == ["flash", "torch_rbf_type_bias", "flash", "torch_rbf_type_bias"]
 
 
 def test_hybrid_trunk_builds_geometry_cache_when_required():

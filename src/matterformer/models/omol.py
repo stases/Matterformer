@@ -883,6 +883,7 @@ class MatterformerOMolForceField(nn.Module):
                 trunk_result = self.trunk.forward_flat_hybrid(
                     token_features,
                     coords=centered_coords,
+                    atom_types=atomic_flat,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     flat_geom=flat_geom,
@@ -892,6 +893,7 @@ class MatterformerOMolForceField(nn.Module):
                 trunk_result = self.trunk.forward_flat_tetra(
                     token_features,
                     coords=centered_coords,
+                    atom_types=atomic_flat,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     return_output=True,
@@ -990,6 +992,7 @@ class MatterformerOMolForceField(nn.Module):
                     pad_mask=pad_mask,
                     coords=centered_coords,
                     sigma=sigma,
+                    atom_types=atomic_numbers,
                     return_output=True,
                 )
             if not isinstance(trunk_result, HybridTrunkOutput) or trunk_result.group is None:

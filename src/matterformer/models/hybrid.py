@@ -102,6 +102,32 @@ def expand_hybrid_schedule(
     return schedule
 
 
+def _use_scheduled_local_attention(layer_idx: int, local_cfg: dict[str, Any]) -> bool:
+    if not bool(local_cfg.get("enabled", False)):
+        return False
+    every = int(local_cfg.get("every", 4))
+    if every <= 0:
+        return False
+    offset = int(local_cfg.get("offset", every - 1))
+    return (int(layer_idx) - offset) % every == 0
+
+
+def _tetra_config_for_layer(base_config: dict[str, Any], layer_idx: int) -> dict[str, Any]:
+    local_cfg = dict(base_config.get("local_attention_mod") or {})
+    if not _use_scheduled_local_attention(layer_idx, local_cfg):
+        return base_config
+    scheduled = dict(base_config)
+    scheduled["attention_backend"] = str(local_cfg.get("backend", "triton_rbf_type_bias"))
+    attention_bias = {
+        key: value
+        for key, value in local_cfg.items()
+        if key not in {"enabled", "backend", "every", "offset"}
+    }
+    attention_bias.setdefault("kind", "rbf_type_enveloped")
+    scheduled["attention_bias"] = attention_bias
+    return scheduled
+
+
 @dataclass
 class HybridConfig:
     num_blocks: int = 4
@@ -184,6 +210,7 @@ class HybridConfig:
             "rope_cache": True,
             "constant_key_fastpath": True,
             "fused_qv": False,
+            "local_attention_mod": None,
             **dict(cfg.tetra),
         }
         cfg.trivial = {
@@ -207,6 +234,7 @@ class ModelState:
     geom: GeometryCache | None
     cond_emb: torch.Tensor | None = None
     sigma: torch.Tensor | None = None
+    atom_types: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1864,7 +1892,12 @@ class TetraPlatonicGlobalLayer(nn.Module):
         with record_function("tetra_global/platonic_block"):
             group_shape = state.group.shape
             x = state.group.reshape(group_shape[0], group_shape[1], self.group_order * self.dim_per_frame)
-            x = self.block(x, pos=self._positions(state.pos, group_shape[1]), pad_mask=state.mask)
+            x = self.block(
+                x,
+                pos=self._positions(state.pos, group_shape[1]),
+                pad_mask=state.mask,
+                atom_types=state.atom_types,
+            )
             state.group = x.view(group_shape)
         if state.mask is not None:
             state.group = state.group.masked_fill(state.mask[..., None, None], 0.0)
@@ -1875,6 +1908,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
         group: torch.Tensor,
         *,
         pos: torch.Tensor,
+        atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
@@ -1885,7 +1919,13 @@ class TetraPlatonicGlobalLayer(nn.Module):
                     f"got {tuple(group.shape)}"
                 )
             x = group.reshape(group.shape[0], self.group_order * self.dim_per_frame)
-            x = self.block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = self.block.forward_flat(
+                x,
+                pos=pos,
+                atom_types=atom_types,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
             return x.view_as(group)
 
 
@@ -2114,6 +2154,7 @@ class HybridTransformerTrunk(nn.Module):
 
         blocks: list[HybridBlock] = []
         simplicial_target = str(self.config.simplicial.get("target", "scalar")).lower().replace("-", "_")
+        tetra_layer_idx = 0
         for block_order in schedule:
             sublayers: list[nn.Module] = []
             for layer_type in block_order:
@@ -2144,15 +2185,17 @@ class HybridTransformerTrunk(nn.Module):
                             )
                         )
                 elif layer_type == "tetra":
+                    tetra_config = _tetra_config_for_layer(self.config.tetra, tetra_layer_idx)
                     sublayers.append(
                         TetraPlatonicGlobalLayer(
                             group_order=self.group_order,
                             dim_per_frame=self.group_dim_per_frame,
-                            config=self.config.tetra,
+                            config=tetra_config,
                             dropout=dropout,
                             eps=eps,
                         )
                     )
+                    tetra_layer_idx += 1
                 elif layer_type == "trivial":
                     trivial_attn = dict(self.config.trivial.get("attention", {}))
                     sublayers.append(
@@ -2281,6 +2324,7 @@ class HybridTransformerTrunk(nn.Module):
         x: torch.Tensor,
         *,
         coords: torch.Tensor,
+        atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         return_output: bool = False,
@@ -2296,6 +2340,8 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"Expected flat tetra trunk input [N, {self.input_dim}], got {tuple(x.shape)}")
         if coords.shape != (x.shape[0], 3):
             raise ValueError(f"Expected flat coords [N, 3], got {tuple(coords.shape)} for x {tuple(x.shape)}")
+        if atom_types is not None and atom_types.shape != (x.shape[0],):
+            raise ValueError(f"Expected flat atom_types [{x.shape[0]}], got {tuple(atom_types.shape)}")
 
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         with record_function("hybrid_trunk_flat/lift_tetra_input"):
@@ -2308,6 +2354,7 @@ class HybridTransformerTrunk(nn.Module):
                     group = layer.forward_flat(
                         group,
                         pos=coords,
+                        atom_types=atom_types,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=int(max_seqlen),
                     )
@@ -2329,6 +2376,7 @@ class HybridTransformerTrunk(nn.Module):
         x: torch.Tensor,
         *,
         coords: torch.Tensor,
+        atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         flat_geom: FlatGeometryCache | None,
@@ -2346,6 +2394,8 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"Expected flat hybrid trunk input [N, {self.input_dim}], got {tuple(x.shape)}")
         if coords.shape != (x.shape[0], 3):
             raise ValueError(f"Expected flat coords [N, 3], got {tuple(coords.shape)} for x {tuple(x.shape)}")
+        if atom_types is not None and atom_types.shape != (x.shape[0],):
+            raise ValueError(f"Expected flat atom_types [{x.shape[0]}], got {tuple(atom_types.shape)}")
 
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         with record_function("hybrid_trunk_flat_hybrid/lift_tetra_input"):
@@ -2357,6 +2407,7 @@ class HybridTransformerTrunk(nn.Module):
                         group = layer.forward_flat(
                             group,
                             pos=coords,
+                            atom_types=atom_types,
                             cu_seqlens=cu_seqlens,
                             max_seqlen=int(max_seqlen),
                         )
@@ -2468,6 +2519,7 @@ class HybridTransformerTrunk(nn.Module):
         coords: torch.Tensor | None = None,
         lattice: torch.Tensor | None = None,
         sigma: torch.Tensor | None = None,
+        atom_types: torch.Tensor | None = None,
         return_output: bool = False,
     ) -> torch.Tensor | HybridTrunkOutput:
         if pad_mask is not None and pad_mask.dtype != torch.bool:
@@ -2495,6 +2547,7 @@ class HybridTransformerTrunk(nn.Module):
             geom=geom,
             cond_emb=cond_emb,
             sigma=sigma,
+            atom_types=atom_types,
         )
         with record_function("hybrid_trunk/blocks"):
             for block in self.blocks:

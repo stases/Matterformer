@@ -26,6 +26,7 @@ PLATONIC_ATTENTION_BIAS_MODES = {
     "radial_rbf": 1,
     "radial_r2": 2,
     "radial_slope": 3,
+    "rbf_type_enveloped": 4,
 }
 
 
@@ -57,6 +58,8 @@ def normalize_platonic_attention_bias_mode(value: str | int | None, *, has_bias:
         key = "radial_r2"
     elif key in {"slope", "radial_linear"}:
         key = "radial_slope"
+    elif key in {"rbf_type", "type_rbf", "rbf_type_bias", "smooth_local", "smooth_local_mod"}:
+        key = "rbf_type_enveloped"
     if key not in PLATONIC_ATTENTION_BIAS_MODES:
         raise ValueError(f"unknown Platonic attention bias mode: {value!r}")
     return PLATONIC_ATTENTION_BIAS_MODES[key]
@@ -132,6 +135,58 @@ def _radial_rbf_bias_reference(
     return subhead_bias.index_select(dim=-1, index=head_subidx).permute(2, 0, 1).contiguous()
 
 
+def _c2_quintic_envelope(dist: torch.Tensor, cutoff: float) -> torch.Tensor:
+    x = (dist / float(cutoff)).clamp(min=0.0, max=1.0)
+    x2 = x.square()
+    x3 = x2 * x
+    env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+    return torch.where(dist < float(cutoff), env, torch.zeros_like(env))
+
+
+def _rbf_type_bias_reference(
+    pos_i: torch.Tensor,
+    pos_j: torch.Tensor,
+    atom_i: torch.Tensor | None,
+    atom_j: torch.Tensor | None,
+    *,
+    num_heads: int,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    type_bias: torch.Tensor | None = None,
+    diag_zero: bool,
+) -> torch.Tensor:
+    if heads_per_frame <= 0 or num_heads % int(heads_per_frame) != 0:
+        raise ValueError("heads_per_frame must divide num_heads for Platonic RBF/type attention bias")
+    delta = pos_j[None, :, :] - pos_i[:, None, :]
+    dist = delta.square().sum(dim=-1).clamp_min(0.0).sqrt()
+    env = _c2_quintic_envelope(dist, cutoff).to(dtype=dist.dtype)
+    if diag_zero and pos_i.shape[0] == pos_j.shape[0]:
+        diagonal = torch.eye(pos_i.shape[0], device=pos_i.device, dtype=torch.bool)
+        env = env.masked_fill(diagonal, 0.0)
+
+    centers = centers.to(device=dist.device, dtype=dist.dtype)
+    gamma = gamma.to(device=dist.device, dtype=dist.dtype)
+    rbf = torch.exp(-gamma * (dist[..., None] - centers.view(1, 1, -1)).square())
+    rbf = rbf * env[..., None]
+    weights = rbf_weight.to(device=dist.device, dtype=dist.dtype)
+    subhead_bias = torch.einsum("ijm,hm->ijh", rbf, weights)
+
+    if type_bias is not None:
+        if atom_i is None or atom_j is None:
+            raise ValueError("type_bias requires atom_i and atom_j")
+        zmax = type_bias.shape[0] - 1
+        zi = atom_i.to(device=dist.device).long().clamp(min=0, max=zmax)
+        zj = atom_j.to(device=dist.device).long().clamp(min=0, max=zmax)
+        pair_type = type_bias.to(device=dist.device, dtype=dist.dtype)[zi[:, None], zj[None, :]]
+        subhead_bias = subhead_bias + env[..., None] * pair_type
+
+    head_subidx = torch.arange(num_heads, device=pos_i.device) % int(heads_per_frame)
+    return subhead_bias.index_select(dim=-1, index=head_subidx).permute(2, 0, 1).contiguous()
+
+
 def platonic_attention_flat_torch_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -140,11 +195,14 @@ def platonic_attention_flat_torch_reference(
     cu_seqlens: torch.Tensor,
     max_seqlen: int | None = None,
     pos: torch.Tensor | None = None,
+    atom_types: torch.Tensor | None = None,
     heads_per_frame: int | None = None,
     rbf_weight: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
+    type_bias: torch.Tensor | None = None,
     centers: torch.Tensor | None = None,
     gamma: torch.Tensor | None = None,
+    cutoff: float | None = None,
     radial_bias_kind: str | int | None = None,
     diag_zero: bool = True,
     dropout_p: float = 0.0,
@@ -161,12 +219,19 @@ def platonic_attention_flat_torch_reference(
     if dropout_p != 0.0:
         raise ValueError("Platonic flat reference attention only supports dropout_p=0")
     use_rbf = rbf_weight is not None
+    bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
+    use_rbf_type = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
     if use_rbf:
-        if pos is None or heads_per_frame is None or gate is None or centers is None or gamma is None:
-            raise ValueError("Radial bias requires pos, heads_per_frame, gate, centers, and gamma")
+        if pos is None or heads_per_frame is None or centers is None or gamma is None:
+            raise ValueError("Radial bias requires pos, heads_per_frame, centers, and gamma")
+        if not use_rbf_type and gate is None:
+            raise ValueError("Legacy radial bias requires gate")
+        if use_rbf_type and cutoff is None:
+            raise ValueError("RBF/type enveloped bias requires cutoff")
+        if use_rbf_type and type_bias is not None and atom_types is None:
+            raise ValueError("RBF/type enveloped bias with type_bias requires atom_types")
         if pos.ndim != 2 or pos.shape != (q.shape[0], 3):
             raise ValueError(f"pos must have shape [{q.shape[0]}, 3], got {tuple(pos.shape)}")
-    bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
     outputs: list[torch.Tensor] = []
     starts = cu_seqlens[:-1].detach().cpu().tolist()
     ends = cu_seqlens[1:].detach().cpu().tolist()
@@ -180,7 +245,24 @@ def platonic_attention_flat_torch_reference(
         k_seg = k[start_i:end_i].transpose(0, 1)
         v_seg = v[start_i:end_i].transpose(0, 1)
         scores = torch.matmul(q_seg, k_seg.transpose(-2, -1)) * scale
-        if use_rbf:
+        if use_rbf_type:
+            assert pos is not None
+            bias = _rbf_type_bias_reference(
+                pos[start_i:end_i],
+                pos[start_i:end_i],
+                None if atom_types is None else atom_types[start_i:end_i],
+                None if atom_types is None else atom_types[start_i:end_i],
+                num_heads=q.shape[1],
+                heads_per_frame=int(heads_per_frame),
+                rbf_weight=rbf_weight,
+                type_bias=type_bias,
+                centers=centers,
+                gamma=gamma,
+                cutoff=float(cutoff),
+                diag_zero=diag_zero,
+            )
+            scores = scores + bias.to(dtype=scores.dtype)
+        elif use_rbf:
             assert pos is not None
             bias = _radial_rbf_bias_reference(
                 pos[start_i:end_i],
@@ -188,7 +270,7 @@ def platonic_attention_flat_torch_reference(
                 num_heads=q.shape[1],
                 heads_per_frame=int(heads_per_frame),
                 rbf_weight=rbf_weight,
-                gate=gate,
+                gate=gate,  # type: ignore[arg-type]
                 centers=centers,
                 gamma=gamma,
                 diag_zero=diag_zero,
@@ -209,8 +291,10 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
     @triton.jit
     def _radial_bias_tile(
         pos_ptr,
+        atom_type_ptr,
         rbf_weight_ptr,
         gate_ptr,
+        type_bias_ptr,
         centers_ptr,
         gamma_ptr,
         start: tl.tensor,
@@ -222,6 +306,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         heads_per_frame: tl.constexpr,
         num_rbf: tl.constexpr,
         bias_mode: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
         diag_zero: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -239,7 +325,6 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         dz = zj - zi
         dist2 = tl.maximum(dx * dx + dy * dy + dz * dz, 0.0)
         subhead = head_idx % heads_per_frame
-        gate = tl.load(gate_ptr + subhead).to(tl.float32)
         bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         if bias_mode == 1:
             dist = tl.sqrt(dist2)
@@ -249,13 +334,44 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                 weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
                 rho = tl.exp(-gamma * (dist - center) * (dist - center))
                 bias += weight * rho
+            gate = tl.load(gate_ptr + subhead).to(tl.float32)
+            bias *= 1.0 + gate
         elif bias_mode == 2:
             weight = tl.load(rbf_weight_ptr + subhead * num_rbf).to(tl.float32)
             bias = weight * dist2
+            gate = tl.load(gate_ptr + subhead).to(tl.float32)
+            bias *= 1.0 + gate
         elif bias_mode == 3:
             weight = tl.load(rbf_weight_ptr + subhead * num_rbf).to(tl.float32)
             bias = weight * tl.sqrt(dist2)
-        bias *= 1.0 + gate
+            gate = tl.load(gate_ptr + subhead).to(tl.float32)
+            bias *= 1.0 + gate
+        elif bias_mode == 4:
+            dist = tl.sqrt(dist2)
+            x = dist / cutoff
+            x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+            x2 = x * x
+            x3 = x2 * x
+            env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+            env = tl.where(dist < cutoff, env, 0.0)
+            gamma = tl.load(gamma_ptr).to(tl.float32)
+            for rb in range(0, num_rbf):
+                center = tl.load(centers_ptr + rb).to(tl.float32)
+                weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                rho = tl.exp(-gamma * (dist - center) * (dist - center)) * env
+                bias += weight * rho
+            zi_atom = tl.load(atom_type_ptr + start + offs_m, mask=m_mask, other=0)[:, None]
+            zj_atom = tl.load(atom_type_ptr + start + offs_n, mask=n_mask, other=0)[None, :]
+            zi_atom = tl.minimum(tl.maximum(zi_atom, 0), max_atomic_number)
+            zj_atom = tl.minimum(tl.maximum(zj_atom, 0), max_atomic_number)
+            zdim = max_atomic_number + 1
+            type_index = ((zi_atom * zdim + zj_atom) * heads_per_frame + subhead)
+            type_term = tl.load(
+                type_bias_ptr + type_index,
+                mask=m_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            bias += env * type_term
         if diag_zero:
             bias = tl.where(offs_m[:, None] == offs_n[None, :], 0.0, bias)
         return bias
@@ -266,9 +382,11 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         k_ptr,
         v_ptr,
         pos_ptr,
+        atom_type_ptr,
         cu_ptr,
         rbf_weight_ptr,
         gate_ptr,
+        type_bias_ptr,
         centers_ptr,
         gamma_ptr,
         out_ptr,
@@ -281,6 +399,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         num_rbf: tl.constexpr,
         has_rbf: tl.constexpr,
         bias_mode: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
         diag_zero: tl.constexpr,
         input_precision: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -329,8 +449,10 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                 if has_rbf:
                     scores += _radial_bias_tile(
                         pos_ptr,
+                        atom_type_ptr,
                         rbf_weight_ptr,
                         gate_ptr,
+                        type_bias_ptr,
                         centers_ptr,
                         gamma_ptr,
                         start,
@@ -342,6 +464,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         heads_per_frame,
                         num_rbf,
                         bias_mode,
+                        cutoff,
+                        max_atomic_number,
                         diag_zero,
                         BLOCK_M,
                         BLOCK_N,
@@ -406,12 +530,14 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         k_ptr,
         v_ptr,
         pos_ptr,
+        atom_type_ptr,
         cu_ptr,
         dout_ptr,
         lse_ptr,
         delta_ptr,
         rbf_weight_ptr,
         gate_ptr,
+        type_bias_ptr,
         centers_ptr,
         gamma_ptr,
         dq_ptr,
@@ -419,6 +545,7 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         dv_ptr,
         d_rbf_weight_ptr,
         d_gate_ptr,
+        d_type_bias_ptr,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         max_seqlen: tl.constexpr,
@@ -427,6 +554,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         num_rbf: tl.constexpr,
         has_rbf: tl.constexpr,
         bias_mode: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
         diag_zero: tl.constexpr,
         input_precision: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -462,7 +591,7 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         delta = tl.load(delta_ptr + (start + offs_m) * num_heads + head_idx, mask=m_mask, other=0.0).to(tl.float32)
         dq = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
         subhead = head_idx % heads_per_frame
-        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf else 0.0
+        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf and bias_mode != 4 else 0.0
         gate_factor = 1.0 + gate
         for block_n in range(0, tl.cdiv(max_seqlen, BLOCK_N)):
             n_start = block_n * BLOCK_N
@@ -509,7 +638,33 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         dist = tl.sqrt(dist2)
                         weight = tl.load(rbf_weight_ptr + subhead * num_rbf).to(tl.float32)
                         base_bias = weight * dist
-                    bias = base_bias * gate_factor
+                    elif bias_mode == 4:
+                        dist = tl.sqrt(dist2)
+                        x = dist / cutoff
+                        x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+                        x2 = x * x
+                        x3 = x2 * x
+                        env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+                        env = tl.where(dist < cutoff, env, 0.0)
+                        gamma = tl.load(gamma_ptr).to(tl.float32)
+                        for rb in range(0, num_rbf):
+                            center = tl.load(centers_ptr + rb).to(tl.float32)
+                            weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                            rho = tl.exp(-gamma * (dist - center) * (dist - center)) * env
+                            base_bias += weight * rho
+                        zi_atom = tl.load(atom_type_ptr + start + offs_m, mask=m_mask, other=0)[:, None]
+                        zj_atom = tl.load(atom_type_ptr + start + n, mask=n_mask, other=0)[None, :]
+                        zi_atom = tl.minimum(tl.maximum(zi_atom, 0), max_atomic_number)
+                        zj_atom = tl.minimum(tl.maximum(zj_atom, 0), max_atomic_number)
+                        zdim = max_atomic_number + 1
+                        type_index = ((zi_atom * zdim + zj_atom) * heads_per_frame + subhead)
+                        type_term = tl.load(
+                            type_bias_ptr + type_index,
+                            mask=m_mask[:, None] & n_mask[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        base_bias += env * type_term
+                    bias = base_bias if bias_mode == 4 else base_bias * gate_factor
                     if diag_zero:
                         bias = tl.where(offs_m[:, None] == n[None, :], 0.0, bias)
                     scores += bias
@@ -538,7 +693,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         ds_bias = tl.where(offs_m[:, None] == n[None, :], 0.0, ds)
                     else:
                         ds_bias = ds
-                    tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
+                    if bias_mode != 4:
+                        tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
                     if bias_mode == 1:
                         for rb in range(0, num_rbf):
                             center = tl.load(centers_ptr + rb).to(tl.float32)
@@ -551,6 +707,18 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                     elif bias_mode == 3:
                         grad_w = tl.sum(tl.sum(ds_bias * dist * gate_factor, axis=0), axis=0)
                         tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf, grad_w, sem="relaxed")
+                    elif bias_mode == 4:
+                        for rb in range(0, num_rbf):
+                            center = tl.load(centers_ptr + rb).to(tl.float32)
+                            rho = tl.exp(-gamma * (dist - center) * (dist - center)) * env
+                            grad_w = tl.sum(tl.sum(ds_bias * rho, axis=0), axis=0)
+                            tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf + rb, grad_w, sem="relaxed")
+                        tl.atomic_add(
+                            d_type_bias_ptr + type_index,
+                            ds_bias * env,
+                            sem="relaxed",
+                            mask=m_mask[:, None] & n_mask[None, :],
+                        )
         tl.store(
             dq_ptr + ((start + offs_m[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
             dq,
@@ -563,12 +731,14 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         k_ptr,
         v_ptr,
         pos_ptr,
+        atom_type_ptr,
         cu_ptr,
         dout_ptr,
         lse_ptr,
         delta_ptr,
         rbf_weight_ptr,
         gate_ptr,
+        type_bias_ptr,
         centers_ptr,
         gamma_ptr,
         dq_ptr,
@@ -580,6 +750,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         num_rbf: tl.constexpr,
         has_rbf: tl.constexpr,
         bias_mode: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
         diag_zero: tl.constexpr,
         input_precision: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -636,8 +808,10 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                 if has_rbf:
                     scores += _radial_bias_tile(
                         pos_ptr,
+                        atom_type_ptr,
                         rbf_weight_ptr,
                         gate_ptr,
+                        type_bias_ptr,
                         centers_ptr,
                         gamma_ptr,
                         start,
@@ -649,6 +823,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         heads_per_frame,
                         num_rbf,
                         bias_mode,
+                        cutoff,
+                        max_atomic_number,
                         diag_zero,
                         BLOCK_M,
                         BLOCK_N,
@@ -671,18 +847,21 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         k_ptr,
         v_ptr,
         pos_ptr,
+        atom_type_ptr,
         cu_ptr,
         dout_ptr,
         lse_ptr,
         delta_ptr,
         rbf_weight_ptr,
         gate_ptr,
+        type_bias_ptr,
         centers_ptr,
         gamma_ptr,
         dk_ptr,
         dv_ptr,
         d_rbf_weight_ptr,
         d_gate_ptr,
+        d_type_bias_ptr,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         max_seqlen: tl.constexpr,
@@ -691,6 +870,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         num_rbf: tl.constexpr,
         has_rbf: tl.constexpr,
         bias_mode: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
         diag_zero: tl.constexpr,
         input_precision: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -725,7 +906,7 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         dk = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
         dv = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
         subhead = head_idx % heads_per_frame
-        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf else 0.0
+        gate = tl.load(gate_ptr + subhead).to(tl.float32) if has_rbf and bias_mode != 4 else 0.0
         gate_factor = 1.0 + gate
         for block_m in range(0, tl.cdiv(max_seqlen, BLOCK_M)):
             m_start = block_m * BLOCK_M
@@ -774,7 +955,33 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         dist = tl.sqrt(dist2)
                         weight = tl.load(rbf_weight_ptr + subhead * num_rbf).to(tl.float32)
                         base_bias = weight * dist
-                    bias = base_bias * gate_factor
+                    elif bias_mode == 4:
+                        dist = tl.sqrt(dist2)
+                        x = dist / cutoff
+                        x = tl.minimum(tl.maximum(x, 0.0), 1.0)
+                        x2 = x * x
+                        x3 = x2 * x
+                        env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+                        env = tl.where(dist < cutoff, env, 0.0)
+                        gamma = tl.load(gamma_ptr).to(tl.float32)
+                        for rb in range(0, num_rbf):
+                            center = tl.load(centers_ptr + rb).to(tl.float32)
+                            weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+                            rho = tl.exp(-gamma * (dist - center) * (dist - center)) * env
+                            base_bias += weight * rho
+                        zi_atom = tl.load(atom_type_ptr + start + m, mask=m_mask, other=0)[:, None]
+                        zj_atom = tl.load(atom_type_ptr + start + n, mask=n_mask, other=0)[None, :]
+                        zi_atom = tl.minimum(tl.maximum(zi_atom, 0), max_atomic_number)
+                        zj_atom = tl.minimum(tl.maximum(zj_atom, 0), max_atomic_number)
+                        zdim = max_atomic_number + 1
+                        type_index = ((zi_atom * zdim + zj_atom) * heads_per_frame + subhead)
+                        type_term = tl.load(
+                            type_bias_ptr + type_index,
+                            mask=m_mask[:, None] & n_mask[None, :],
+                            other=0.0,
+                        ).to(tl.float32)
+                        base_bias += env * type_term
+                    bias = base_bias if bias_mode == 4 else base_bias * gate_factor
                     if diag_zero:
                         bias = tl.where(m[:, None] == n[None, :], 0.0, bias)
                     scores += bias
@@ -790,7 +997,8 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                         ds_bias = tl.where(m[:, None] == n[None, :], 0.0, ds)
                     else:
                         ds_bias = ds
-                    tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
+                    if bias_mode != 4:
+                        tl.atomic_add(d_gate_ptr + subhead, tl.sum(tl.sum(ds_bias * base_bias, axis=0), axis=0), sem="relaxed")
                     if bias_mode == 1:
                         for rb in range(0, num_rbf):
                             center = tl.load(centers_ptr + rb).to(tl.float32)
@@ -803,6 +1011,18 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
                     elif bias_mode == 3:
                         grad_w = tl.sum(tl.sum(ds_bias * dist * gate_factor, axis=0), axis=0)
                         tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf, grad_w, sem="relaxed")
+                    elif bias_mode == 4:
+                        for rb in range(0, num_rbf):
+                            center = tl.load(centers_ptr + rb).to(tl.float32)
+                            rho = tl.exp(-gamma * (dist - center) * (dist - center)) * env
+                            grad_w = tl.sum(tl.sum(ds_bias * rho, axis=0), axis=0)
+                            tl.atomic_add(d_rbf_weight_ptr + subhead * num_rbf + rb, grad_w, sem="relaxed")
+                        tl.atomic_add(
+                            d_type_bias_ptr + type_index,
+                            ds_bias * env,
+                            sem="relaxed",
+                            mask=m_mask[:, None] & n_mask[None, :],
+                        )
         tl.store(
             dk_ptr + ((start + n[:, None]) * num_heads + head_idx) * head_dim + offs_d[None, :],
             dk,
@@ -823,12 +1043,16 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         k: torch.Tensor,
         v: torch.Tensor,
         pos: torch.Tensor,
+        atom_types: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rbf_weight: torch.Tensor,
         gate: torch.Tensor,
+        type_bias: torch.Tensor,
         centers: torch.Tensor,
         gamma: torch.Tensor,
+        cutoff: float,
+        max_atomic_number: int,
         heads_per_frame: int,
         diag_zero: bool,
         precision: str,
@@ -848,11 +1072,14 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 v,
                 cu_seqlens=cu_seqlens,
                 pos=pos if has_rbf else None,
+                atom_types=atom_types if has_rbf else None,
                 heads_per_frame=heads_per_frame if has_rbf else None,
                 rbf_weight=rbf_weight if has_rbf else None,
                 gate=gate if has_rbf else None,
+                type_bias=type_bias if has_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
                 centers=centers if has_rbf else None,
                 gamma=gamma if has_rbf else None,
+                cutoff=cutoff if has_rbf else None,
                 radial_bias_kind=bias_mode,
                 diag_zero=diag_zero,
             )
@@ -860,9 +1087,11 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
         pos = pos.contiguous()
+        atom_types = atom_types.contiguous()
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
         rbf_weight = rbf_weight.contiguous()
         gate = gate.contiguous()
+        type_bias = type_bias.contiguous()
         centers = centers.contiguous()
         gamma = gamma.contiguous()
         total_tokens, num_heads, head_dim = q.shape
@@ -877,9 +1106,11 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             k,
             v,
             pos,
+            atom_types,
             cu,
             rbf_weight,
             gate,
+            type_bias,
             centers,
             gamma,
             out,
@@ -892,6 +1123,8 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             int(rbf_weight.shape[-1]) if has_rbf else 1,
             bool(has_rbf),
             int(bias_mode),
+            float(cutoff),
+            int(max_atomic_number),
             bool(diag_zero),
             input_precision,
             BLOCK_M=int(block_m),
@@ -899,8 +1132,10 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             BLOCK_D=block_d,
             num_warps=4,
         )
-        ctx.save_for_backward(q, k, v, pos, cu, out, lse, rbf_weight, gate, centers, gamma)
+        ctx.save_for_backward(q, k, v, pos, atom_types, cu, out, lse, rbf_weight, gate, type_bias, centers, gamma)
         ctx.heads_per_frame = int(heads_per_frame)
+        ctx.cutoff = float(cutoff)
+        ctx.max_atomic_number = int(max_atomic_number)
         ctx.diag_zero = bool(diag_zero)
         ctx.precision = input_precision
         ctx.bias_mode = int(bias_mode)
@@ -912,40 +1147,78 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q, k, v, pos, cu, out, lse, rbf_weight, gate, centers, gamma = ctx.saved_tensors
+        q, k, v, pos, atom_types, cu, out, lse, rbf_weight, gate, type_bias, centers, gamma = ctx.saved_tensors
         if not TRITON_PLATONIC_ATTENTION_AVAILABLE or not q.is_cuda:
             with torch.enable_grad():
                 q_ref = q.detach().requires_grad_(True)
                 k_ref = k.detach().requires_grad_(True)
                 v_ref = v.detach().requires_grad_(True)
                 weight_ref = rbf_weight.detach().requires_grad_(ctx.has_rbf)
-                gate_ref = gate.detach().requires_grad_(ctx.has_rbf)
+                is_rbf_type = ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
+                gate_ref = gate.detach().requires_grad_(ctx.has_rbf and not is_rbf_type)
+                type_ref = type_bias.detach().requires_grad_(ctx.has_rbf and is_rbf_type)
                 ref_out = platonic_attention_flat_torch_reference(
                     q_ref,
                     k_ref,
                     v_ref,
                     cu_seqlens=cu,
                     pos=pos if ctx.has_rbf else None,
+                    atom_types=atom_types if ctx.has_rbf else None,
                     heads_per_frame=ctx.heads_per_frame if ctx.has_rbf else None,
                     rbf_weight=weight_ref if ctx.has_rbf else None,
                     gate=gate_ref if ctx.has_rbf else None,
+                    type_bias=type_ref if ctx.has_rbf and is_rbf_type else None,
                     centers=centers if ctx.has_rbf else None,
                     gamma=gamma if ctx.has_rbf else None,
+                    cutoff=ctx.cutoff if ctx.has_rbf else None,
                     radial_bias_kind=ctx.bias_mode,
                     diag_zero=ctx.diag_zero,
                 )
+                grad_inputs = (
+                    (q_ref, k_ref, v_ref, weight_ref, type_ref)
+                    if ctx.has_rbf and is_rbf_type
+                    else (q_ref, k_ref, v_ref, weight_ref, gate_ref)
+                    if ctx.has_rbf
+                    else (q_ref, k_ref, v_ref)
+                )
                 grads = torch.autograd.grad(
                     ref_out,
-                    (q_ref, k_ref, v_ref, weight_ref, gate_ref) if ctx.has_rbf else (q_ref, k_ref, v_ref),
+                    grad_inputs,
                     dout,
                     allow_unused=True,
                 )
-            if ctx.has_rbf:
+            if ctx.has_rbf and is_rbf_type:
+                dq, dk, dv, dw, dt = grads
+                dg = None
+            elif ctx.has_rbf:
                 dq, dk, dv, dw, dg = grads
+                dt = None
             else:
                 dq, dk, dv = grads
-                dw = dg = None
-            return dq, dk, dv, None, None, None, dw, dg, None, None, None, None, None, None, None, None, None
+                dw = dg = dt = None
+            return (
+                dq,
+                dk,
+                dv,
+                None,
+                None,
+                None,
+                None,
+                dw,
+                dg,
+                dt,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         dout = dout.contiguous()
         dq = torch.empty_like(q)
@@ -953,6 +1226,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         dv = torch.empty_like(v)
         d_rbf_weight = torch.zeros_like(rbf_weight) if ctx.has_rbf else torch.zeros_like(rbf_weight)
         d_gate = torch.zeros_like(gate) if ctx.has_rbf else torch.zeros_like(gate)
+        d_type_bias = torch.zeros_like(type_bias) if ctx.has_rbf else torch.zeros_like(type_bias)
         block_d = platonic_attention_block_d_for_head_dim(q.shape[-1])
         delta_mode = os.environ.get("MATTERFORMER_PLATONIC_TRITON_DELTA", "triton_vector").lower()
         if delta_mode == "triton":
@@ -989,7 +1263,13 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
         if bwd_mode not in {"auto", "atomic", "split"}:
             bwd_mode = "auto"
         use_atomic_bwd = bwd_mode == "atomic" or (
-            bwd_mode == "auto" and ctx.has_rbf and ctx.bias_mode != PLATONIC_ATTENTION_BIAS_MODES["radial_rbf"]
+            bwd_mode == "auto"
+            and ctx.has_rbf
+            and ctx.bias_mode
+            not in {
+                PLATONIC_ATTENTION_BIAS_MODES["radial_rbf"],
+                PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
+            }
         )
         if use_atomic_bwd:
             dk.zero_()
@@ -1000,12 +1280,14 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 k,
                 v,
                 pos,
+                atom_types,
                 cu,
                 dout,
                 lse,
                 delta,
                 rbf_weight,
                 gate,
+                type_bias,
                 centers,
                 gamma,
                 dq,
@@ -1013,6 +1295,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 dv,
                 d_rbf_weight,
                 d_gate,
+                d_type_bias,
                 q.shape[1],
                 q.shape[2],
                 max_seqlen,
@@ -1021,6 +1304,8 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 int(rbf_weight.shape[-1]) if ctx.has_rbf else 1,
                 ctx.has_rbf,
                 ctx.bias_mode,
+                ctx.cutoff,
+                ctx.max_atomic_number,
                 ctx.diag_zero,
                 ctx.precision,
                 BLOCK_M=ctx.block_m,
@@ -1035,8 +1320,12 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
                 d_rbf_weight if ctx.has_rbf else None,
                 d_gate if ctx.has_rbf else None,
+                d_type_bias if ctx.has_rbf and ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1053,12 +1342,14 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             k,
             v,
             pos,
+            atom_types,
             cu,
             dout,
             lse,
             delta,
             rbf_weight,
             gate,
+            type_bias,
             centers,
             gamma,
             dq,
@@ -1070,6 +1361,8 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             int(rbf_weight.shape[-1]) if ctx.has_rbf else 1,
             ctx.has_rbf,
             ctx.bias_mode,
+            ctx.cutoff,
+            ctx.max_atomic_number,
             ctx.diag_zero,
             ctx.precision,
             BLOCK_M=ctx.block_m,
@@ -1083,18 +1376,21 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             k,
             v,
             pos,
+            atom_types,
             cu,
             dout,
             lse,
             delta,
             rbf_weight,
             gate,
+            type_bias,
             centers,
             gamma,
             dk,
             dv,
             d_rbf_weight,
             d_gate,
+            d_type_bias,
             q.shape[1],
             q.shape[2],
             max_seqlen,
@@ -1103,6 +1399,8 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             int(rbf_weight.shape[-1]) if ctx.has_rbf else 1,
             ctx.has_rbf,
             ctx.bias_mode,
+            ctx.cutoff,
+            ctx.max_atomic_number,
             ctx.diag_zero,
             ctx.precision,
             BLOCK_M=ctx.block_m,
@@ -1117,8 +1415,14 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             d_rbf_weight if ctx.has_rbf else None,
             d_gate if ctx.has_rbf else None,
+            d_type_bias if ctx.has_rbf and ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1140,11 +1444,15 @@ def platonic_attention_flat_triton(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
     pos: torch.Tensor | None = None,
+    atom_types: torch.Tensor | None = None,
     heads_per_frame: int | None = None,
     rbf_weight: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
+    type_bias: torch.Tensor | None = None,
     centers: torch.Tensor | None = None,
     gamma: torch.Tensor | None = None,
+    cutoff: float | None = None,
+    max_atomic_number: int | None = None,
     diag_zero: bool = True,
     radial_bias_kind: str | int | None = None,
     precision: str = "tf32",
@@ -1159,14 +1467,25 @@ def platonic_attention_flat_triton(
     flash_compat_bf16 = normalized_precision == "bf16_flash_compat"
     kernel_precision = _kernel_input_precision(normalized_precision)
     use_rbf = rbf_weight is not None
+    bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
+    use_rbf_type = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
     if use_rbf:
-        if pos is None or heads_per_frame is None or gate is None or centers is None or gamma is None:
-            raise ValueError("Platonic radial Triton attention requires pos, heads_per_frame, gate, centers, and gamma")
+        if pos is None or heads_per_frame is None or centers is None or gamma is None:
+            raise ValueError("Platonic radial Triton attention requires pos, heads_per_frame, centers, and gamma")
+        if not use_rbf_type and gate is None:
+            raise ValueError("Platonic legacy radial Triton attention requires gate")
+        if use_rbf_type:
+            if atom_types is None or type_bias is None or cutoff is None:
+                raise ValueError("Platonic RBF/type Triton attention requires atom_types, type_bias, and cutoff")
+            if atom_types.ndim != 1 or atom_types.shape[0] != q.shape[0]:
+                raise ValueError(f"atom_types must have shape [{q.shape[0]}], got {tuple(atom_types.shape)}")
+            if type_bias.ndim != 3 or type_bias.shape[-1] != int(heads_per_frame):
+                raise ValueError("type_bias must have shape [max_z + 1, max_z + 1, heads_per_frame]")
         if q.shape[1] % int(heads_per_frame) != 0:
             raise ValueError("heads_per_frame must divide num_heads for Platonic radial Triton attention")
         if rbf_weight.ndim != 2 or rbf_weight.shape[0] != int(heads_per_frame):
             raise ValueError("rbf_weight must have shape [heads_per_frame, num_basis]")
-        if gate.shape != (int(heads_per_frame),):
+        if gate is not None and gate.shape != (int(heads_per_frame),):
             raise ValueError("gate must have shape [heads_per_frame]")
         if pos.ndim != 2 or pos.shape != (q.shape[0], 3):
             raise ValueError(f"pos must have shape [{q.shape[0]}, 3], got {tuple(pos.shape)}")
@@ -1174,7 +1493,6 @@ def platonic_attention_flat_triton(
             raise ValueError("centers must be a 1D tensor")
         if centers.numel() != rbf_weight.shape[1]:
             raise ValueError("centers length must match rbf_weight.shape[1]")
-    bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
     if strict and q.is_cuda and not TRITON_PLATONIC_ATTENTION_AVAILABLE:
         raise RuntimeError("attention_backend='triton' requested, but Triton is not available")
     if not q.is_cuda or not TRITON_PLATONIC_ATTENTION_AVAILABLE:
@@ -1185,11 +1503,14 @@ def platonic_attention_flat_triton(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             pos=pos if use_rbf else None,
+            atom_types=atom_types if use_rbf_type else None,
             heads_per_frame=heads_per_frame if use_rbf else None,
             rbf_weight=rbf_weight,
             gate=gate,
+            type_bias=type_bias if use_rbf_type else None,
             centers=centers,
             gamma=gamma,
+            cutoff=cutoff if use_rbf_type else None,
             radial_bias_kind=bias_mode,
             diag_zero=diag_zero,
         )
@@ -1199,21 +1520,33 @@ def platonic_attention_flat_triton(
     orig_dtype = q.dtype
     dummy_weight = rbf_weight if rbf_weight is not None else torch.empty((1, 1), device=q.device, dtype=torch.float32)
     dummy_gate = gate if gate is not None else torch.empty((1,), device=q.device, dtype=torch.float32)
+    dummy_type_bias = type_bias if type_bias is not None else torch.empty((1, 1, 1), device=q.device, dtype=torch.float32)
     dummy_centers = centers if centers is not None else torch.empty((1,), device=q.device, dtype=torch.float32)
     dummy_gamma = gamma if gamma is not None else torch.ones((), device=q.device, dtype=torch.float32)
     dummy_pos = pos if pos is not None else torch.empty((q.shape[0], 3), device=q.device, dtype=torch.float32)
-    if q.requires_grad or k.requires_grad or v.requires_grad or (rbf_weight is not None and rbf_weight.requires_grad):
+    dummy_atom_types = atom_types if atom_types is not None else torch.empty((q.shape[0],), device=q.device, dtype=torch.int64)
+    if (
+        q.requires_grad
+        or k.requires_grad
+        or v.requires_grad
+        or (rbf_weight is not None and rbf_weight.requires_grad)
+        or (type_bias is not None and type_bias.requires_grad)
+    ):
         out = _PlatonicFlatAttentionFunction.apply(
             q_apply,
             k_apply,
             v_apply,
             dummy_pos,
+            dummy_atom_types,
             cu_seqlens,
             int(max_seqlen),
             dummy_weight,
             dummy_gate,
+            dummy_type_bias,
             dummy_centers,
             dummy_gamma,
+            float(cutoff or 1.0),
+            int(max_atomic_number if max_atomic_number is not None else (dummy_type_bias.shape[0] - 1)),
             int(heads_per_frame or q.shape[1]),
             bool(diag_zero),
             kernel_precision,
@@ -1228,12 +1561,16 @@ def platonic_attention_flat_triton(
         k_apply,
         v_apply,
         dummy_pos,
+        dummy_atom_types,
         cu_seqlens,
         int(max_seqlen),
         dummy_weight,
         dummy_gate,
+        dummy_type_bias,
         dummy_centers,
         dummy_gamma,
+        float(cutoff or 1.0),
+        int(max_atomic_number if max_atomic_number is not None else (dummy_type_bias.shape[0] - 1)),
         int(heads_per_frame or q.shape[1]),
         bool(diag_zero),
         kernel_precision,
