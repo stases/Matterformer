@@ -20,7 +20,13 @@ def _build_cu_seqlens(total_tokens: int, segment_len: int, device: torch.device)
     return cu, max(lengths) if lengths else 0
 
 
-def _make_attention(args: argparse.Namespace, *, rope_cache: bool, constant_key_fastpath: bool) -> PlatonicAttention:
+def _make_attention(
+    args: argparse.Namespace,
+    *,
+    rope_cache: bool,
+    constant_key_fastpath: bool,
+    fused_qv: bool = False,
+) -> PlatonicAttention:
     return PlatonicAttention(
         d_model=args.d_model,
         num_heads=args.num_heads,
@@ -35,6 +41,7 @@ def _make_attention(args: argparse.Namespace, *, rope_cache: bool, constant_key_
         linear_backend=args.linear_backend,
         rope_cache=rope_cache,
         constant_key_fastpath=constant_key_fastpath,
+        fused_qv=fused_qv,
     )
 
 
@@ -114,8 +121,17 @@ def main() -> None:
     recompute = _make_attention(args, rope_cache=False, constant_key_fastpath=False).to(device)
     cached = _make_attention(args, rope_cache=True, constant_key_fastpath=True).to(device)
     cached.load_state_dict(recompute.state_dict())
+    fused = None
+    if not args.use_key:
+        fused = _make_attention(args, rope_cache=True, constant_key_fastpath=True, fused_qv=True).to(device)
+        fused.load_state_dict(cached.state_dict(), strict=False)
+        if cached.q_proj is None or cached.v_proj is None:
+            raise RuntimeError("Cached reference attention unexpectedly has no separate q/v projections")
+        fused.set_fused_qv_from_separate_(cached.q_proj, cached.v_proj)
     recompute.eval()
     cached.eval()
+    if fused is not None:
+        fused.eval()
 
     x = torch.randn(args.total_tokens, args.d_model, device=device)
     pos = torch.randn(args.total_tokens, 3, device=device)
@@ -127,13 +143,23 @@ def main() -> None:
     def cached_fn(inp: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
         return cached.forward_flat(inp, pos=xyz, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
+    def fused_fn(inp: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+        if fused is None:
+            raise RuntimeError("fused_qv benchmark is unavailable when use_key=True")
+        return fused.forward_flat(inp, pos=xyz, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
     timed_recompute_fn = torch.compile(recompute_fn, mode="default") if args.compile else recompute_fn
     timed_cached_fn = torch.compile(cached_fn, mode="default") if args.compile else cached_fn
+    timed_fused_fn = torch.compile(fused_fn, mode="default") if args.compile and fused is not None else fused_fn
 
     with torch.no_grad():
         y_recompute = timed_recompute_fn(x, pos)
         y_cached = timed_cached_fn(x, pos)
-        max_error = (y_recompute - y_cached).abs().max().item()
+        cache_max_error = (y_recompute - y_cached).abs().max().item()
+        fused_max_error = float("nan")
+        if fused is not None:
+            y_fused = timed_fused_fn(x, pos)
+            fused_max_error = (y_cached - y_fused).abs().max().item()
 
     print(
         "torch",
@@ -162,8 +188,10 @@ def main() -> None:
         args.total_tokens,
         "segment_len",
         args.segment_len,
-        "max_error",
-        f"{max_error:.3e}",
+        "cache_max_error",
+        f"{cache_max_error:.3e}",
+        "fused_max_error",
+        f"{fused_max_error:.3e}",
     )
 
     if args.mode in {"forward", "both"}:
@@ -185,6 +213,21 @@ def main() -> None:
         )
         speedup = recompute_ms / cached_ms if cached_ms > 0 else float("inf")
         print(f"mode=forward recompute={recompute_ms:.3f}ms cached={cached_ms:.3f}ms speedup={speedup:.3f}x")
+        if fused is not None:
+            fused_ms = _time_forward(
+                timed_fused_fn,
+                fused,
+                x,
+                pos,
+                warmup=args.warmup,
+                repeats=args.repeats,
+            )
+            cache_to_fused = cached_ms / fused_ms if fused_ms > 0 else float("inf")
+            recompute_to_fused = recompute_ms / fused_ms if fused_ms > 0 else float("inf")
+            print(
+                f"mode=forward cached={cached_ms:.3f}ms fused_qv={fused_ms:.3f}ms "
+                f"cache_to_fused={cache_to_fused:.3f}x recompute_to_fused={recompute_to_fused:.3f}x"
+            )
 
     if args.mode in {"backward", "both"}:
         recompute_ms = _time_forward_backward(
@@ -205,6 +248,21 @@ def main() -> None:
         )
         speedup = recompute_ms / cached_ms if cached_ms > 0 else float("inf")
         print(f"mode=fwd_bwd recompute={recompute_ms:.3f}ms cached={cached_ms:.3f}ms speedup={speedup:.3f}x")
+        if fused is not None:
+            fused_ms = _time_forward_backward(
+                timed_fused_fn,
+                fused,
+                x,
+                pos,
+                warmup=args.warmup,
+                repeats=args.repeats,
+            )
+            cache_to_fused = cached_ms / fused_ms if fused_ms > 0 else float("inf")
+            recompute_to_fused = recompute_ms / fused_ms if fused_ms > 0 else float("inf")
+            print(
+                f"mode=fwd_bwd cached={cached_ms:.3f}ms fused_qv={fused_ms:.3f}ms "
+                f"cache_to_fused={cache_to_fused:.3f}x recompute_to_fused={recompute_to_fused:.3f}x"
+            )
 
 
 if __name__ == "__main__":

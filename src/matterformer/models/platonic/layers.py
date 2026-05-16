@@ -17,6 +17,13 @@ except (ImportError, OSError):
     flash_attn_varlen_func = None
 
 
+TRITON_RADIAL_BACKENDS = {
+    "triton_radial_rbf": "radial_rbf",
+    "triton_radial_r2": "radial_r2",
+    "triton_radial_slope": "radial_slope",
+}
+
+
 class GroupLayerNorm(nn.Module):
     def __init__(self, group_order: int, channels_per_group: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -49,6 +56,7 @@ class PlatonicAttention(nn.Module):
         linear_backend: str = "spatial",
         rope_cache: bool = True,
         constant_key_fastpath: bool = True,
+        fused_qv: bool = False,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -72,13 +80,23 @@ class PlatonicAttention(nn.Module):
         self.rope_on_values = bool(rope_on_values)
         self.rope_cache = bool(rope_cache)
         self.constant_key_fastpath = bool(constant_key_fastpath)
+        self.fused_qv = bool(fused_qv)
+        if self.fused_qv and self.use_key:
+            raise ValueError("fused_qv=True is only supported when use_key=False")
         self.attention_backend = str(attention_backend).lower()
         if self.attention_backend == "default":
             self.attention_backend = "sdpa"
-        if self.attention_backend not in {"sdpa", "flash", "triton", "triton_radial_rbf"}:
-            raise ValueError("attention_backend must be one of {'sdpa', 'flash', 'triton', 'triton_radial_rbf'}")
-        self.q_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
-        self.v_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
+        if self.attention_backend not in {"sdpa", "flash", "triton", *TRITON_RADIAL_BACKENDS}:
+            allowed = sorted({"sdpa", "flash", "triton", *TRITON_RADIAL_BACKENDS})
+            raise ValueError(f"attention_backend must be one of {allowed}")
+        if self.fused_qv:
+            self.qv_proj = PlatonicLinear(self.d_model, 2 * self.d_model, solid=solid_name, linear_backend=linear_backend)
+            self.q_proj = None
+            self.v_proj = None
+        else:
+            self.qv_proj = None
+            self.q_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
+            self.v_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
         self.k_proj = (
             PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
             if self.use_key
@@ -92,18 +110,35 @@ class PlatonicAttention(nn.Module):
         self.triton_precision = str(self.attention_bias_config.get("precision", "tf32"))
         self.rbf_weight: nn.Parameter | None
         self.rbf_gate: nn.Parameter | None
-        if self.attention_backend == "triton_radial_rbf":
-            bias_kind = str(self.attention_bias_config.get("kind", "radial_rbf")).lower().replace("-", "_")
-            if bias_kind != "radial_rbf":
-                raise ValueError("attention_backend='triton_radial_rbf' requires attention_bias.kind='radial_rbf'")
-            num_rbf = int(self.attention_bias_config.get("num_rbf", 8))
+        self.radial_bias_kind: str | None
+        if self.attention_backend in TRITON_RADIAL_BACKENDS:
+            default_bias_kind = TRITON_RADIAL_BACKENDS[self.attention_backend]
+            bias_kind = str(self.attention_bias_config.get("kind", default_bias_kind)).lower().replace("-", "_")
+            if bias_kind in {"rbf", "radial"}:
+                bias_kind = "radial_rbf"
+            elif bias_kind in {"r2", "radial_square", "radial_squared"}:
+                bias_kind = "radial_r2"
+            elif bias_kind in {"slope", "radial_linear"}:
+                bias_kind = "radial_slope"
+            if bias_kind != default_bias_kind:
+                raise ValueError(
+                    f"attention_backend={self.attention_backend!r} requires attention_bias.kind={default_bias_kind!r}"
+                )
+            self.radial_bias_kind = bias_kind
+            num_rbf = int(self.attention_bias_config.get("num_rbf", 8 if bias_kind == "radial_rbf" else 1))
             if num_rbf <= 0:
-                raise ValueError("attention_bias.num_rbf must be positive")
-            rbf_min = float(self.attention_bias_config.get("rbf_min", 0.0))
-            rbf_max = float(self.attention_bias_config.get("rbf_max", 6.0))
-            centers = torch.linspace(rbf_min, rbf_max, num_rbf)
-            delta = (rbf_max - rbf_min) / max(num_rbf - 1, 1)
-            gamma = torch.tensor(1.0 / max(delta * delta, 1.0e-6), dtype=torch.float32)
+                raise ValueError("attention_bias.num_rbf/num_basis must be positive")
+            if bias_kind == "radial_rbf":
+                rbf_min = float(self.attention_bias_config.get("rbf_min", 0.0))
+                rbf_max = float(self.attention_bias_config.get("rbf_max", 6.0))
+                centers = torch.linspace(rbf_min, rbf_max, num_rbf)
+                delta = (rbf_max - rbf_min) / max(num_rbf - 1, 1)
+                gamma = torch.tensor(1.0 / max(delta * delta, 1.0e-6), dtype=torch.float32)
+            else:
+                if num_rbf != 1:
+                    raise ValueError(f"{bias_kind} uses a single coefficient; set attention_bias.num_rbf=1 or omit it")
+                centers = torch.zeros(1, dtype=torch.float32)
+                gamma = torch.ones((), dtype=torch.float32)
             self.register_buffer("rbf_centers", centers, persistent=True)
             self.register_buffer("rbf_gamma", gamma, persistent=True)
             zero_init = bool(self.attention_bias_config.get("zero_init", True))
@@ -115,6 +150,7 @@ class PlatonicAttention(nn.Module):
             )
             self.rbf_diag_zero = bool(self.attention_bias_config.get("diag_zero", True))
         else:
+            self.radial_bias_kind = None
             self.rbf_weight = None
             self.rbf_gate = None
             self.register_buffer("rbf_centers", torch.empty(0), persistent=False)
@@ -133,13 +169,57 @@ class PlatonicAttention(nn.Module):
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.group_order, self.heads_per_frame, self.head_dim)
 
+    def _project_qv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.qv_proj is not None:
+            qv = self.qv_proj(x).view(
+                *x.shape[:-1],
+                self.group_order,
+                2,
+                self.heads_per_frame,
+                self.head_dim,
+            )
+            q, v = qv.unbind(dim=-3)
+            return q, v
+        if self.q_proj is None or self.v_proj is None:
+            raise RuntimeError("Separate q/v projections are not configured")
+        return self._split(self.q_proj(x)), self._split(self.v_proj(x))
+
+    @torch.no_grad()
+    def set_fused_qv_from_separate_(self, q_proj: PlatonicLinear, v_proj: PlatonicLinear) -> None:
+        """Initialize a fused q/v projection from equivalent separate projections."""
+        if self.qv_proj is None:
+            raise RuntimeError("set_fused_qv_from_separate_ requires fused_qv=True")
+        if q_proj.linear_backend != v_proj.linear_backend or q_proj.linear_backend != self.qv_proj.linear_backend:
+            raise ValueError("q, v, and qv projections must use the same linear backend")
+        if q_proj.in_channels != self.qv_proj.in_channels or v_proj.in_channels != self.qv_proj.in_channels:
+            raise ValueError("q, v, and qv projections must have matching input channels")
+        if q_proj.out_channels + v_proj.out_channels != self.qv_proj.out_channels:
+            raise ValueError("qv output channels must equal q output channels plus v output channels")
+
+        if self.qv_proj.linear_backend == "fourier_direct":
+            self.qv_proj.w1.copy_(torch.cat([q_proj.w1, v_proj.w1], dim=0))
+            self.qv_proj.w2_re.copy_(torch.cat([q_proj.w2_re, v_proj.w2_re], dim=0))
+            self.qv_proj.w2_im.copy_(torch.cat([q_proj.w2_im, v_proj.w2_im], dim=0))
+            q_w3 = q_proj.w3.view(3, q_proj.out_channels, 3 * q_proj.in_channels)
+            v_w3 = v_proj.w3.view(3, v_proj.out_channels, 3 * v_proj.in_channels)
+            qv_w3 = torch.cat([q_w3, v_w3], dim=1).reshape(3 * self.qv_proj.out_channels, 3 * self.qv_proj.in_channels)
+            self.qv_proj.w3.copy_(qv_w3)
+        else:
+            if q_proj.kernel is None or v_proj.kernel is None or self.qv_proj.kernel is None:
+                raise RuntimeError("Spatial-kernel projections are not configured")
+            self.qv_proj.kernel.copy_(torch.cat([q_proj.kernel, v_proj.kernel], dim=1))
+
+        if self.qv_proj.bias is not None:
+            if q_proj.bias is None or v_proj.bias is None:
+                raise ValueError("Cannot initialize fused qv bias from bias-free q/v projections")
+            self.qv_proj.bias.copy_(torch.cat([q_proj.bias, v_proj.bias], dim=0))
+
     def _project_qkv_with_rope(
         self,
         x: torch.Tensor,
         pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        q = self._split(self.q_proj(x))
-        v = self._split(self.v_proj(x))
+        q, v = self._project_qv(x)
         if not self.rope_cache:
             k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
             q = self.rope(q, pos)
@@ -331,9 +411,9 @@ class PlatonicAttention(nn.Module):
         dropout_p = self.dropout if self.training else 0.0
         if dropout_p != 0.0:
             raise ValueError("Platonic Triton flat attention currently requires dropout=0")
-        if self.attention_backend == "triton_radial_rbf":
+        if self.attention_backend in TRITON_RADIAL_BACKENDS:
             if self.rbf_weight is None or self.rbf_gate is None:
-                raise RuntimeError("triton_radial_rbf backend was initialized without radial RBF parameters")
+                raise RuntimeError(f"{self.attention_backend} backend was initialized without radial parameters")
             return platonic_attention_flat_triton(
                 q,
                 k,
@@ -347,6 +427,7 @@ class PlatonicAttention(nn.Module):
                 centers=self.rbf_centers,
                 gamma=self.rbf_gamma,
                 diag_zero=self.rbf_diag_zero,
+                radial_bias_kind=self.radial_bias_kind,
                 precision=self.triton_precision,
                 block_m=self.triton_block_m,
                 block_n=self.triton_block_n,
@@ -376,7 +457,7 @@ class PlatonicAttention(nn.Module):
         q = q.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        if self.attention_backend in {"triton", "triton_radial_rbf"}:
+        if self.attention_backend in {"triton", *TRITON_RADIAL_BACKENDS}:
             raise ValueError(
                 "Platonic Triton attention is implemented for forward_flat only; "
                 "use omol_runtime_mode='internal_flat_tetra' or switch attention_backend to 'flash'/'sdpa'."
@@ -410,7 +491,7 @@ class PlatonicAttention(nn.Module):
         v = v.reshape(num_tokens, self.num_heads, self.head_dim)
         if self.attention_backend == "flash":
             out = self._flash_attention_flat(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen))
-        elif self.attention_backend in {"triton", "triton_radial_rbf"}:
+        elif self.attention_backend in {"triton", *TRITON_RADIAL_BACKENDS}:
             out = self._triton_attention_flat(q, k, v, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen))
         else:
             out = self._sdpa_attention_flat(q, k, v, cu_seqlens)
@@ -443,6 +524,7 @@ class PlatonicBlock(nn.Module):
         ffn_linear_backend: str | None = None,
         rope_cache: bool = True,
         constant_key_fastpath: bool = True,
+        fused_qv: bool = False,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -470,6 +552,7 @@ class PlatonicBlock(nn.Module):
             linear_backend=attn_linear_backend,
             rope_cache=rope_cache,
             constant_key_fastpath=constant_key_fastpath,
+            fused_qv=fused_qv,
         )
         self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name, linear_backend=mlp_linear_backend)
         self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name, linear_backend=mlp_linear_backend)

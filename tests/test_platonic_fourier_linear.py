@@ -99,6 +99,58 @@ def test_platonic_attention_flat_rope_cache_matches_recompute():
     torch.testing.assert_close(y_cached, y_recompute, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("linear_backend", ["spatial", "fourier", "fourier_direct"])
+def test_platonic_attention_fused_qv_matches_separate_forward_backward(linear_backend: str):
+    torch.manual_seed(23)
+    kwargs = dict(
+        d_model=12 * 4,
+        num_heads=12,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        rope_sigma=0.9,
+        learned_freqs=True,
+        freq_init="random",
+        use_key=False,
+        rope_on_values=True,
+        attention_backend="sdpa",
+        linear_backend=linear_backend,
+        rope_cache=True,
+        constant_key_fastpath=True,
+    )
+    separate = PlatonicAttention(**kwargs, fused_qv=False)
+    fused = PlatonicAttention(**kwargs, fused_qv=True)
+    fused.load_state_dict(separate.state_dict(), strict=False)
+    assert separate.q_proj is not None
+    assert separate.v_proj is not None
+    fused.set_fused_qv_from_separate_(separate.q_proj, separate.v_proj)
+
+    x0 = torch.randn(2, 5, 12 * 4)
+    pos = torch.randn(2, 5, 3)
+    pad_mask = torch.tensor([[False, False, False, True, True], [False, False, False, False, True]])
+    x_separate = x0.clone().requires_grad_(True)
+    x_fused = x0.clone().requires_grad_(True)
+    y_separate = separate(x_separate, pos=pos, pad_mask=pad_mask)
+    y_fused = fused(x_fused, pos=pos, pad_mask=pad_mask)
+    torch.testing.assert_close(y_fused, y_separate, atol=3e-5, rtol=3e-5)
+
+    loss_separate = y_separate.square().mean() + 0.01 * y_separate.sum()
+    loss_fused = y_fused.square().mean() + 0.01 * y_fused.sum()
+    loss_separate.backward()
+    loss_fused.backward()
+    torch.testing.assert_close(x_fused.grad, x_separate.grad, atol=5e-5, rtol=5e-5)
+
+
+def test_platonic_attention_fused_qv_requires_constant_keys():
+    with pytest.raises(ValueError, match="fused_qv=True"):
+        PlatonicAttention(
+            d_model=12 * 4,
+            num_heads=12,
+            solid_name="tetrahedron",
+            use_key=True,
+            fused_qv=True,
+        )
+
+
 def test_fourier_platonic_linear_matches_spatial_tetra_forward_backward():
     torch.manual_seed(0)
     spatial = PlatonicLinear(12 * 4, 12 * 7, solid="tetrahedron", linear_backend="spatial")
@@ -257,6 +309,20 @@ def test_platonic_block_can_split_attention_and_ffn_linear_backends():
     assert block.linear2.linear_backend == "fourier_direct"
 
 
+def test_platonic_block_fused_qv_wiring():
+    block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        fused_qv=True,
+    )
+    assert block.attn.qv_proj is not None
+    assert block.attn.q_proj is None
+    assert block.attn.v_proj is None
+
+
 def test_omol_tetra_fourier_linear_backend_forward_backward():
     torch.manual_seed(4)
     dataset = SyntheticOMolDataset(num_samples=2, seed=7, min_atoms=3, max_atoms=4)
@@ -277,6 +343,7 @@ def test_omol_tetra_fourier_linear_backend_forward_backward():
             "rope_on_values": True,
             "ffn_mult": 2,
             "linear_backend": "fourier",
+            "fused_qv": True,
         },
         "readout": {"kind": "platonic_ffn"},
     }

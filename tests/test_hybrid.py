@@ -169,6 +169,41 @@ def test_platonic_radial_rbf_zero_init_is_noop_and_weight_gets_grad():
     assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
 
 
+@pytest.mark.parametrize("radial_bias_kind", ["radial_r2", "radial_slope"])
+def test_platonic_cheap_radial_zero_init_is_noop_and_weight_gets_grad(radial_bias_kind):
+    torch.manual_seed(109)
+    q = torch.randn(6, 4, 4, requires_grad=True)
+    k = torch.randn(6, 4, 4, requires_grad=True)
+    v = torch.randn(6, 4, 4, requires_grad=True)
+    pos = torch.randn(6, 3)
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    centers = torch.zeros(1)
+    gamma = torch.tensor(1.0)
+    rbf_weight = torch.zeros(2, 1, requires_grad=True)
+    gate = torch.zeros(2, requires_grad=True)
+
+    unbiased = platonic_attention_flat_torch_reference(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=3)
+    biased = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=rbf_weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+        radial_bias_kind=radial_bias_kind,
+        diag_zero=True,
+    )
+    torch.testing.assert_close(biased, unbiased, atol=1e-7, rtol=1e-7)
+    biased.square().sum().backward()
+    assert rbf_weight.grad is not None
+    assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
+
+
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
     torch.manual_seed(103)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -376,6 +411,92 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
     torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+@pytest.mark.parametrize("radial_bias_kind", ["radial_r2", "radial_slope"])
+def test_platonic_flat_triton_cheap_radial_cuda_matches_reference_forward_backward(radial_bias_kind):
+    torch.manual_seed(110)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    pos = torch.randn(6, 3, device=device)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+    centers = torch.zeros(1, device=device)
+    gamma = torch.ones((), device=device)
+    weight = (torch.randn(2, 1, device=device) * 0.01).requires_grad_(True)
+    gate = torch.zeros(2, device=device, requires_grad=True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    gate_ref = gate.detach().clone().requires_grad_(True)
+
+    out = platonic_attention_flat_triton(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=weight,
+        gate=gate,
+        centers=centers,
+        gamma=gamma,
+        radial_bias_kind=radial_bias_kind,
+        strict=True,
+        precision="tf32x3",
+    )
+    ref = platonic_attention_flat_torch_reference(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos,
+        heads_per_frame=2,
+        rbf_weight=weight_ref,
+        gate=gate_ref,
+        centers=centers,
+        gamma=gamma,
+        radial_bias_kind=radial_bias_kind,
+    )
+    torch.testing.assert_close(out, ref, atol=5e-5, rtol=5e-5)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+def test_platonic_flat_triton_bf16_flash_compat_runs_with_fp32_output():
+    torch.manual_seed(111)
+    device = torch.device("cuda")
+    q = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(6, 4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    cu_seqlens = torch.tensor([0, 2, 6], device=device, dtype=torch.int32)
+    out = platonic_attention_flat_triton(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        strict=True,
+        precision="bf16_flash_compat",
+    )
+    assert out.dtype == torch.float32
+    assert out.shape == q.shape
+    out.square().mean().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")

@@ -183,6 +183,7 @@ class HybridConfig:
             "ffn_linear_backend": None,
             "rope_cache": True,
             "constant_key_fastpath": True,
+            "fused_qv": False,
             **dict(cfg.tetra),
         }
         cfg.trivial = {
@@ -1847,6 +1848,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
             ffn_linear_backend=str(ffn_linear_backend) if ffn_linear_backend is not None else None,
             rope_cache=bool(config.get("rope_cache", True)),
             constant_key_fastpath=bool(config.get("constant_key_fastpath", True)),
+            fused_qv=bool(config.get("fused_qv", False)),
         )
 
     @staticmethod

@@ -173,6 +173,7 @@ def main(args: argparse.Namespace) -> None:
     train_loader = build_loader(
         train_dataset,
         batch_size=args.batch_size,
+        max_graphs_per_batch=args.max_graphs_per_batch,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
@@ -180,6 +181,9 @@ def main(args: argparse.Namespace) -> None:
         max_edges=args.max_edges_per_batch,
         seed=args.seed,
         prefetch_factor=args.prefetch_factor,
+        batching_mode=args.batching_mode,
+        bucket_window_size=args.bucket_window_size,
+        bucket_shuffle_groups=args.bucket_shuffle_groups,
     )
     element_refs = load_omol_element_references(args.element_refs_json).to(device)
     criterion = OMolDirectForceLoss(
@@ -204,6 +208,8 @@ def main(args: argparse.Namespace) -> None:
         pair_n_rbf=args.pair_n_rbf,
         pair_rbf_max=args.pair_rbf_max,
         force_head_mode=args.force_head_mode,
+        readout_head_mode=args.readout_head_mode,
+        readout_activation=args.readout_activation,
     ).to(device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -321,8 +327,12 @@ if __name__ == "__main__":
     parser.add_argument("--element-refs-json", type=str, default="configs/omol/element_refs.json")
     parser.add_argument("--hybrid-config-json", type=str, default="configs/omol/scalar_is_triton_d768_l19.json")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-graphs-per-batch", type=int, default=None)
     parser.add_argument("--max-atoms-per-batch", type=int, default=None)
     parser.add_argument("--max-edges-per-batch", type=int, default=None)
+    parser.add_argument("--batching-mode", type=str, default="random", choices=["random", "bucket"])
+    parser.add_argument("--bucket-window-size", type=int, default=4096)
+    parser.add_argument("--bucket-shuffle-groups", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
@@ -353,6 +363,8 @@ if __name__ == "__main__":
         default="direct",
         choices=["auto", "pairwise", "direct", "direct_3d", "non_equivariant", "tetra_vector"],
     )
+    parser.add_argument("--readout-head-mode", type=str, default="dense", choices=["dense", "platonic"])
+    parser.add_argument("--readout-activation", type=str, default=None, choices=["gelu", "silu", "relu", "mish", "sin"])
     parser.add_argument("--train-augmentation", type=str, default="o3", choices=["off", "so3", "o3"])
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--float32-matmul-precision", type=str, default="highest")
