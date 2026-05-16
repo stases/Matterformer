@@ -761,7 +761,30 @@ def main(args: argparse.Namespace) -> None:
     close_dataset_handles(test_dataset)
     ema = EMA(model, args.ema_decay) if args.ema_decay > 0.0 else None
     if args.compile and args.model_backend == "matterformer":
-        model = torch.compile(model, mode=args.compile_mode)  # type: ignore[assignment]
+        if args.compile_scope == "model":
+            model = torch.compile(model, mode=args.compile_mode)  # type: ignore[assignment]
+        elif args.compile_scope == "trunk_flat":
+            base_model = unwrap_model(model)
+            if args.omol_runtime_mode == "internal_flat_tetra":
+                base_model.trunk.forward_flat_tetra = torch.compile(  # type: ignore[method-assign]
+                    base_model.trunk.forward_flat_tetra,
+                    mode=args.compile_mode,
+                )
+            elif args.omol_runtime_mode == "internal_flat_hybrid":
+                base_model.trunk.forward_flat_hybrid = torch.compile(  # type: ignore[method-assign]
+                    base_model.trunk.forward_flat_hybrid,
+                    mode=args.compile_mode,
+                )
+            else:
+                base_model.trunk.forward = torch.compile(  # type: ignore[method-assign]
+                    base_model.trunk.forward,
+                    mode=args.compile_mode,
+                )
+            print(f"compile: compiled Matterformer trunk only scope={args.compile_scope} mode={args.compile_mode}")
+        elif args.compile_scope == "none":
+            print("compile: disabled by --compile-scope none")
+        else:
+            raise ValueError(f"Unknown --compile-scope {args.compile_scope!r}")
     elif args.compile:
         print("compile: AllScAIP backend skips the outer torch.compile wrapper; use --allscaip-compile to control its internal compile path")
 
@@ -1236,6 +1259,16 @@ if __name__ == "__main__":
     parser.add_argument("--float32-matmul-precision", type=str, default="highest")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-mode", type=str, default="default")
+    parser.add_argument(
+        "--compile-scope",
+        type=str,
+        default="model",
+        choices=["model", "trunk_flat", "none"],
+        help=(
+            "Matterformer torch.compile target. 'model' compiles the whole OMol wrapper; "
+            "'trunk_flat' compiles only the flat trunk path and leaves dynamic padding/scatter eager."
+        ),
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
     parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)

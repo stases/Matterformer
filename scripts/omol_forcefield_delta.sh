@@ -93,6 +93,7 @@ BF16="${BF16:-0}"
 FLOAT32_MATMUL_PRECISION="${FLOAT32_MATMUL_PRECISION:-highest}"
 COMPILE="${COMPILE:-0}"
 COMPILE_MODE="${COMPILE_MODE:-default}"
+COMPILE_SCOPE="${COMPILE_SCOPE:-model}"
 
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-10}"
 FLOPS_COEF="${FLOPS_COEF:-72.0}"
@@ -307,6 +308,7 @@ echo "bf16:                    $BF16"
 echo "float32_matmul_prec:     $FLOAT32_MATMUL_PRECISION"
 echo "compile:                 $COMPILE"
 echo "compile_mode:            $COMPILE_MODE"
+echo "compile_scope:           $COMPILE_SCOPE"
 echo "grad_clip_norm:          $GRAD_CLIP_NORM"
 echo "skip_loss_above:         $SKIP_LOSS_ABOVE"
 echo "ema_decay:               $EMA_DECAY"
@@ -388,6 +390,7 @@ echo "============================================================"
   --ema-warmup-steps "$EMA_WARMUP_STEPS" \
   --float32-matmul-precision "$FLOAT32_MATMUL_PRECISION" \
   --compile-mode "$COMPILE_MODE" \
+  --compile-scope "$COMPILE_SCOPE" \
   --log-every-steps "$LOG_EVERY_STEPS" \
   --flops-coef "$FLOPS_COEF" \
   --profile-steps "$PROFILE_STEPS" \
