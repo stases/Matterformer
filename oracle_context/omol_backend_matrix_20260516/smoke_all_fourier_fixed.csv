@@ -1,0 +1,2 @@
+status,attention_mode,linear_mode,compile_scope,precision_mode,forward_ms,fwd_bwd_ms,max_mem_gb,energy_max_abs,force_max_abs,error
+ok,flash,all_fourier_direct,none,fp32_high,27.372821990866214,134.8614160087891,1.365875244140625,0.003010094165802002,2.093513830914162e-05,

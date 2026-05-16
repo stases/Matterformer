@@ -1,0 +1,117 @@
+{
+  "args": {
+    "attention_modes": [
+      "flash",
+      "triton_tf32x3"
+    ],
+    "chgspin_emb_dim": 160,
+    "chgspin_mode": "add",
+    "compile_scopes": [
+      "none"
+    ],
+    "d_model": 1920,
+    "hybrid_config_json": "configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale.json",
+    "linear_modes": [
+      "spatial_recompute",
+      "ffn_fourier_direct"
+    ],
+    "max_atoms_per_graph": 80,
+    "mlp_ratio": 2.0,
+    "n_heads": 60,
+    "n_layers": 16,
+    "num_graphs": 20,
+    "output_prefix": "oracle_context/omol_backend_matrix_20260516/smoke",
+    "pair_hidden_dim": 128,
+    "pair_n_rbf": 16,
+    "pair_rbf_max": 6.0,
+    "precision_modes": [
+      "fp32_high"
+    ],
+    "readout_activation": "sin",
+    "repeats": 1,
+    "stop_after": 4,
+    "total_atoms": 512,
+    "warmup": 0
+  },
+  "batch": {
+    "atoms": 512.0,
+    "graphs": 20.0,
+    "max_atoms": 80.0,
+    "padded_slots": 1600.0,
+    "sum_n2": 27490.0
+  },
+  "created": "2026-05-16T09:04:36+0200",
+  "cuda": "12.4",
+  "gpu": "NVIDIA RTX 6000 Ada Generation",
+  "rows": [
+    {
+      "attention_mode": "flash",
+      "compile_scope": "none",
+      "energy_max_abs": 0.0,
+      "energy_mean_abs": 0.0,
+      "force_max_abs": 7.275957614183426e-12,
+      "force_mean_abs": 8.724280792151567e-14,
+      "forward_ms": 22.200115025043488,
+      "fwd_bwd_ms": 116.55309301568195,
+      "index": 1,
+      "linear_mode": "spatial_recompute",
+      "max_mem_gb": 3.072295665740967,
+      "precision_mode": "fp32_high",
+      "status": "ok",
+      "total": 4,
+      "wall_s": 0.45312712498707697
+    },
+    {
+      "attention_mode": "flash",
+      "compile_scope": "none",
+      "energy_max_abs": 2.9921531677246094e-05,
+      "energy_mean_abs": 8.903630259737838e-06,
+      "force_max_abs": 1.465138848288916e-05,
+      "force_mean_abs": 8.670489251016988e-07,
+      "forward_ms": 21.227507037110627,
+      "fwd_bwd_ms": 81.88352402066812,
+      "index": 2,
+      "linear_mode": "ffn_fourier_direct",
+      "max_mem_gb": 2.009856700897217,
+      "precision_mode": "fp32_high",
+      "status": "ok",
+      "total": 4,
+      "wall_s": 0.4606824549846351
+    },
+    {
+      "attention_mode": "triton_tf32x3",
+      "compile_scope": "none",
+      "energy_max_abs": 2.9861927032470703e-05,
+      "energy_mean_abs": 8.828355930745602e-06,
+      "force_max_abs": 1.2944143236381933e-05,
+      "force_mean_abs": 9.023565326060634e-07,
+      "forward_ms": 21.997460979036987,
+      "fwd_bwd_ms": 782.7868959866464,
+      "index": 3,
+      "linear_mode": "spatial_recompute",
+      "max_mem_gb": 3.137702465057373,
+      "precision_mode": "fp32_high",
+      "status": "ok",
+      "total": 4,
+      "wall_s": 1.599338495056145
+    },
+    {
+      "attention_mode": "triton_tf32x3",
+      "compile_scope": "none",
+      "energy_max_abs": 3.9011240005493164e-05,
+      "energy_mean_abs": 8.210726264223922e-06,
+      "force_max_abs": 1.5433630323968828e-05,
+      "force_mean_abs": 9.369553595206526e-07,
+      "forward_ms": 20.937713037710637,
+      "fwd_bwd_ms": 78.57321394840255,
+      "index": 4,
+      "linear_mode": "ffn_fourier_direct",
+      "max_mem_gb": 2.0576319694519043,
+      "precision_mode": "fp32_high",
+      "status": "ok",
+      "total": 4,
+      "wall_s": 0.4634353800211102
+    }
+  ],
+  "torch": "2.5.0+cu124"
+}

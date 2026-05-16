@@ -1,0 +1,64 @@
+{
+  "args": {
+    "attention_modes": [
+      "flash"
+    ],
+    "chgspin_emb_dim": 160,
+    "chgspin_mode": "add",
+    "compile_scopes": [
+      "none"
+    ],
+    "d_model": 1920,
+    "hybrid_config_json": "configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale.json",
+    "linear_modes": [
+      "all_fourier_direct"
+    ],
+    "max_atoms_per_graph": 80,
+    "mlp_ratio": 2.0,
+    "n_heads": 60,
+    "n_layers": 16,
+    "num_graphs": 20,
+    "output_prefix": "oracle_context/omol_backend_matrix_20260516/smoke_all_fourier_fixed",
+    "pair_hidden_dim": 128,
+    "pair_n_rbf": 16,
+    "pair_rbf_max": 6.0,
+    "precision_modes": [
+      "fp32_high"
+    ],
+    "readout_activation": "sin",
+    "repeats": 1,
+    "stop_after": 1,
+    "total_atoms": 512,
+    "warmup": 0
+  },
+  "batch": {
+    "atoms": 512.0,
+    "graphs": 20.0,
+    "max_atoms": 80.0,
+    "padded_slots": 1600.0,
+    "sum_n2": 27490.0
+  },
+  "created": "2026-05-16T09:12:28+0200",
+  "cuda": "12.4",
+  "gpu": "NVIDIA RTX 6000 Ada Generation",
+  "rows": [
+    {
+      "attention_mode": "flash",
+      "compile_scope": "none",
+      "energy_max_abs": 0.003010094165802002,
+      "energy_mean_abs": 0.0008755336748436093,
+      "force_max_abs": 2.093513830914162e-05,
+      "force_mean_abs": 1.4572369764209725e-06,
+      "forward_ms": 27.372821990866214,
+      "fwd_bwd_ms": 134.8614160087891,
+      "index": 1,
+      "linear_mode": "all_fourier_direct",
+      "max_mem_gb": 1.365875244140625,
+      "precision_mode": "fp32_high",
+      "status": "ok",
+      "total": 1,
+      "wall_s": 0.605263601988554
+    }
+  ],
+  "torch": "2.5.0+cu124"
+}

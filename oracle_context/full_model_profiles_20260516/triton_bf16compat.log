@@ -1,0 +1,13 @@
+dataset: train=3986754 val=2762021 test=2762021
+model: backend=matterformer stream_type=tetra readout_head_mode=platonic parameters=36219524 trainable=36219524 non_trainable=0
+runtime: omol_runtime_mode=internal_flat_tetra batching_mode=random bucket_window_size=4096 bucket_shuffle_groups=8 max_graphs_per_batch=999999 max_graphs_per_batch_val=999999
+precision: bf16=False matmul=high
+normalization: rmsd=1.433569 energy_weight=10.0 force_weight=10.0
+loader/train: len_estimate=21320 len_scanned=18296 graphs_per_step=217.903 atoms_per_step=11952.392 sum_n2_per_step=1145014.780 max_graphs_step=283 max_atoms_step=12000 max_sum_n2_step=1501097 scan_seconds=3.804
+loader/val: len_estimate=2762021 len_scanned=1129502 graphs_per_step=1.316 atoms_per_step=77.972 sum_n2_per_step=5584.959 max_graphs_step=26 max_atoms_step=100 max_sum_n2_step=10000 scan_seconds=2.547
+profile step=0000003 profile/augmentation_ms=6.903 profile/backward_ms=968.679 profile/data_wait_ms=80.994 profile/forward_ms=430.401 profile/h2d_ms=0.503 profile/max_mem_gb=27.165 profile/optimizer_ms=4.176
+profile step=0000004 profile/augmentation_ms=6.475 profile/backward_ms=977.003 profile/data_wait_ms=74.181 profile/forward_ms=424.399 profile/h2d_ms=0.428 profile/max_mem_gb=27.442 profile/optimizer_ms=4.182
+profile step=0000005 profile/augmentation_ms=6.185 profile/backward_ms=976.548 profile/data_wait_ms=70.691 profile/forward_ms=426.925 profile/h2d_ms=0.447 profile/max_mem_gb=27.466 profile/optimizer_ms=4.176
+epoch=001 step=0000005 loss=13.791665 e_mae_per_atom=655.154 f_mae=535.239 lr=0.000000e+00
+final_val step=0000005 total=360.425 e_mae_per_atom=84.183 f_mae=636.666 best_total=360.425
+test total=360.424 e_mae_per_atom=84.184 f_mae=636.665

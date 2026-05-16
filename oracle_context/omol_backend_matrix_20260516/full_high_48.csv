@@ -1,0 +1,49 @@
+status,attention_mode,linear_mode,compile_scope,precision_mode,forward_ms,fwd_bwd_ms,max_mem_gb,energy_max_abs,force_max_abs,error
+ok,flash,spatial_recompute,none,fp32_high,292.6640869991388,857.888913480565,32.73790216445923,4.971027374267578e-05,1.8704737158259377e-05,
+ok,flash,spatial_fast,none,fp32_high,273.0112739955075,808.5790094919503,27.240310192108154,5.054473876953125e-05,1.7227353964699432e-05,
+ok,flash,ffn_fourier_direct,none,fp32_high,289.39178297878243,866.403227992123,26.417057037353516,9.965896606445312e-05,1.7584416127647273e-05,
+error,flash,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_tf32x3,spatial_recompute,none,fp32_high,295.65716750221327,894.0371464996133,34.114925384521484,7.724761962890625e-05,2.054689139185939e-05,
+ok,triton_tf32x3,spatial_fast,none,fp32_high,277.1961854887195,844.7717849921901,28.617487907409668,7.522106170654297e-05,2.0529230823740363e-05,
+ok,triton_tf32x3,ffn_fourier_direct,none,fp32_high,286.90504099358805,876.3679615221918,27.79426097869873,7.891654968261719e-05,1.8498256395105273e-05,
+error,triton_tf32x3,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_bf16compat,spatial_recompute,none,fp32_high,299.02158500044607,861.4332595025189,32.7399787902832,6.0677528381347656e-05,1.757660174916964e-05,
+ok,triton_bf16compat,spatial_fast,none,fp32_high,276.8972579797264,811.0848699870985,27.24248456954956,5.412101745605469e-05,1.5437066394952126e-05,
+ok,triton_bf16compat,ffn_fourier_direct,none,fp32_high,291.71576601220295,856.2407880090177,26.419231414794922,7.998943328857422e-05,1.8017461115960032e-05,
+error,triton_bf16compat,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_r2,spatial_recompute,none,fp32_high,299.8534615035169,926.1702329968102,34.11276626586914,7.009506225585938e-05,1.9943392544519156e-05,
+ok,triton_radial_r2,spatial_fast,none,fp32_high,285.3217085066717,876.9276605162304,28.615328788757324,8.487701416015625e-05,2.0567074898281135e-05,
+ok,triton_radial_r2,ffn_fourier_direct,none,fp32_high,289.6177965158131,896.816456981469,27.792101860046387,9.85860824584961e-05,1.8369584722677246e-05,
+error,triton_radial_r2,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_slope,spatial_recompute,none,fp32_high,301.004816981731,932.9430049983785,34.11276626586914,6.830692291259766e-05,1.7534506696392782e-05,
+ok,triton_radial_slope,spatial_fast,none,fp32_high,286.1717769992538,882.6045530149713,28.615328788757324,8.916854858398438e-05,2.0483817934291437e-05,
+ok,triton_radial_slope,ffn_fourier_direct,none,fp32_high,289.7877120121848,898.2922879804391,27.792101860046387,8.344650268554688e-05,1.9190803868696094e-05,
+error,triton_radial_slope,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_rbf8,spatial_recompute,none,fp32_high,309.37878249096684,966.6055749985389,34.11276626586914,6.687641143798828e-05,2.0202509404043667e-05,
+ok,triton_radial_rbf8,spatial_fast,none,fp32_high,292.98940100125037,929.8422239953652,28.615328788757324,7.700920104980469e-05,1.9808074284810573e-05,
+ok,triton_radial_rbf8,ffn_fourier_direct,none,fp32_high,293.881658493774,929.7270865063183,27.792101860046387,8.738040924072266e-05,1.8498256395105273e-05,
+error,triton_radial_rbf8,all_fourier_direct,none,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,flash,spatial_recompute,trunk_flat,fp32_high,186.68322250596248,608.6824090161826,25.853358268737793,5.2809715270996094e-05,1.540254925203044e-05,
+ok,flash,spatial_fast,trunk_flat,fp32_high,177.6512025098782,576.309575495543,25.769859313964844,3.24249267578125e-05,1.5087129213497974e-05,
+ok,flash,ffn_fourier_direct,trunk_flat,fp32_high,160.64159700181335,491.0740864870604,24.94702911376953,0.00010609626770019531,2.008293267863337e-05,
+error,flash,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_tf32x3,spatial_recompute,trunk_flat,fp32_high,201.4896564942319,680.0329450052232,27.23847007751465,7.748603820800781e-05,2.0510307876975276e-05,
+ok,triton_tf32x3,spatial_fast,trunk_flat,fp32_high,195.94725049682893,648.2041910057887,26.553661346435547,7.927417755126953e-05,1.7285345165873878e-05,
+ok,triton_tf32x3,ffn_fourier_direct,trunk_flat,fp32_high,175.45943750883453,559.3751074920874,25.732327938079834,9.196996688842773e-05,1.9190803868696094e-05,
+error,triton_tf32x3,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_bf16compat,spatial_recompute,trunk_flat,fp32_high,199.02677048230544,637.8252824943047,25.865846633911133,5.5909156799316406e-05,1.7423888493794948e-05,
+ok,triton_bf16compat,spatial_fast,trunk_flat,fp32_high,193.61007850966416,605.6062174902763,25.179529190063477,5.143880844116211e-05,1.7885578927234747e-05,
+ok,triton_bf16compat,ffn_fourier_direct,trunk_flat,fp32_high,174.3573940184433,520.5331564939115,24.35761547088623,8.976459503173828e-05,1.7746559024089947e-05,
+error,triton_bf16compat,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_r2,spatial_recompute,trunk_flat,fp32_high,204.29968551616184,705.9452119865455,27.237439155578613,8.440017700195312e-05,1.9712058929144405e-05,
+ok,triton_radial_r2,spatial_fast,trunk_flat,fp32_high,197.94510249630548,674.8069729947019,26.551228523254395,9.131431579589844e-05,2.054689139185939e-05,
+ok,triton_radial_r2,ffn_fourier_direct,trunk_flat,fp32_high,179.4504015124403,582.1109475218691,25.730355739593506,9.059906005859375e-05,1.998401785385795e-05,
+error,triton_radial_r2,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_slope,spatial_recompute,trunk_flat,fp32_high,204.02993098832667,710.4254460136872,27.237439155578613,6.574392318725586e-05,2.0471201423788443e-05,
+ok,triton_radial_slope,spatial_fast,trunk_flat,fp32_high,199.7913189989049,678.4006929956377,26.551228523254395,8.487701416015625e-05,2.0478770238696598e-05,
+ok,triton_radial_slope,ffn_fourier_direct,trunk_flat,fp32_high,179.6781225129962,583.2390929863323,25.730355739593506,8.314847946166992e-05,1.8498256395105273e-05,
+error,triton_radial_slope,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
+ok,triton_radial_rbf8,spatial_recompute,trunk_flat,fp32_high,211.62376148276962,754.0536820015404,27.237439155578613,7.998943328857422e-05,2.0083007257198915e-05,
+ok,triton_radial_rbf8,spatial_fast,trunk_flat,fp32_high,204.61948250886053,718.0605569737963,26.551228523254395,8.499622344970703e-05,2.0327395759522915e-05,
+ok,triton_radial_rbf8,ffn_fourier_direct,trunk_flat,fp32_high,187.1904624858871,625.2723225043155,25.730355739593506,8.821487426757812e-05,1.8498256395105273e-05,
+error,triton_radial_rbf8,all_fourier_direct,trunk_flat,fp32_high,,,,,,"ValueError: q, v, and qv projections must use the same linear backend"
