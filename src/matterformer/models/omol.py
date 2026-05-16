@@ -293,20 +293,36 @@ class MatterformerOMolForceField(nn.Module):
                     or "gelu"
                 )
                 readout_ffn = bool(readout_cfg.get("ffn", True))
+                linear_backend = str(
+                    readout_cfg.get(
+                        "linear_backend",
+                        self.hybrid_config.tetra.get("linear_backend", "spatial"),
+                    )
+                )
                 if readout_ffn:
                     self.platonic_scalar_readout = nn.Sequential(
-                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        PlatonicLinear(d_model, d_model, solid=group.name, linear_backend=linear_backend),
                         _readout_activation(str(activation_name)),
-                        PlatonicLinear(d_model, group.G, solid=group.name),
+                        PlatonicLinear(d_model, group.G, solid=group.name, linear_backend=linear_backend),
                     )
                     self.platonic_vector_readout = nn.Sequential(
-                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        PlatonicLinear(d_model, d_model, solid=group.name, linear_backend=linear_backend),
                         _readout_activation(str(activation_name)),
-                        PlatonicLinear(d_model, group.G * 3, solid=group.name),
+                        PlatonicLinear(d_model, group.G * 3, solid=group.name, linear_backend=linear_backend),
                     )
                 else:
-                    self.platonic_scalar_readout = PlatonicLinear(d_model, group.G, solid=group.name)
-                    self.platonic_vector_readout = PlatonicLinear(d_model, group.G * 3, solid=group.name)
+                    self.platonic_scalar_readout = PlatonicLinear(
+                        d_model,
+                        group.G,
+                        solid=group.name,
+                        linear_backend=linear_backend,
+                    )
+                    self.platonic_vector_readout = PlatonicLinear(
+                        d_model,
+                        group.G * 3,
+                        solid=group.name,
+                        linear_backend=linear_backend,
+                    )
                 self.group_force_head = None
                 self.register_buffer("_platonic_readout_rotations", group.elements, persistent=False)
                 self.register_buffer("_group_rotations", torch.empty(0), persistent=False)

@@ -64,6 +64,72 @@ class PlatonicRoPE(nn.Module):
         z = radius[None, :] * torch.sin(theta)
         return torch.stack([x, y[None, :].expand(num_heads, -1), z], dim=-1) * magnitudes.view(1, -1, 1)
 
+    def cos_sin(
+        self,
+        pos: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached RoPE cos/sin factors for ``pos``.
+
+        The returned tensors have shape ``[..., G, H, D/2]`` and can be reused
+        for q, k, v, and inverse value transport inside one attention block.
+        """
+        if pos.shape[-1] != 3:
+            raise ValueError(f"pos trailing dimension must be 3, got {pos.shape[-1]}")
+        target_device = device if device is not None else pos.device
+        freqs = self.freqs.to(device=target_device, dtype=torch.float32)
+        frames = self.group_elements.to(device=target_device, dtype=torch.float32)
+        rotated_freqs = torch.einsum("gde,hfe->ghfd", frames, freqs)
+        angles = torch.einsum(
+            "...d,ghfd->...ghf",
+            pos.to(device=target_device, dtype=torch.float32),
+            rotated_freqs,
+        )
+        return torch.cos(angles).to(dtype=dtype), torch.sin(angles).to(dtype=dtype)
+
+    def apply_from_cos_sin(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor:
+        *leading, group_order, num_heads, head_dim = x.shape
+        if (group_order, num_heads, head_dim) != (self.G, self.num_heads, self.head_dim):
+            raise ValueError(
+                f"Expected x trailing shape {(self.G, self.num_heads, self.head_dim)}, "
+                f"got {(group_order, num_heads, head_dim)}"
+            )
+        expected_cos_shape = tuple(leading) + (self.G, self.num_heads, self.num_pairs)
+        if tuple(cos.shape) != expected_cos_shape or tuple(sin.shape) != expected_cos_shape:
+            raise ValueError(
+                f"cos/sin shape must be {expected_cos_shape}, got {tuple(cos.shape)} and {tuple(sin.shape)}"
+            )
+        cos = cos.to(device=x.device, dtype=x.dtype)
+        sin = sin.to(device=x.device, dtype=x.dtype)
+        if inverse:
+            sin = -sin
+        paired = x.view(*leading, self.G, self.num_heads, self.num_pairs, 2)
+        x0, x1 = paired.unbind(dim=-1)
+        out = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
+        return out.reshape(*leading, self.G, self.num_heads, self.head_dim)
+
+    def constant_key_from_cos_sin(self, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Return ``RoPE(ones)`` from cached factors without allocating ones first."""
+        expected_trailing = (self.G, self.num_heads, self.num_pairs)
+        if tuple(cos.shape[-3:]) != expected_trailing or tuple(sin.shape[-3:]) != expected_trailing:
+            raise ValueError(
+                f"cos/sin trailing shape must be {expected_trailing}, "
+                f"got {tuple(cos.shape[-3:])} and {tuple(sin.shape[-3:])}"
+            )
+        if tuple(cos.shape) != tuple(sin.shape):
+            raise ValueError(f"cos and sin shapes must match, got {tuple(cos.shape)} and {tuple(sin.shape)}")
+        key = torch.stack((cos - sin, sin + cos), dim=-1)
+        return key.reshape(*cos.shape[:-1], self.head_dim)
+
     def forward(self, x: torch.Tensor, pos: torch.Tensor, *, inverse: bool = False) -> torch.Tensor:
         *leading, group_order, num_heads, head_dim = x.shape
         if (group_order, num_heads, head_dim) != (self.G, self.num_heads, self.head_dim):
@@ -73,15 +139,5 @@ class PlatonicRoPE(nn.Module):
             )
         if pos.shape[-1] != 3 or tuple(pos.shape[:-1]) != tuple(leading):
             raise ValueError(f"pos shape must be {tuple(leading) + (3,)}, got {tuple(pos.shape)}")
-        freqs = self.freqs.to(device=x.device, dtype=torch.float32)
-        frames = self.group_elements.to(device=x.device, dtype=torch.float32)
-        rotated_freqs = torch.einsum("gde,hfe->ghfd", frames, freqs)
-        angles = torch.einsum("...d,ghfd->...ghf", pos.to(dtype=torch.float32), rotated_freqs)
-        cos = torch.cos(angles).to(dtype=x.dtype)
-        sin = torch.sin(angles).to(dtype=x.dtype)
-        if inverse:
-            sin = -sin
-        paired = x.view(*leading, self.G, self.num_heads, self.num_pairs, 2)
-        x0, x1 = paired.unbind(dim=-1)
-        out = torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1)
-        return out.reshape(*leading, self.G, self.num_heads, self.head_dim)
+        cos, sin = self.cos_sin(pos, dtype=x.dtype, device=x.device)
+        return self.apply_from_cos_sin(x, cos, sin, inverse=inverse)

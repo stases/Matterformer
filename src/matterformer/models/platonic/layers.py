@@ -46,6 +46,9 @@ class PlatonicAttention(nn.Module):
         rope_on_values: bool = True,
         attention_backend: str = "sdpa",
         attention_bias: dict | None = None,
+        linear_backend: str = "spatial",
+        rope_cache: bool = True,
+        constant_key_fastpath: bool = True,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -67,15 +70,21 @@ class PlatonicAttention(nn.Module):
         self.dropout = float(dropout)
         self.use_key = bool(use_key)
         self.rope_on_values = bool(rope_on_values)
+        self.rope_cache = bool(rope_cache)
+        self.constant_key_fastpath = bool(constant_key_fastpath)
         self.attention_backend = str(attention_backend).lower()
         if self.attention_backend == "default":
             self.attention_backend = "sdpa"
         if self.attention_backend not in {"sdpa", "flash", "triton", "triton_radial_rbf"}:
             raise ValueError("attention_backend must be one of {'sdpa', 'flash', 'triton', 'triton_radial_rbf'}")
-        self.q_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name)
-        self.v_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name)
-        self.k_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name) if self.use_key else None
-        self.out_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name)
+        self.q_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
+        self.v_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
+        self.k_proj = (
+            PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
+            if self.use_key
+            else None
+        )
+        self.out_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
         self.attention_bias_config = dict(attention_bias or {})
         self.triton_block_m = int(self.attention_bias_config.get("block_m", 16))
         self.triton_block_n = int(self.attention_bias_config.get("block_n", 32))
@@ -123,6 +132,46 @@ class PlatonicAttention(nn.Module):
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.group_order, self.heads_per_frame, self.head_dim)
+
+    def _project_qkv_with_rope(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        q = self._split(self.q_proj(x))
+        v = self._split(self.v_proj(x))
+        if not self.rope_cache:
+            k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+            if self.rope_on_values:
+                v = self.rope(v, pos)
+            return q, k, v, None
+
+        cos, sin = self.rope.cos_sin(pos, dtype=q.dtype, device=q.device)
+        q = self.rope.apply_from_cos_sin(q, cos, sin)
+        if self.k_proj is not None:
+            k = self.rope.apply_from_cos_sin(self._split(self.k_proj(x)), cos, sin)
+        elif self.constant_key_fastpath:
+            k = self.rope.constant_key_from_cos_sin(cos, sin)
+        else:
+            k = self.rope.apply_from_cos_sin(torch.ones_like(q), cos, sin)
+        if self.rope_on_values:
+            v = self.rope.apply_from_cos_sin(v, cos, sin)
+        return q, k, v, (cos, sin)
+
+    def _inverse_value_rope(
+        self,
+        out: torch.Tensor,
+        pos: torch.Tensor,
+        rope_factors: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        if not self.rope_on_values:
+            return out
+        if rope_factors is None:
+            return self.rope(out, pos, inverse=True)
+        cos, sin = rope_factors
+        return self.rope.apply_from_cos_sin(out, cos, sin, inverse=True)
 
     def _sdpa_attention(
         self,
@@ -322,13 +371,7 @@ class PlatonicAttention(nn.Module):
         pos: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q = self._split(self.q_proj(x))
-        v = self._split(self.v_proj(x))
-        k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
-        q = self.rope(q, pos)
-        k = self.rope(k, pos)
-        if self.rope_on_values:
-            v = self.rope(v, pos)
+        q, k, v, rope_factors = self._project_qkv_with_rope(x, pos)
         batch_size, num_tokens = x.shape[:2]
         q = q.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
@@ -349,8 +392,7 @@ class PlatonicAttention(nn.Module):
             self.heads_per_frame,
             self.head_dim,
         )
-        if self.rope_on_values:
-            out = self.rope(out, pos, inverse=True)
+        out = self._inverse_value_rope(out, pos, rope_factors)
         return self.out_proj(out.reshape(batch_size, num_tokens, self.d_model))
 
     def forward_flat(
@@ -361,13 +403,7 @@ class PlatonicAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        q = self._split(self.q_proj(x))
-        v = self._split(self.v_proj(x))
-        k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
-        q = self.rope(q, pos)
-        k = self.rope(k, pos)
-        if self.rope_on_values:
-            v = self.rope(v, pos)
+        q, k, v, rope_factors = self._project_qkv_with_rope(x, pos)
         num_tokens = x.shape[0]
         q = q.reshape(num_tokens, self.num_heads, self.head_dim)
         k = k.reshape(num_tokens, self.num_heads, self.head_dim)
@@ -379,8 +415,7 @@ class PlatonicAttention(nn.Module):
         else:
             out = self._sdpa_attention_flat(q, k, v, cu_seqlens)
         out = out.contiguous().view(num_tokens, self.group_order, self.heads_per_frame, self.head_dim)
-        if self.rope_on_values:
-            out = self.rope(out, pos, inverse=True)
+        out = self._inverse_value_rope(out, pos, rope_factors)
         return self.out_proj(out.reshape(num_tokens, self.d_model))
 
 
@@ -403,6 +438,11 @@ class PlatonicBlock(nn.Module):
         attention_backend: str = "sdpa",
         attention_bias: dict | None = None,
         layer_scale_init_value: float | None = None,
+        linear_backend: str = "spatial",
+        attention_linear_backend: str | None = None,
+        ffn_linear_backend: str | None = None,
+        rope_cache: bool = True,
+        constant_key_fastpath: bool = True,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -413,6 +453,8 @@ class PlatonicBlock(nn.Module):
         self.channels_per_group = d_model // group.G
         self.norm1 = GroupLayerNorm(group.G, self.channels_per_group, eps=layer_norm_eps)
         self.norm2 = GroupLayerNorm(group.G, self.channels_per_group, eps=layer_norm_eps)
+        attn_linear_backend = str(attention_linear_backend or linear_backend)
+        mlp_linear_backend = str(ffn_linear_backend or linear_backend)
         self.attn = PlatonicAttention(
             d_model,
             nhead,
@@ -425,9 +467,12 @@ class PlatonicBlock(nn.Module):
             rope_on_values=rope_on_values,
             attention_backend=attention_backend,
             attention_bias=attention_bias,
+            linear_backend=attn_linear_backend,
+            rope_cache=rope_cache,
+            constant_key_fastpath=constant_key_fastpath,
         )
-        self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name)
-        self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name)
+        self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name, linear_backend=mlp_linear_backend)
+        self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name, linear_backend=mlp_linear_backend)
         self.dropout = nn.Dropout(dropout)
         self.activation = activation
         if layer_scale_init_value is None:

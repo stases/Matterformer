@@ -166,6 +166,7 @@ class HybridConfig:
             "kernel": {"backend": "triton_knn"},
             "geometry": {"builder": "dense", "strict": False},
             "projection_mode": "group_linear",
+            "linear_backend": "spatial",
             **dict(cfg.simplicial),
         }
         cfg.tetra = {
@@ -177,6 +178,11 @@ class HybridConfig:
             "use_key": False,
             "rope_on_values": True,
             "ffn_mult": 4,
+            "linear_backend": "spatial",
+            "attention_linear_backend": None,
+            "ffn_linear_backend": None,
+            "rope_cache": True,
+            "constant_key_fastpath": True,
             **dict(cfg.tetra),
         }
         cfg.trivial = {
@@ -1256,6 +1262,7 @@ class GroupFramewiseSimplicialAttention(nn.Module):
         strict_triton: bool = False,
         projection_mode: str = "group_linear",
         solid: str = "tetrahedron",
+        linear_backend: str = "spatial",
         bias_config: dict[str, Any] | None = None,
         message_config: dict[str, Any] | None = None,
     ) -> None:
@@ -1282,8 +1289,8 @@ class GroupFramewiseSimplicialAttention(nn.Module):
         if self.projection_mode == "group_linear":
             d_group_in = self.group_order * self.dim_per_frame
             d_group_out = self.group_order * self.inner_dim
-            self.in_proj = PlatonicLinear(d_group_in, 5 * d_group_out, solid=solid)
-            self.out_proj = PlatonicLinear(d_group_out, d_group_in, solid=solid)
+            self.in_proj = PlatonicLinear(d_group_in, 5 * d_group_out, solid=solid, linear_backend=linear_backend)
+            self.out_proj = PlatonicLinear(d_group_out, d_group_in, solid=solid, linear_backend=linear_backend)
         else:
             self.in_proj = nn.Linear(self.dim_per_frame, 5 * self.inner_dim)
             self.out_proj = nn.Linear(self.inner_dim, self.dim_per_frame)
@@ -1655,6 +1662,7 @@ class GroupFramewiseSimplicialLayer(nn.Module):
         self.group_order = int(group_order)
         self.dim_per_frame = int(dim_per_frame)
         self.projection_mode = str(config.get("projection_mode", "group_linear")).lower()
+        linear_backend = str(config.get("linear_backend", "spatial"))
         num_heads = int(config.get("num_heads", 1))
         self.norm1 = GroupLayerNorm(self.group_order, self.dim_per_frame, eps=eps)
         self.norm2 = GroupLayerNorm(self.group_order, self.dim_per_frame, eps=eps)
@@ -1670,16 +1678,17 @@ class GroupFramewiseSimplicialLayer(nn.Module):
             strict_triton=bool(dict(config.get("kernel", {})).get("strict", False)),
             projection_mode=self.projection_mode,
             solid=solid,
+            linear_backend=linear_backend,
             bias_config=dict(config.get("bias", {})),
             message_config=dict(config.get("message", {})),
         )
         d_group = self.group_order * self.dim_per_frame
         hidden = int(d_group * mlp_ratio)
         self.mlp = nn.Sequential(
-            PlatonicLinear(d_group, hidden, solid=solid),
+            PlatonicLinear(d_group, hidden, solid=solid, linear_backend=linear_backend),
             nn.GELU(approximate="tanh"),
             nn.Dropout(dropout),
-            PlatonicLinear(hidden, d_group, solid=solid),
+            PlatonicLinear(hidden, d_group, solid=solid, linear_backend=linear_backend),
         )
         self.dropout = nn.Dropout(dropout)
         layer_scale_init = config.get("layer_scale_init_value", None)
@@ -1810,6 +1819,9 @@ class TetraPlatonicGlobalLayer(nn.Module):
         if PLATONIC_GROUPS[solid].G != int(group_order):
             raise ValueError(f"Group {solid!r} has order {PLATONIC_GROUPS[solid].G}, expected {group_order}")
         heads_per_frame = int(config.get("heads_per_frame", 1))
+        linear_backend = str(config.get("linear_backend", "spatial"))
+        attention_linear_backend = config.get("attention_linear_backend", None)
+        ffn_linear_backend = config.get("ffn_linear_backend", None)
         d_group = int(group_order) * int(dim_per_frame)
         n_heads = int(group_order) * heads_per_frame
         self.group_order = int(group_order)
@@ -1830,6 +1842,11 @@ class TetraPlatonicGlobalLayer(nn.Module):
             attention_bias=dict(config.get("attention_bias") or {}),
             activation=_activation_from_name(str(config.get("activation", "gelu"))),
             layer_scale_init_value=config.get("layer_scale_init_value", None),
+            linear_backend=linear_backend,
+            attention_linear_backend=str(attention_linear_backend) if attention_linear_backend is not None else None,
+            ffn_linear_backend=str(ffn_linear_backend) if ffn_linear_backend is not None else None,
+            rope_cache=bool(config.get("rope_cache", True)),
+            constant_key_fastpath=bool(config.get("constant_key_fastpath", True)),
         )
 
     @staticmethod
@@ -2020,6 +2037,7 @@ class HybridTransformerTrunk(nn.Module):
         self.group_order = int(self.config.tetra.get("group_order", 12))
         self.group_dim_per_frame = int(self.config.tetra_dim_per_frame or 0)
         self.tetra_solid = str(self.config.tetra.get("group", "tetrahedron")).lower()
+        self.tetra_linear_backend = str(self.config.tetra.get("linear_backend", "spatial"))
         self.input_lift_kind = str(self.config.input_lift.get("kind", "scalar_copy")).lower().replace("-", "_")
         if self.input_lift_kind in {"platonic", "platonic_scalar", "platonic_copy"}:
             self.input_lift_kind = "platonic_linear"
@@ -2060,6 +2078,7 @@ class HybridTransformerTrunk(nn.Module):
                 self.group_order * self.group_dim_per_frame,
                 solid=self.tetra_solid,
                 bias=False,
+                linear_backend=self.tetra_linear_backend,
             )
         else:
             self.group_input_proj = (

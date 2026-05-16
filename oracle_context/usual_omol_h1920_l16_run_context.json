@@ -1,0 +1,129 @@
+{
+  "purpose": "Condensed usual OMol run context for Fourier PlatonicLinear speed review.",
+  "repo": "/home/thadziv/GitHub/Matterformer",
+  "python_bin": "/home/thadziv/GitHub/erwin/erwin/bin/python",
+  "normal_training_slurm": {
+    "partition": "delta",
+    "account": "deltausers",
+    "gres": "gpu:1",
+    "cpus_per_task": 16,
+    "mem": "64G",
+    "time": "5-00:00:00"
+  },
+  "gpu_benchmark_slurm_used": {
+    "partition": "all6000",
+    "account": "all6000users",
+    "gres": "gpu:1",
+    "cpus_per_task": 4,
+    "mem": "32G",
+    "time": "00:30:00",
+    "node": "ivi-cn032",
+    "gpu": "NVIDIA RTX 6000 Ada Generation"
+  },
+  "training_entrypoint": "scripts/omol_matterformer_pt2_l16_delta.sh",
+  "training_wrapper": "scripts/omol_forcefield_delta.sh",
+  "hybrid_config_json": "configs/omol/tetra_t_only_h1920_l16_pt2_exact_sin_layerscale.json",
+  "precision": {
+    "bf16": false,
+    "float32_matmul_precision": "high",
+    "tf32_effectively_enabled_for_matmul": true
+  },
+  "runtime": {
+    "model_backend": "matterformer",
+    "omol_runtime_mode": "internal_flat_tetra",
+    "compile": true,
+    "compile_mode": "default"
+  },
+  "model": {
+    "d_model": 1920,
+    "n_heads": 60,
+    "n_layers": 16,
+    "mlp_ratio": 2.0,
+    "dropout": 0.0,
+    "attn_dropout": 0.0,
+    "chgspin_mode": "add",
+    "chgspin_emb_dim": 160,
+    "readout_head_mode": "platonic",
+    "readout_activation": "sin",
+    "force_head_mode": "auto"
+  },
+  "tetra_config": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "tetra_dim_per_frame": 160,
+    "heads_per_frame": 5,
+    "head_dim": 32,
+    "rope_sigma": 2.0,
+    "learned_freqs": true,
+    "freq_init": "random",
+    "use_key": false,
+    "rope_on_values": true,
+    "attention_backend": "flash",
+    "activation": "sin",
+    "ffn_mult": 2,
+    "layer_scale_init_value": 0.0001,
+    "input_lift": "scalar_copy",
+    "readout": "platonic_ffn"
+  },
+  "batching": {
+    "batch_size": 64,
+    "val_batch_size": 64,
+    "max_atoms_per_batch": 12000,
+    "max_atoms_per_batch_val": 12000,
+    "max_graphs_per_batch": 999999,
+    "max_graphs_per_batch_val": 999999,
+    "max_edges_per_batch": 2400000,
+    "max_edges_per_batch_val": 2400000,
+    "batching_mode": "random",
+    "num_workers": 16,
+    "prefetch_factor": 4
+  },
+  "optimization": {
+    "optimizer": "muon",
+    "lr": 0.00025,
+    "weight_decay": 0.00001,
+    "warmup_steps": 5000,
+    "muon_lr": 0.01,
+    "muon_momentum": 0.95,
+    "muon_weight_decay": 0.0,
+    "muon_adam_lr": 0.00025,
+    "muon_adam_weight_decay": 0.00001,
+    "muon_hidden_only": true,
+    "muon_min_ndim": 2,
+    "muon_platonic_kernel_view": "conv",
+    "muon_exclude_name_fragments": "embed,embedding,head,readout,rope,freq,attn.",
+    "important_note": "This means Muon mainly updates trunk FFN PlatonicLinear kernels, not attention q/v/out kernels."
+  },
+  "loss": {
+    "energy_loss": "per_atom_mae",
+    "force_loss": "l2norm",
+    "energy_weight": 10,
+    "force_weight": 10,
+    "normalizer_rmsd": 1.433569,
+    "skip_loss_above": 1000
+  },
+  "linears_per_tetra_block": {
+    "q_projection": {
+      "cin_per_frame": 160,
+      "cout_per_frame": 160
+    },
+    "v_projection": {
+      "cin_per_frame": 160,
+      "cout_per_frame": 160
+    },
+    "k_projection": null,
+    "out_projection": {
+      "cin_per_frame": 160,
+      "cout_per_frame": 160
+    },
+    "ffn_up": {
+      "cin_per_frame": 160,
+      "cout_per_frame": 320
+    },
+    "ffn_down": {
+      "cin_per_frame": 320,
+      "cout_per_frame": 160
+    },
+    "tokens_interpretation": "In internal_flat_tetra, tokens are atoms in the flattened batch, capped by max_atoms_per_batch, usually up to about 12000."
+  }
+}

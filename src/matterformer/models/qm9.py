@@ -536,21 +536,37 @@ class QM9EDMModel(nn.Module):
             assert effective_hybrid_config is not None
             group = PLATONIC_GROUPS[str(effective_hybrid_config.tetra.get("group", "tetrahedron")).lower()]
             if self.use_platonic_qm9_readout:
+                linear_backend = str(
+                    effective_hybrid_config.readout.get(
+                        "linear_backend",
+                        effective_hybrid_config.tetra.get("linear_backend", "spatial"),
+                    )
+                )
                 readout_ffn = bool(effective_hybrid_config.readout.get("ffn", True))
                 if readout_ffn:
                     self.platonic_scalar_readout = nn.Sequential(
-                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        PlatonicLinear(d_model, d_model, solid=group.name, linear_backend=linear_backend),
                         nn.GELU(),
-                        PlatonicLinear(d_model, group.G * atom_channels, solid=group.name),
+                        PlatonicLinear(d_model, group.G * atom_channels, solid=group.name, linear_backend=linear_backend),
                     )
                     self.platonic_vector_readout = nn.Sequential(
-                        PlatonicLinear(d_model, d_model, solid=group.name),
+                        PlatonicLinear(d_model, d_model, solid=group.name, linear_backend=linear_backend),
                         nn.GELU(),
-                        PlatonicLinear(d_model, group.G * 3, solid=group.name),
+                        PlatonicLinear(d_model, group.G * 3, solid=group.name, linear_backend=linear_backend),
                     )
                 else:
-                    self.platonic_scalar_readout = PlatonicLinear(d_model, group.G * atom_channels, solid=group.name)
-                    self.platonic_vector_readout = PlatonicLinear(d_model, group.G * 3, solid=group.name)
+                    self.platonic_scalar_readout = PlatonicLinear(
+                        d_model,
+                        group.G * atom_channels,
+                        solid=group.name,
+                        linear_backend=linear_backend,
+                    )
+                    self.platonic_vector_readout = PlatonicLinear(
+                        d_model,
+                        group.G * 3,
+                        solid=group.name,
+                        linear_backend=linear_backend,
+                    )
                 self.register_buffer("_platonic_readout_rotations", group.elements, persistent=False)
             else:
                 self.group_vector_head = nn.Sequential(
