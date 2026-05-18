@@ -36,6 +36,47 @@ def _gather_neighbor_values(values: torch.Tensor, neighbor_idx: torch.Tensor) ->
     return torch.gather(values, dim=2, index=idx)
 
 
+def _valid_atom_mask(coords: torch.Tensor, pad_mask: torch.Tensor | None) -> torch.Tensor:
+    if pad_mask is None:
+        return torch.ones(coords.shape[:2], device=coords.device, dtype=torch.bool)
+    return ~pad_mask[:, : coords.shape[1]].to(device=coords.device, dtype=torch.bool)
+
+
+def _empty_neighbors(
+    coords: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_atoms = coords.shape[:2]
+    idx = torch.empty((batch_size, num_atoms, 0), device=coords.device, dtype=dtype)
+    mask = torch.empty((batch_size, num_atoms, 0), device=coords.device, dtype=torch.bool)
+    dist = torch.empty((batch_size, num_atoms, 0), device=coords.device, dtype=torch.float32)
+    return idx, mask, dist
+
+
+def _prepend_self_neighbor_slot(
+    neighbor_idx: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+    dist_values: torch.Tensor,
+    *,
+    valid_atom_mask: torch.Tensor,
+    k_neighbors: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, num_atoms = valid_atom_mask.shape
+    self_idx = torch.arange(num_atoms, device=neighbor_idx.device, dtype=neighbor_idx.dtype).view(1, num_atoms, 1)
+    self_idx = self_idx.expand(batch_size, num_atoms, 1)
+    self_mask = valid_atom_mask.to(device=neighbor_mask.device, dtype=torch.bool).unsqueeze(-1)
+    self_dist = torch.zeros((batch_size, num_atoms, 1), device=dist_values.device, dtype=dist_values.dtype)
+    idx = torch.cat([self_idx, neighbor_idx], dim=-1)
+    mask = torch.cat([self_mask, neighbor_mask], dim=-1)
+    dist = torch.cat([self_dist, dist_values], dim=-1)
+    if idx.shape[-1] > int(k_neighbors):
+        idx = idx[..., : int(k_neighbors)]
+        mask = mask[..., : int(k_neighbors)]
+        dist = dist[..., : int(k_neighbors)]
+    return idx.contiguous(), mask.contiguous(), dist.contiguous()
+
+
 def _dense_nonperiodic_knn_geometry_cache(
     coords: torch.Tensor,
     *,
@@ -44,25 +85,47 @@ def _dense_nonperiodic_knn_geometry_cache(
     rbf_dim: int,
     cutoff: float | None,
     seq_len: int,
+    include_self: bool = False,
+    self_as_first_neighbor: bool = False,
+    mask_by_cutoff: bool = False,
 ) -> GeometryCache:
     features = NonPeriodicGeometryAdapter()(coords=coords, pad_mask=pad_mask)
     pair_mask = features.pair_mask.clone()
     coords_len = coords.shape[1]
     eye = torch.eye(coords_len, device=pair_mask.device, dtype=torch.bool).view(1, coords_len, coords_len)
-    pair_mask = pair_mask & ~eye
+    if not include_self or self_as_first_neighbor:
+        pair_mask = pair_mask & ~eye
     if pad_mask is not None:
         atom_pad = pad_mask[:, :coords_len].bool()
         pair_mask = pair_mask & ~atom_pad[:, :, None] & ~atom_pad[:, None, :]
-    k_eff = min(int(k_neighbors), max(coords_len, 1))
-    masked_dist = features.pair_dist.masked_fill(~pair_mask, torch.finfo(features.pair_dist.dtype).max)
-    dist, neighbor_idx = torch.topk(masked_dist, k=k_eff, dim=-1, largest=False)
-    neighbor_mask = torch.gather(pair_mask, dim=-1, index=neighbor_idx)
-    if k_eff < int(k_neighbors):
-        pad_k = int(k_neighbors) - k_eff
-        neighbor_idx = F.pad(neighbor_idx, (0, pad_k), value=0)
-        neighbor_mask = F.pad(neighbor_mask, (0, pad_k), value=False)
-        dist = F.pad(dist, (0, pad_k), value=0.0)
+    query_k = max(int(k_neighbors) - 1, 0) if self_as_first_neighbor else int(k_neighbors)
+    if query_k > 0:
+        k_eff = min(query_k, max(coords_len, 1))
+        masked_dist = features.pair_dist.masked_fill(~pair_mask, torch.finfo(features.pair_dist.dtype).max)
+        dist, neighbor_idx = torch.topk(masked_dist, k=k_eff, dim=-1, largest=False)
+        neighbor_mask = torch.gather(pair_mask, dim=-1, index=neighbor_idx)
+        if k_eff < query_k:
+            pad_k = query_k - k_eff
+            neighbor_idx = F.pad(neighbor_idx, (0, pad_k), value=0)
+            neighbor_mask = F.pad(neighbor_mask, (0, pad_k), value=False)
+            dist = F.pad(dist, (0, pad_k), value=0.0)
+    else:
+        neighbor_idx, neighbor_mask, dist = _empty_neighbors(coords, dtype=torch.long)
+    if self_as_first_neighbor:
+        neighbor_idx, neighbor_mask, dist = _prepend_self_neighbor_slot(
+            neighbor_idx,
+            neighbor_mask,
+            dist,
+            valid_atom_mask=_valid_atom_mask(coords, pad_mask),
+            k_neighbors=int(k_neighbors),
+        )
+    if mask_by_cutoff:
+        if cutoff is None:
+            raise ValueError("mask_by_cutoff requires cutoff")
+        neighbor_mask = neighbor_mask & (dist < float(cutoff))
     rel = _gather_neighbor_values(-features.pair_delta, neighbor_idx)
+    if include_self or self_as_first_neighbor or mask_by_cutoff:
+        rel = torch.where(neighbor_mask[..., None], rel, torch.zeros_like(rel))
     dist = torch.where(neighbor_mask, dist, torch.zeros_like(dist))
     unit = rel / dist.clamp_min(1e-8).unsqueeze(-1)
     unit = torch.where(neighbor_mask[..., None], unit, torch.zeros_like(unit))
@@ -92,6 +155,7 @@ if TRITON_NONPERIODIC_KNN_AVAILABLE:
         dist2_out_ptr,
         num_atoms: tl.constexpr,
         k_neighbors: tl.constexpr,
+        INCLUDE_SELF: tl.constexpr,
         HAS_PAD_MASK: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -126,7 +190,9 @@ if TRITON_NONPERIODIC_KNN_AVAILABLE:
         for start in tl.range(0, num_atoms, BLOCK_N):
             cand = start + offs_n
             cand_mask = cand < num_atoms
-            valid = cand_mask & (cand != query_idx) & query_valid
+            valid = cand_mask & query_valid
+            if not INCLUDE_SELF:
+                valid = valid & (cand != query_idx)
             if HAS_PAD_MASK:
                 cand_pad = tl.load(pad_mask_ptr + batch_idx * num_atoms + cand, mask=cand_mask, other=1)
                 valid = valid & (cand_pad == 0)
@@ -249,6 +315,9 @@ def build_triton_nonperiodic_knn_geometry_cache(
     cutoff: float | None,
     seq_len: int,
     strict: bool = False,
+    include_self: bool = False,
+    self_as_first_neighbor: bool = False,
+    mask_by_cutoff: bool = False,
 ) -> GeometryCache:
     if coords.ndim != 3 or coords.shape[-1] != 3:
         raise ValueError(f"coords must have shape [B, N, 3], got {tuple(coords.shape)}")
@@ -256,6 +325,10 @@ def build_triton_nonperiodic_knn_geometry_cache(
         raise ValueError(f"pad_mask must have shape {tuple(coords.shape[:2])}, got {tuple(pad_mask.shape)}")
     if int(k_neighbors) <= 0:
         raise ValueError("k_neighbors must be positive")
+    if self_as_first_neighbor and not include_self:
+        raise ValueError("self_as_first_neighbor requires include_self=True")
+    if mask_by_cutoff and cutoff is None:
+        raise ValueError("mask_by_cutoff requires cutoff")
     if int(k_neighbors) > 64:
         raise ValueError("triton_nonperiodic kNN supports k_neighbors <= 64")
     if int(rbf_dim) <= 0:
@@ -282,6 +355,9 @@ def build_triton_nonperiodic_knn_geometry_cache(
                 rbf_dim=rbf_dim,
                 cutoff=cutoff,
                 seq_len=seq_len,
+                include_self=include_self,
+                self_as_first_neighbor=self_as_first_neighbor,
+                mask_by_cutoff=mask_by_cutoff,
             )
 
     coords_f = coords.float().contiguous()
@@ -292,33 +368,50 @@ def build_triton_nonperiodic_knn_geometry_cache(
         else torch.empty((0,), device=coords.device, dtype=torch.bool)
     )
     k_neighbors = int(k_neighbors)
+    topk_neighbors = max(k_neighbors - 1, 0) if self_as_first_neighbor else k_neighbors
     rbf_dim = int(rbf_dim)
-    block_k = _next_power_of_2(k_neighbors)
+    topk_block_k = _next_power_of_2(max(topk_neighbors, 1))
+    feature_block_k = _next_power_of_2(k_neighbors)
     block_n = 32
-    block_merge = _next_power_of_2(block_k + block_n)
+    block_merge = _next_power_of_2(topk_block_k + block_n)
     block_r = _next_power_of_2(rbf_dim)
 
-    neighbor_idx_i32 = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.int32)
-    neighbor_mask = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.bool)
-    dist2 = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.float32)
+    if topk_neighbors > 0:
+        neighbor_idx_i32 = torch.empty((batch_size, num_atoms, topk_neighbors), device=coords.device, dtype=torch.int32)
+        neighbor_mask = torch.empty((batch_size, num_atoms, topk_neighbors), device=coords.device, dtype=torch.bool)
+        dist2 = torch.empty((batch_size, num_atoms, topk_neighbors), device=coords.device, dtype=torch.float32)
+    else:
+        neighbor_idx_i32, neighbor_mask, dist2 = _empty_neighbors(coords, dtype=torch.int32)
 
     grid = (batch_size * num_atoms,)
-    with record_function("triton_knn/topk_kernel"):
-        _nonperiodic_knn_topk_kernel[grid](
-            coords_f,
-            pad,
+    if topk_neighbors > 0:
+        with record_function("triton_knn/topk_kernel"):
+            _nonperiodic_knn_topk_kernel[grid](
+                coords_f,
+                pad,
+                neighbor_idx_i32,
+                neighbor_mask,
+                dist2,
+                num_atoms=num_atoms,
+                k_neighbors=topk_neighbors,
+                INCLUDE_SELF=bool(include_self and not self_as_first_neighbor),
+                HAS_PAD_MASK=pad_mask is not None,
+                BLOCK_N=block_n,
+                BLOCK_K=topk_block_k,
+                BLOCK_MERGE=block_merge,
+                num_warps=4,
+                num_stages=1,
+            )
+    if self_as_first_neighbor:
+        neighbor_idx_i32, neighbor_mask, dist2 = _prepend_self_neighbor_slot(
             neighbor_idx_i32,
             neighbor_mask,
             dist2,
-            num_atoms=num_atoms,
+            valid_atom_mask=_valid_atom_mask(coords, pad_mask),
             k_neighbors=k_neighbors,
-            HAS_PAD_MASK=pad_mask is not None,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            BLOCK_MERGE=block_merge,
-            num_warps=4,
-            num_stages=1,
         )
+    if mask_by_cutoff:
+        neighbor_mask = (neighbor_mask & (dist2 < float(cutoff) * float(cutoff))).contiguous()
 
     rel = torch.empty((batch_size, num_atoms, k_neighbors, 3), device=coords.device, dtype=torch.float32)
     dist = torch.empty((batch_size, num_atoms, k_neighbors), device=coords.device, dtype=torch.float32)
@@ -343,7 +436,7 @@ def build_triton_nonperiodic_knn_geometry_cache(
             rbf_dim=rbf_dim,
             rbf_delta=float(rbf_delta),
             rbf_gamma=float(rbf_gamma),
-            BLOCK_K=block_k,
+            BLOCK_K=feature_block_k,
             BLOCK_R=block_r,
             num_warps=4,
             num_stages=1,
