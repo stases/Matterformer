@@ -48,6 +48,7 @@ MAX_EDGES_PER_BATCH="${MAX_EDGES_PER_BATCH:-2000000}"
 MAX_EDGES_PER_BATCH_VAL="${MAX_EDGES_PER_BATCH_VAL:-2000000}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+PIN_MEMORY="${PIN_MEMORY:-1}"
 BATCHING_MODE="${BATCHING_MODE:-random}"
 BUCKET_WINDOW_SIZE="${BUCKET_WINDOW_SIZE:-4096}"
 BUCKET_SHUFFLE_GROUPS="${BUCKET_SHUFFLE_GROUPS:-8}"
@@ -243,6 +244,7 @@ EXTRA_ARGS=()
 [ "$BF16" = "1" ] && EXTRA_ARGS+=(--bf16) || EXTRA_ARGS+=(--no-bf16)
 [ "$COMPILE" = "1" ] && EXTRA_ARGS+=(--compile) || EXTRA_ARGS+=(--no-compile)
 [ "$SAVE_CHECKPOINT" = "1" ] && EXTRA_ARGS+=(--save-checkpoint) || EXTRA_ARGS+=(--no-save-checkpoint)
+[ "$PIN_MEMORY" = "1" ] && EXTRA_ARGS+=(--pin-memory) || EXTRA_ARGS+=(--no-pin-memory)
 [ "$ALLSCAIP_COMPILE" = "1" ] && EXTRA_ARGS+=(--allscaip-compile) || EXTRA_ARGS+=(--no-allscaip-compile)
 [ "$ALLSCAIP_USE_PADDING" = "1" ] && EXTRA_ARGS+=(--allscaip-use-padding) || EXTRA_ARGS+=(--no-allscaip-use-padding)
 [ "$ALLSCAIP_USE_CHUNKED_GRAPH" = "1" ] && EXTRA_ARGS+=(--allscaip-use-chunked-graph) || EXTRA_ARGS+=(--no-allscaip-use-chunked-graph)
@@ -278,6 +280,9 @@ echo "mlp_ratio:               $MLP_RATIO"
 echo "chgspin_mode:            $CHGSPIN_MODE"
 echo "chgspin_emb_dim:         ${CHGSPIN_EMB_DIM:-null}"
 echo "batch_size:              $BATCH_SIZE"
+echo "num_workers:             $NUM_WORKERS"
+echo "prefetch_factor:         $PREFETCH_FACTOR"
+echo "pin_memory:              $PIN_MEMORY"
 echo "max_graphs_per_batch:    ${MAX_GRAPHS_PER_BATCH:-null}"
 echo "max_graphs_per_batch_val:${MAX_GRAPHS_PER_BATCH_VAL:-null}"
 echo "max_atoms_per_batch:     $MAX_ATOMS_PER_BATCH"
