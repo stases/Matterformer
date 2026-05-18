@@ -390,6 +390,18 @@ def distributed_eval_average(totals: dict[str, float], graphs: int) -> dict[str,
     return {key: float(values[idx].item() / total_graphs) for idx, key in enumerate(keys)}
 
 
+def configure_compile_for_distributed(args: argparse.Namespace) -> None:
+    if not (bool(getattr(args, "distributed", False)) and bool(getattr(args, "compile", False))):
+        return
+    try:
+        import torch._dynamo
+
+        torch._dynamo.config.optimize_ddp = False
+        main_process_print(args, "compile: disabled torch._dynamo.config.optimize_ddp for DDP compatibility")
+    except Exception as exc:
+        main_process_print(args, f"compile: could not disable Dynamo DDP optimizer: {exc}")
+
+
 def maybe_init_wandb(args: argparse.Namespace):
     if not is_main_process(args):
         return None
@@ -833,6 +845,7 @@ def main(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     if args.float32_matmul_precision is not None:
         torch.set_float32_matmul_precision(args.float32_matmul_precision)
+    configure_compile_for_distributed(args)
     args.model_backend = str(args.model_backend).lower().replace("-", "_")
     args.hybrid_config = load_hybrid_config(args.hybrid_config_json) if args.model_backend == "matterformer" else None
     apply_tetra_attention_block_overrides(args.hybrid_config, args)
