@@ -75,6 +75,7 @@ ALLSCAIP_PREPROCESS_ON_CPU="${ALLSCAIP_PREPROCESS_ON_CPU:-0}"
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
 MAX_STEPS="${MAX_STEPS:-0}"
 LR="${LR:-5e-4}"
+LR_MIN="${LR_MIN:-0}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
 MUON_LR="${MUON_LR:-0.02}"
@@ -294,6 +295,7 @@ echo "omol_runtime_mode:       $OMOL_RUNTIME_MODE"
 echo "max_epochs:              $MAX_EPOCHS"
 echo "max_steps:               $MAX_STEPS (0 means epoch-limited)"
 echo "lr:                      $LR"
+echo "lr_min:                  $LR_MIN"
 echo "weight_decay:            $WEIGHT_DECAY"
 echo "optimizer:               $OPTIMIZER"
 echo "muon_lr:                 $MUON_LR"
@@ -402,6 +404,7 @@ echo "============================================================"
   --max-steps "$MAX_STEPS" \
   --warmup-steps "$WARMUP_STEPS" \
   --lr "$LR" \
+  --lr-min "$LR_MIN" \
   --weight-decay "$WEIGHT_DECAY" \
   --optimizer "$OPTIMIZER" \
   --muon-lr "$MUON_LR" \

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 from typing import Mapping
 
 import numpy as np
@@ -8,14 +9,45 @@ import torch
 
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup: int, max_iters: int):
+    def __init__(
+        self,
+        optimizer,
+        warmup: int,
+        max_iters: int,
+        *,
+        lr_min: float = 0.0,
+        min_lrs: Sequence[float] | None = None,
+    ):
         self.warmup = int(warmup)
         self.max_iters = int(max_iters)
+        self.lr_min = float(lr_min)
+        self.min_lrs = None if min_lrs is None else [float(value) for value in min_lrs]
         super().__init__(optimizer)
 
     def get_lr(self):
         factor = self._get_lr_factor(self.last_epoch)
-        return [base_lr * factor for base_lr in self.base_lrs]
+        min_lrs = self._get_min_lrs()
+        if self._is_warmup_step(self.last_epoch):
+            return [base_lr * factor for base_lr in self.base_lrs]
+        return [
+            min_lr + (base_lr - min_lr) * factor
+            for base_lr, min_lr in zip(self.base_lrs, min_lrs, strict=True)
+        ]
+
+    def _get_min_lrs(self) -> list[float]:
+        if self.min_lrs is None:
+            min_lrs = [self.lr_min for _ in self.base_lrs]
+        else:
+            if len(self.min_lrs) != len(self.base_lrs):
+                raise ValueError(
+                    f"min_lrs length {len(self.min_lrs)} does not match optimizer param groups {len(self.base_lrs)}"
+                )
+            min_lrs = list(self.min_lrs)
+        return [min(float(min_lr), float(base_lr)) for base_lr, min_lr in zip(self.base_lrs, min_lrs, strict=True)]
+
+    def _is_warmup_step(self, step_index: int) -> bool:
+        step = max(int(step_index) + 1, 1)
+        return self.warmup > 0 and step <= self.warmup
 
     def _get_lr_factor(self, step_index: int) -> float:
         step = max(int(step_index) + 1, 1)

@@ -203,6 +203,39 @@ def build_optimizer(model: torch.nn.Module, args: argparse.Namespace) -> torch.o
     return SingleDeviceMuonWithAuxAdam(param_groups)
 
 
+def resolve_scheduler_max_iters(args: argparse.Namespace, train_loader: DataLoader) -> int:
+    if args.max_steps > 0:
+        return int(args.max_steps)
+    if args.max_epochs is None:
+        raise ValueError("--max-steps <= 0 requires --max-epochs so the LR scheduler has a finite horizon")
+    batches_per_epoch = int(len(train_loader))
+    if batches_per_epoch <= 0:
+        raise ValueError("train_loader has no batches; cannot resolve an epoch-limited LR scheduler horizon")
+    return int(args.max_epochs) * batches_per_epoch
+
+
+def resolve_scheduler_min_lrs(optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> list[float]:
+    lr_min = float(args.lr_min)
+    if lr_min < 0.0:
+        raise ValueError("--lr-min must be non-negative")
+    if lr_min == 0.0:
+        return [0.0 for _ in optimizer.param_groups]
+
+    optimizer_name = str(args.optimizer).lower()
+    if optimizer_name == "muon":
+        reference_lr = float(args.muon_adam_lr if args.muon_adam_lr is not None else args.lr)
+    else:
+        reference_lr = float(args.lr)
+    if reference_lr <= 0.0:
+        raise ValueError("Reference learning rate must be positive when --lr-min is positive")
+
+    min_lrs = []
+    for group in optimizer.param_groups:
+        group_lr = float(group["lr"])
+        min_lrs.append(lr_min * group_lr / reference_lr)
+    return min_lrs
+
+
 def _config_values_match(actual, expected) -> bool:
     if isinstance(expected, float):
         try:
@@ -797,7 +830,23 @@ def main(args: argparse.Namespace) -> None:
         print("compile: AllScAIP backend skips the outer torch.compile wrapper; use --allscaip-compile to control its internal compile path")
 
     optimizer = build_optimizer(model, args)
-    scheduler = CosineWarmupScheduler(optimizer, warmup=args.warmup_steps, max_iters=args.max_steps)
+    scheduler_max_iters = resolve_scheduler_max_iters(args, train_loader)
+    scheduler_min_lrs = resolve_scheduler_min_lrs(optimizer, args)
+    args.scheduler_resolved = {
+        "name": "cosine_warmup",
+        "warmup_steps": int(args.warmup_steps),
+        "max_iters": int(scheduler_max_iters),
+        "lr_min": float(args.lr_min),
+        "base_lrs": [float(group["lr"]) for group in optimizer.param_groups],
+        "min_lrs": [float(value) for value in scheduler_min_lrs],
+    }
+    print("scheduler_resolved: " + json.dumps(args.scheduler_resolved, sort_keys=True))
+    scheduler = CosineWarmupScheduler(
+        optimizer,
+        warmup=args.warmup_steps,
+        max_iters=scheduler_max_iters,
+        min_lrs=scheduler_min_lrs,
+    )
     run = maybe_init_wandb(args)
 
     checkpoint_path = Path(args.output)
@@ -854,6 +903,7 @@ def main(args: argparse.Namespace) -> None:
     )
     print(f"precision: bf16={args.bf16} matmul={args.float32_matmul_precision}")
     print(f"normalization: rmsd={args.normalizer_rmsd} energy_weight={args.energy_weight} force_weight={args.force_weight}")
+    print("scheduler: " + json.dumps(args.scheduler_resolved, sort_keys=True))
     summarize_loader_startup("train", train_loader, run)
     summarize_loader_startup("val", val_loader, run)
     if hasattr(base_model, "allscaip_config"):
@@ -1212,6 +1262,15 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=0.0,
+        help=(
+            "Final cosine LR floor for the reference Adam LR. For Muon, this is applied to the aux Adam "
+            "LR and scaled proportionally for the Muon LR so both groups keep the same decay ratio."
+        ),
+    )
     parser.add_argument("--normalizer-rmsd", type=float, default=1.433569)
     parser.add_argument("--energy-weight", type=float, default=10.0)
     parser.add_argument("--force-weight", type=float, default=10.0)
