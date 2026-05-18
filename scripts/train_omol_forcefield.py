@@ -832,10 +832,13 @@ def main(args: argparse.Namespace) -> None:
             base_model = unwrap_model(model)
             compile_message = f"compile: compiled Matterformer trunk only scope={args.compile_scope} mode={args.compile_mode}"
             if args.omol_runtime_mode == "internal_flat_tetra":
-                if base_model.trunk._radius_sparse_layout_config() is not None:
+                if (
+                    base_model.trunk._radius_sparse_layout_config() is not None
+                    or base_model.trunk._fixed_k_local_config() is not None
+                ):
                     compile_stats = base_model.trunk.compile_flat_tetra_layer_forwards(mode=args.compile_mode)
                     compile_message = (
-                        "compile: compiled Matterformer radius-sparse flat tetra layer scope "
+                        "compile: compiled Matterformer sparse/local flat tetra layer scope "
                         f"mode={args.compile_mode} stats={compile_stats}"
                     )
                 else:

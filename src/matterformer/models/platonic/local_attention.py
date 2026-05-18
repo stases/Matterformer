@@ -37,6 +37,86 @@ class ESENFixedKLocalAttentionFeatures:
     type_base: torch.Tensor
 
 
+@dataclass(frozen=True)
+class FixedKLocalAttentionContext:
+    """Prepared fixed-K neighbor tensors for one flat atom batch."""
+
+    neighbor_idx: torch.Tensor
+    neighbor_mask: torch.Tensor
+    dist: torch.Tensor
+    rbf: torch.Tensor | None = None
+    esen_features: ESENFixedKLocalAttentionFeatures | None = None
+
+
+@dataclass(frozen=True)
+class ESENFixedKLocalBiasView:
+    """Non-owning eSEN fixed-K bias view over PlatonicAttention parameters."""
+
+    rbf_weight: torch.Tensor
+    centers: torch.Tensor
+    gamma: torch.Tensor
+    cutoff: float
+    heads_per_frame: int
+    type_bias: torch.Tensor | None = None
+    diag_zero: bool = True
+    envelope_in_score: bool = True
+
+    def __call__(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        neighbor_mask: torch.Tensor,
+        dist: torch.Tensor | None,
+        rbf: torch.Tensor | None,
+        atom_types: torch.Tensor | None,
+    ) -> FixedKLocalBiasResult:
+        del k, v
+        if dist is None:
+            raise ValueError("ESENFixedKLocalBiasView requires dist")
+        dist = dist.to(device=q.device, dtype=q.dtype)
+        neighbor_mask = neighbor_mask.to(device=q.device, dtype=torch.bool)
+        neighbor_idx = neighbor_idx.to(device=q.device, dtype=torch.long).masked_fill(~neighbor_mask, 0)
+        if rbf is None:
+            centers = self.centers.to(device=q.device, dtype=q.dtype)
+            gamma = self.gamma.to(device=q.device, dtype=q.dtype)
+            rbf = torch.exp(-gamma * (dist[..., None] - centers.view(1, 1, -1)).square())
+        else:
+            rbf = rbf.to(device=q.device, dtype=q.dtype)
+        if q.shape[1] % int(self.heads_per_frame) != 0:
+            raise ValueError("heads_per_frame must divide the number of attention heads")
+
+        same = neighbor_idx == torch.arange(q.shape[0], device=q.device)[:, None]
+        local_mask = neighbor_mask & (dist < float(self.cutoff))
+        local_mask = local_mask | (same & neighbor_mask)
+        env = _c2_quintic_envelope(dist, float(self.cutoff))
+        env = torch.where(neighbor_mask, env, torch.zeros_like(env))
+        env_bias = env.masked_fill(same, 0.0) if bool(self.diag_zero) else env
+
+        raw_subhead = torch.einsum(
+            "nkr,sr->nks",
+            rbf,
+            self.rbf_weight.to(device=q.device, dtype=q.dtype),
+        )
+        if self.type_bias is not None:
+            if atom_types is None:
+                raise ValueError("type_bias requires atom_types")
+            zmax = int(self.type_bias.shape[0]) - 1
+            zi = atom_types.to(device=q.device).long().clamp(min=0, max=zmax)
+            zj = zi.index_select(0, neighbor_idx.reshape(-1)).reshape_as(neighbor_idx)
+            raw_subhead = raw_subhead + self.type_bias.to(device=q.device, dtype=q.dtype)[zi[:, None], zj]
+
+        subhead_bias = env_bias[..., None] * raw_subhead
+        head_subidx = torch.arange(q.shape[1], device=q.device) % int(self.heads_per_frame)
+        bias = subhead_bias.index_select(dim=-1, index=head_subidx).permute(0, 2, 1).contiguous()
+        if self.envelope_in_score:
+            env_score = env.masked_fill(same & neighbor_mask, 1.0)
+            bias = bias + env_score.clamp_min(1.0e-20).log().unsqueeze(1).to(dtype=bias.dtype)
+        return FixedKLocalBiasResult(bias=bias, mask=local_mask)
+
+
 class FixedKLocalBias(nn.Module):
     """Base class for replaceable fixed-K local attention biases."""
 

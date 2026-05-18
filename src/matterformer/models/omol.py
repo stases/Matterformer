@@ -967,6 +967,36 @@ class MatterformerOMolForceField(nn.Module):
                 )
                 del padded_geom
 
+        fixed_k_context = None
+        fixed_k_cfg = self.trunk._fixed_k_local_config()
+        if fixed_k_cfg is not None:
+            if flat_hybrid:
+                raise RuntimeError("fixed-K local Platonic attention is currently supported only in internal_flat_tetra")
+            with record_function("omol/fixed_k_local_geometry_cache"):
+                padded_fixed_k_geom = build_triton_nonperiodic_knn_geometry_cache(
+                    centered_coords_padded,
+                    pad_mask=pad_mask,
+                    k_neighbors=int(fixed_k_cfg["k_neighbors"]),
+                    rbf_dim=int(fixed_k_cfg["num_rbf"]),
+                    cutoff=float(fixed_k_cfg["cutoff"]),
+                    seq_len=num_slots,
+                    strict=bool(fixed_k_cfg["strict"]),
+                    include_self=bool(fixed_k_cfg["include_self"]),
+                    self_as_first_neighbor=bool(fixed_k_cfg["self_as_first_neighbor"]),
+                    mask_by_cutoff=bool(fixed_k_cfg["mask_by_cutoff"]),
+                )
+                flat_fixed_k_geom = flatten_padded_geometry_cache(
+                    padded_fixed_k_geom,
+                    valid=valid,
+                    batch_index=batch_index,
+                    cu_seqlens=cu_seqlens,
+                )
+                fixed_k_context = self.trunk.prepare_fixed_k_local_context(
+                    flat_fixed_k_geom,
+                    atom_types=atomic_flat,
+                )
+                del padded_fixed_k_geom, flat_fixed_k_geom
+
         with record_function("omol/trunk_flat"):
             if flat_hybrid:
                 trunk_result = self.trunk.forward_flat_hybrid(
@@ -987,6 +1017,7 @@ class MatterformerOMolForceField(nn.Module):
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     chgspin_film=chgspin_film,
+                    fixed_k_context=fixed_k_context,
                     return_output=True,
                 )
         if not isinstance(trunk_result, HybridFlatTrunkOutput) or trunk_result.group is None:

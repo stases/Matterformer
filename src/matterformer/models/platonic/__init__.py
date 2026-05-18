@@ -6,6 +6,8 @@ from matterformer.models.platonic.groups import (
 from matterformer.models.platonic.local_attention import (
     ESENEnvelopedRBFTypeFixedKBias,
     ESENFixedKLocalAttentionFeatures,
+    ESENFixedKLocalBiasView,
+    FixedKLocalAttentionContext,
     FixedKLocalBias,
     FixedKLocalBiasResult,
     NoFixedKLocalBias,
@@ -31,6 +33,8 @@ __all__ = [
     "PLATONIC_GROUPS",
     "ESENEnvelopedRBFTypeFixedKBias",
     "ESENFixedKLocalAttentionFeatures",
+    "ESENFixedKLocalBiasView",
+    "FixedKLocalAttentionContext",
     "FixedKLocalBias",
     "FixedKLocalBiasResult",
     "NoFixedKLocalBias",

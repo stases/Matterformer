@@ -8,6 +8,11 @@ from torch import nn
 
 from matterformer.models.platonic.groups import PLATONIC_GROUPS
 from matterformer.models.platonic.linear import PlatonicLinear
+from matterformer.models.platonic.local_attention import (
+    ESENFixedKLocalBiasView,
+    FixedKLocalAttentionContext,
+)
+from matterformer.models.platonic.local_attention_triton import fixed_k_local_attention_triton
 from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout
 from matterformer.models.platonic.rope import PlatonicRoPE
 from matterformer.models.platonic.triton_attention import (
@@ -31,6 +36,13 @@ TRITON_BIAS_BACKEND_ALIASES = {
     "triton_radius_sparse": "radius_rbf_type_enveloped",
     "triton_esen_local": "radius_rbf_type_enveloped",
 }
+FIXED_K_BACKEND_ALIASES = {
+    "fixed_k": "fixed_k_esen",
+    "fixed_k_triton": "fixed_k_esen",
+    "triton_fixed_k": "fixed_k_esen",
+    "triton_fixed_k_esen": "fixed_k_esen",
+    "fixed_k_esen_local": "fixed_k_esen",
+}
 TORCH_BIAS_BACKEND_ALIASES = {
     "torch_rbf_type_bias": "rbf_type_enveloped",
     "torch_smooth_local": "rbf_type_enveloped",
@@ -40,14 +52,15 @@ TORCH_BIAS_BACKEND_ALIASES = {
 }
 TRITON_RADIAL_BACKENDS = TRITON_BIAS_BACKEND_ALIASES
 TORCH_LOCAL_BIAS_BACKENDS = TORCH_BIAS_BACKEND_ALIASES
-LOCAL_BIAS_BACKENDS = {**TRITON_BIAS_BACKEND_ALIASES, **TORCH_BIAS_BACKEND_ALIASES}
-CANONICAL_ATTENTION_BACKENDS = {"sdpa", "flash", "triton", "torch_reference"}
+LOCAL_BIAS_BACKENDS = {**TRITON_BIAS_BACKEND_ALIASES, **TORCH_BIAS_BACKEND_ALIASES, **FIXED_K_BACKEND_ALIASES}
+CANONICAL_ATTENTION_BACKENDS = {"sdpa", "flash", "triton", "torch_reference", "fixed_k_triton"}
 CANONICAL_ATTENTION_BIAS_KINDS = {
     "radial_rbf",
     "radial_r2",
     "radial_slope",
     "rbf_type_enveloped",
     "radius_rbf_type_enveloped",
+    "fixed_k_esen",
 }
 
 
@@ -75,6 +88,8 @@ def _normalize_attention_bias_kind(value: str | None) -> str | None:
         "esen_like",
     }:
         key = "radius_rbf_type_enveloped"
+    elif key in {"fixed_k", "fixed_k_esen", "fixed_k_esen_local", "knn_esen", "local_esen_fixed_k"}:
+        key = "fixed_k_esen"
     if key not in CANONICAL_ATTENTION_BIAS_KINDS:
         raise ValueError(f"attention_bias.kind must be one of {sorted(CANONICAL_ATTENTION_BIAS_KINDS)}, got {value!r}")
     return key
@@ -92,6 +107,9 @@ def _normalize_attention_backend_and_bias(
     if backend in TRITON_BIAS_BACKEND_ALIASES:
         alias_kind = TRITON_BIAS_BACKEND_ALIASES[backend]
         backend = "triton"
+    elif backend in FIXED_K_BACKEND_ALIASES:
+        alias_kind = FIXED_K_BACKEND_ALIASES[backend]
+        backend = "fixed_k_triton"
     elif backend in TORCH_BIAS_BACKEND_ALIASES:
         alias_kind = TORCH_BIAS_BACKEND_ALIASES[backend]
         backend = "torch_reference"
@@ -214,6 +232,12 @@ class PlatonicAttention(nn.Module):
         self.triton_block_n = int(self.attention_bias_config.get("block_n", 32))
         self.triton_strict = bool(self.attention_bias_config.get("strict", False))
         self.triton_precision = str(self.attention_bias_config.get("precision", "tf32"))
+        self.fixed_k_neighbors = int(
+            self.attention_bias_config.get(
+                "k_neighbors",
+                self.attention_bias_config.get("k", self.attention_bias_config.get("neighbors", 48)),
+            )
+        )
         self.rbf_weight: nn.Parameter | None
         self.rbf_gate: nn.Parameter | None
         self.rbf_type_bias: nn.Parameter | None
@@ -221,7 +245,16 @@ class PlatonicAttention(nn.Module):
         bias_kind = self.attention_bias_config.get("kind")
         if bias_kind is not None:
             bias_kind = _normalize_attention_bias_kind(str(bias_kind))
-            if self.attention_backend not in {"triton", "torch_reference"}:
+            if bias_kind == "fixed_k_esen":
+                if self.attention_backend != "fixed_k_triton":
+                    raise ValueError(
+                        "attention_bias.kind='fixed_k_esen' requires attention_backend='fixed_k_triton'"
+                    )
+                if self.fixed_k_neighbors <= 0:
+                    raise ValueError("attention_bias.k_neighbors must be positive for fixed_k_esen")
+                if self.fixed_k_neighbors > 64:
+                    raise ValueError("fixed_k_esen currently supports attention_bias.k_neighbors <= 64")
+            elif self.attention_backend not in {"triton", "torch_reference"}:
                 raise ValueError(
                     f"attention_bias.kind={bias_kind!r} requires attention_backend='triton' or 'torch_reference'"
                 )
@@ -232,16 +265,16 @@ class PlatonicAttention(nn.Module):
                 raise ValueError(
                     "attention_backend='torch_reference' supports attention_bias.kind="
                     "{'rbf_type_enveloped', 'radius_rbf_type_enveloped'}"
-                )
+            )
             self.radial_bias_kind = bias_kind
-            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped"}:
+            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped", "fixed_k_esen"}:
                 default_num_rbf = 4
             else:
                 default_num_rbf = 8 if bias_kind == "radial_rbf" else 1
             num_rbf = int(self.attention_bias_config.get("num_rbf", default_num_rbf))
             if num_rbf <= 0:
                 raise ValueError("attention_bias.num_rbf/num_basis must be positive")
-            if bias_kind in {"radial_rbf", "rbf_type_enveloped", "radius_rbf_type_enveloped"}:
+            if bias_kind in {"radial_rbf", "rbf_type_enveloped", "radius_rbf_type_enveloped", "fixed_k_esen"}:
                 rbf_min = float(self.attention_bias_config.get("rbf_min", 0.0))
                 rbf_max = float(self.attention_bias_config.get("rbf_max", self.attention_bias_config.get("cutoff", 6.0)))
                 centers = torch.linspace(rbf_min, rbf_max, num_rbf)
@@ -258,7 +291,7 @@ class PlatonicAttention(nn.Module):
             self.rbf_weight = nn.Parameter(torch.zeros(self.heads_per_frame, num_rbf))
             if not zero_init:
                 nn.init.normal_(self.rbf_weight, mean=0.0, std=1.0e-3)
-            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped"}:
+            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped", "fixed_k_esen"}:
                 self.rbf_gate = None
                 self.local_cutoff = float(self.attention_bias_config.get("cutoff", 6.0))
                 self.local_max_atomic_number = int(self.attention_bias_config.get("max_atomic_number", 118))
@@ -276,7 +309,7 @@ class PlatonicAttention(nn.Module):
                 self.local_envelope_in_score = bool(
                     self.attention_bias_config.get(
                         "envelope_in_score",
-                        bias_kind == "radius_rbf_type_enveloped",
+                        bias_kind in {"radius_rbf_type_enveloped", "fixed_k_esen"},
                     )
                 )
             else:
@@ -320,6 +353,23 @@ class PlatonicAttention(nn.Module):
             "block_n": int(self.triton_block_n),
             "sort": str(self.attention_bias_config.get("sort", "cell")),
             "include_self": bool(self.local_include_self),
+        }
+
+    def fixed_k_local_config(self) -> dict | None:
+        if self.attention_backend != "fixed_k_triton" or self.radial_bias_kind != "fixed_k_esen":
+            return None
+        return {
+            "k_neighbors": int(self.fixed_k_neighbors),
+            "cutoff": float(self.local_cutoff),
+            "num_rbf": int(self.rbf_centers.numel()),
+            "max_atomic_number": int(self.local_max_atomic_number),
+            "include_self": bool(self.local_include_self),
+            "self_as_first_neighbor": bool(self.local_include_self),
+            "mask_by_cutoff": True,
+            "heads_per_frame": int(self.heads_per_frame),
+            "diag_zero": bool(self.rbf_diag_zero),
+            "envelope_in_score": bool(self.local_envelope_in_score),
+            "strict": bool(self.triton_strict),
         }
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
@@ -561,6 +611,56 @@ class PlatonicAttention(nn.Module):
             causal=False,
         ).to(orig_dtype)
 
+    def _fixed_k_attention_flat(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        atom_types: torch.Tensor | None = None,
+        fixed_k_context: FixedKLocalAttentionContext | None = None,
+    ) -> torch.Tensor:
+        dropout_p = self.dropout if self.training else 0.0
+        if dropout_p != 0.0:
+            raise ValueError("fixed-K Triton flat attention currently requires dropout=0")
+        if self.radial_bias_kind != "fixed_k_esen":
+            raise ValueError("attention_backend='fixed_k_triton' currently requires attention_bias.kind='fixed_k_esen'")
+        if fixed_k_context is None:
+            raise ValueError("fixed-K Triton attention requires fixed_k_context")
+        if self.rbf_weight is None:
+            raise RuntimeError("fixed-K eSEN attention was initialized without RBF parameters")
+        if self.rbf_type_bias is not None and atom_types is None and fixed_k_context.esen_features is None:
+            raise ValueError("fixed-K eSEN type bias requires atom_types or precomputed eSEN features")
+        if fixed_k_context.neighbor_idx.shape[0] != q.shape[0]:
+            raise ValueError(
+                f"fixed_k_context has {fixed_k_context.neighbor_idx.shape[0]} rows, expected {q.shape[0]}"
+            )
+        bias = ESENFixedKLocalBiasView(
+            rbf_weight=self.rbf_weight,
+            centers=self.rbf_centers,
+            gamma=self.rbf_gamma,
+            cutoff=float(self.local_cutoff),
+            heads_per_frame=int(self.heads_per_frame),
+            type_bias=self.rbf_type_bias,
+            diag_zero=bool(self.rbf_diag_zero),
+            envelope_in_score=bool(self.local_envelope_in_score),
+        )
+        return fixed_k_local_attention_triton(
+            q,
+            k,
+            v,
+            neighbor_idx=fixed_k_context.neighbor_idx,
+            neighbor_mask=fixed_k_context.neighbor_mask,
+            bias=bias,
+            dist=fixed_k_context.dist,
+            rbf=fixed_k_context.rbf,
+            esen_features=fixed_k_context.esen_features,
+            atom_types=atom_types,
+            precision=self.triton_precision,
+            max_atomic_number=self.local_max_atomic_number,
+            strict=self.triton_strict,
+        )
+
     def _triton_attention_flat(
         self,
         q: torch.Tensor,
@@ -730,7 +830,7 @@ class PlatonicAttention(nn.Module):
         q = q.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        if self.attention_backend in {"triton", "torch_reference"}:
+        if self.attention_backend in {"triton", "torch_reference", "fixed_k_triton"}:
             raise ValueError(
                 "Platonic Triton/local-bias attention is implemented for forward_flat only; "
                 "use omol_runtime_mode='internal_flat_tetra' or switch attention_backend to 'flash'/'sdpa'."
@@ -758,6 +858,7 @@ class PlatonicAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         radius_layout: RadiusBlockSparseLayout | None = None,
+        fixed_k_context: FixedKLocalAttentionContext | None = None,
     ) -> torch.Tensor:
         q, k, v, rope_factors = self._project_qkv_with_rope(x, pos)
         num_tokens = x.shape[0]
@@ -776,6 +877,14 @@ class PlatonicAttention(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=int(max_seqlen),
                 radius_layout=radius_layout,
+            )
+        elif self.attention_backend == "fixed_k_triton":
+            out = self._fixed_k_attention_flat(
+                q,
+                k,
+                v,
+                atom_types=atom_types,
+                fixed_k_context=fixed_k_context,
             )
         elif self.attention_backend == "torch_reference":
             out = self._torch_local_bias_attention_flat(
@@ -866,6 +975,9 @@ class PlatonicBlock(nn.Module):
     def radius_sparse_layout_config(self) -> dict | None:
         return self.attn.radius_sparse_layout_config()
 
+    def fixed_k_local_config(self) -> dict | None:
+        return self.attn.fixed_k_local_config()
+
     def _apply_layer_scale(self, x: torch.Tensor, gamma: torch.Tensor | None) -> torch.Tensor:
         if gamma is None:
             return x
@@ -897,6 +1009,7 @@ class PlatonicBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         radius_layout: RadiusBlockSparseLayout | None = None,
+        fixed_k_context: FixedKLocalAttentionContext | None = None,
     ) -> torch.Tensor:
         attn_out = self.dropout(
             self.attn.forward_flat(
@@ -906,6 +1019,7 @@ class PlatonicBlock(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 radius_layout=radius_layout,
+                fixed_k_context=fixed_k_context,
             )
         )
         x = x + self._apply_layer_scale(attn_out, self.gamma_1)

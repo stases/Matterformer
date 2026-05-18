@@ -13,6 +13,10 @@ from matterformer.geometry.adapters import BaseGeometryAdapter, GeometryFeatures
 from matterformer.geometry.cache import FlatGeometryCache, GeometryCache
 from matterformer.geometry.triton_nonperiodic_knn import build_triton_nonperiodic_knn_geometry_cache
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
+from matterformer.models.platonic.local_attention import (
+    FixedKLocalAttentionContext,
+    prepare_esen_fixed_k_local_attention_features,
+)
 from matterformer.models.platonic.layers import GroupLayerNorm
 from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout, build_radius_block_sparse_layout
 from matterformer.models.transformer import AdaLNBlock, GeometryBiasBuilder, _canonicalize_mha_position_mode
@@ -124,7 +128,8 @@ def _tetra_config_for_layer(base_config: dict[str, Any], layer_idx: int) -> dict
         for key, value in local_cfg.items()
         if key not in {"enabled", "backend", "every", "offset"}
     }
-    attention_bias.setdefault("kind", "rbf_type_enveloped")
+    backend = str(local_cfg.get("backend", "triton")).lower().replace("-", "_")
+    attention_bias.setdefault("kind", "fixed_k_esen" if "fixed_k" in backend else "rbf_type_enveloped")
     scheduled["attention_bias"] = attention_bias
     return scheduled
 
@@ -1894,6 +1899,9 @@ class TetraPlatonicGlobalLayer(nn.Module):
     def radius_sparse_layout_config(self) -> dict | None:
         return self.block.radius_sparse_layout_config()
 
+    def fixed_k_local_config(self) -> dict | None:
+        return self.block.fixed_k_local_config()
+
     @staticmethod
     def _positions(pos: torch.Tensor, seq_len: int) -> torch.Tensor:
         if pos.shape[1] == seq_len:
@@ -1950,6 +1958,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
         max_seqlen: int,
         chgspin_film: torch.Tensor | None = None,
         radius_layout: RadiusBlockSparseLayout | None = None,
+        fixed_k_context: FixedKLocalAttentionContext | None = None,
     ) -> torch.Tensor:
         with record_function("tetra_global/platonic_block_flat"):
             if group.ndim != 3 or group.shape[1:] != (self.group_order, self.dim_per_frame):
@@ -1966,6 +1975,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 radius_layout=radius_layout,
+                fixed_k_context=fixed_k_context,
             )
             return x.view_as(group)
 
@@ -2339,6 +2349,71 @@ class HybridTransformerTrunk(nn.Module):
                     )
         return expected
 
+    def _fixed_k_local_config(self) -> dict | None:
+        expected: dict | None = None
+        for block in self.blocks:
+            for layer in block.sublayers:
+                if not isinstance(layer, TetraPlatonicGlobalLayer):
+                    continue
+                cfg = layer.fixed_k_local_config()
+                if cfg is None:
+                    continue
+                if expected is None:
+                    expected = cfg
+                elif cfg != expected:
+                    raise ValueError(
+                        "All fixed-K local Platonic layers in a flat trunk must use the same "
+                        f"geometry settings, got {cfg} and {expected}"
+                    )
+        return expected
+
+    def _first_fixed_k_attention(self) -> Any | None:
+        for block in self.blocks:
+            for layer in block.sublayers:
+                if not isinstance(layer, TetraPlatonicGlobalLayer):
+                    continue
+                if layer.fixed_k_local_config() is not None:
+                    return layer.block.attn
+        return None
+
+    @torch._dynamo.disable
+    def prepare_fixed_k_local_context(
+        self,
+        flat_geom: FlatGeometryCache,
+        *,
+        atom_types: torch.Tensor | None,
+    ) -> FixedKLocalAttentionContext:
+        attn = self._first_fixed_k_attention()
+        if attn is None:
+            raise RuntimeError("prepare_fixed_k_local_context called without fixed-K local layers")
+        cfg = self._fixed_k_local_config()
+        if cfg is None:
+            raise RuntimeError("fixed-K local config is unavailable")
+        if int(flat_geom.k_neighbors) != int(cfg["k_neighbors"]):
+            raise ValueError(
+                f"fixed-K geometry has K={flat_geom.k_neighbors}, expected {int(cfg['k_neighbors'])}"
+            )
+        features = prepare_esen_fixed_k_local_attention_features(
+            neighbor_idx=flat_geom.neighbor_idx,
+            neighbor_mask=flat_geom.neighbor_mask,
+            dist=flat_geom.dist,
+            centers=attn.rbf_centers,
+            gamma=attn.rbf_gamma,
+            cutoff=float(attn.local_cutoff),
+            heads_per_frame=int(attn.heads_per_frame),
+            atom_types=atom_types if attn.rbf_type_bias is not None else None,
+            max_atomic_number=int(attn.local_max_atomic_number),
+            diag_zero=bool(attn.rbf_diag_zero),
+            envelope_in_score=bool(attn.local_envelope_in_score),
+        )
+        return FixedKLocalAttentionContext(
+            neighbor_idx=flat_geom.neighbor_idx,
+            neighbor_mask=flat_geom.neighbor_mask,
+            dist=flat_geom.dist,
+            rbf=flat_geom.rbf,
+            esen_features=features,
+        )
+
     def compile_flat_tetra_layer_forwards(self, *, mode: str = "default") -> dict[str, int]:
         """Compile flat tetra layer calls while leaving dynamic sparse layout plumbing eager.
 
@@ -2353,6 +2428,7 @@ class HybridTransformerTrunk(nn.Module):
             raise RuntimeError("compile_flat_tetra_layer_forwards requires a flat tetra-compatible trunk")
         compiled = 0
         skipped_radius_sparse = 0
+        skipped_fixed_k_local = 0
         for block in self.blocks:
             for layer in block.sublayers:
                 if not isinstance(layer, TetraPlatonicGlobalLayer):
@@ -2360,11 +2436,15 @@ class HybridTransformerTrunk(nn.Module):
                 if layer.radius_sparse_layout_config() is not None:
                     skipped_radius_sparse += 1
                     continue
+                if layer.fixed_k_local_config() is not None:
+                    skipped_fixed_k_local += 1
+                    continue
                 layer.forward_flat = torch.compile(layer.forward_flat, mode=mode)  # type: ignore[method-assign]
                 compiled += 1
         return {
             "compiled_layers": compiled,
             "skipped_radius_sparse_layers": skipped_radius_sparse,
+            "skipped_fixed_k_local_layers": skipped_fixed_k_local,
         }
 
     def _local_moment_lift_features(self, geom: GeometryCache, *, dtype: torch.dtype) -> torch.Tensor:
@@ -2415,6 +2495,7 @@ class HybridTransformerTrunk(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         chgspin_film: torch.Tensor | None = None,
+        fixed_k_context: FixedKLocalAttentionContext | None = None,
         return_output: bool = False,
     ) -> torch.Tensor | HybridFlatTrunkOutput:
         if not self.supports_flat_tetra:
@@ -2430,10 +2511,15 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"Expected flat coords [N, 3], got {tuple(coords.shape)} for x {tuple(x.shape)}")
         if atom_types is not None and atom_types.shape != (x.shape[0],):
             raise ValueError(f"Expected flat atom_types [{x.shape[0]}], got {tuple(atom_types.shape)}")
+        fixed_k_cfg = self._fixed_k_local_config()
+        if fixed_k_cfg is not None and fixed_k_context is None:
+            raise ValueError("forward_flat_tetra with fixed-K local layers requires fixed_k_context")
 
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         radius_layout = None
         radius_cfg = self._radius_sparse_layout_config()
+        if radius_cfg is not None and fixed_k_cfg is not None:
+            raise ValueError("A flat tetra trunk cannot mix radius-sparse and fixed-K local attention layers yet")
         if radius_cfg is not None:
             with record_function("hybrid_trunk_flat/radius_sparse_layout"):
                 radius_layout = build_radius_block_sparse_layout(
@@ -2473,6 +2559,7 @@ class HybridTransformerTrunk(nn.Module):
                         max_seqlen=int(max_seqlen),
                         chgspin_film=chgspin_film,
                         radius_layout=radius_layout,
+                        fixed_k_context=fixed_k_context,
                     )
         if radius_layout is not None:
             group = group.index_select(0, radius_layout.inv_perm)
@@ -2520,6 +2607,11 @@ class HybridTransformerTrunk(nn.Module):
             raise RuntimeError(
                 "radius-sparse Platonic attention is currently wired only for forward_flat_tetra; "
                 "forward_flat_hybrid would also need to permute FlatGeometryCache."
+            )
+        if self._fixed_k_local_config() is not None:
+            raise RuntimeError(
+                "fixed-K local Platonic attention is currently wired only for forward_flat_tetra; "
+                "forward_flat_hybrid needs a shared fixed-K context path before use."
             )
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         with record_function("hybrid_trunk_flat_hybrid/lift_tetra_input"):

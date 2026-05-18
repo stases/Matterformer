@@ -7,6 +7,7 @@ import torch
 from matterformer.models.platonic.local_attention import (
     ESENEnvelopedRBFTypeFixedKBias,
     ESENFixedKLocalAttentionFeatures,
+    ESENFixedKLocalBiasView,
     FixedKLocalBias,
     NoFixedKLocalBias,
     fixed_k_local_attention_torch_reference,
@@ -55,7 +56,7 @@ def _fallback_or_raise(
     v: torch.Tensor,
     neighbor_idx: torch.Tensor,
     neighbor_mask: torch.Tensor,
-    bias: FixedKLocalBias | None,
+    bias: FixedKLocalBias | ESENFixedKLocalBiasView | None,
     dist: torch.Tensor | None,
     rbf: torch.Tensor | None,
     atom_types: torch.Tensor | None,
@@ -1506,7 +1507,7 @@ def fixed_k_local_attention_triton(
     *,
     neighbor_idx: torch.Tensor,
     neighbor_mask: torch.Tensor,
-    bias: FixedKLocalBias | None = None,
+    bias: FixedKLocalBias | ESENFixedKLocalBiasView | None = None,
     dist: torch.Tensor | None = None,
     rbf: torch.Tensor | None = None,
     esen_features: ESENFixedKLocalAttentionFeatures | None = None,
@@ -1596,7 +1597,7 @@ def fixed_k_local_attention_triton(
     diag_zero = True
     envelope_in_score = True
     if bias is not None:
-        if not isinstance(bias, ESENEnvelopedRBFTypeFixedKBias):
+        if not isinstance(bias, (ESENEnvelopedRBFTypeFixedKBias, ESENFixedKLocalBiasView)):
             return _fallback_or_raise(
                 f"unsupported Triton bias module {type(bias).__name__!r}",
                 strict=strict,
