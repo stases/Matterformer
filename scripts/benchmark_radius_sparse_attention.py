@@ -26,6 +26,7 @@ from matterformer.models.platonic.triton_attention import (
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
     platonic_radius_block_sparse_attention_torch_reference,
+    platonic_radius_sparse_attention_flat_triton,
 )
 
 
@@ -186,6 +187,29 @@ def _dense_rbf_type_triton(data: dict[str, Any], args: argparse.Namespace, q, k,
     )
 
 
+def _radius_sparse_triton(data: dict[str, Any], args: argparse.Namespace, q, k, v, w, tb) -> torch.Tensor:
+    return platonic_radius_sparse_attention_flat_triton(
+        q,
+        k,
+        v,
+        pos=data["pos"],
+        atom_types=data["atom_types"],
+        heads_per_frame=args.heads_per_frame,
+        rbf_weight=w,
+        type_bias=tb,
+        centers=data["centers"],
+        gamma=data["gamma"],
+        cutoff=args.cutoff,
+        max_atomic_number=args.max_atomic_number,
+        diag_zero=True,
+        include_self=args.include_self,
+        envelope_in_score=True,
+        radius_layout=data["layout"],
+        precision=args.precision,
+        strict=True,
+    )
+
+
 def _clone_train_inputs(data: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         data["q"].detach().clone().requires_grad_(True),
@@ -245,31 +269,21 @@ def _parity(data: dict[str, Any], args: argparse.Namespace, device: torch.device
             "drbf_weight_max_abs": _max_abs(w_tri.grad, w_den.grad),
             "dtype_bias_max_abs": _max_abs(tb_tri.grad, tb_den.grad),
         }
-        try:
-            platonic_attention_flat_triton(
-                data["q"],
-                data["k"],
-                data["v"],
-                cu_seqlens=data["cu_seqlens"],
-                max_seqlen=data["max_seqlen"],
-                pos=data["pos"],
-                atom_types=data["atom_types"],
-                heads_per_frame=args.heads_per_frame,
-                rbf_weight=data["rbf_weight"],
-                type_bias=data["type_bias"],
-                centers=data["centers"],
-                gamma=data["gamma"],
-                cutoff=args.cutoff,
-                max_atomic_number=args.max_atomic_number,
-                radial_bias_kind="radius_rbf_type_enveloped",
-                precision=args.precision,
-                block_m=args.block_m,
-                block_n=args.block_n,
-                strict=True,
-            )
-            result["radius_sparse_triton"] = {"available": True}
-        except Exception as exc:  # noqa: BLE001 - benchmark should report backend availability.
-            result["radius_sparse_triton"] = {"available": False, "reason": str(exc)}
+        q_sp, k_sp, v_sp, w_sp, tb_sp = _clone_train_inputs(data)
+        q_ref, k_ref, v_ref, w_ref, tb_ref = _clone_train_inputs(data)
+        sparse_triton = _radius_sparse_triton(data, args, q_sp, k_sp, v_sp, w_sp, tb_sp)
+        sparse_ref = _sparse_radius(data, args, q_ref, k_ref, v_ref, w_ref, tb_ref)
+        sparse_triton.backward(grad)
+        sparse_ref.backward(grad)
+        result["radius_sparse_triton"] = {
+            "available": True,
+            "forward_max_abs": _max_abs(sparse_triton, sparse_ref),
+            "dq_max_abs": _max_abs(q_sp.grad, q_ref.grad),
+            "dk_max_abs": _max_abs(k_sp.grad, k_ref.grad),
+            "dv_max_abs": _max_abs(v_sp.grad, v_ref.grad),
+            "drbf_weight_max_abs": _max_abs(w_sp.grad, w_ref.grad),
+            "dtype_bias_max_abs": _max_abs(tb_sp.grad, tb_ref.grad),
+        }
     else:
         result["dense_rbf_type_triton_vs_dense_torch"] = {
             "skipped": True,
@@ -425,11 +439,31 @@ def main() -> None:
                 backward=False,
             )
         )
+        rows.append(
+            _bench(
+                "radius_sparse_triton_forward_torch_backward",
+                lambda q, k, v, w, tb: _radius_sparse_triton(data, args, q, k, v, w, tb),
+                data,
+                args,
+                device,
+                backward=False,
+            )
+        )
         if args.backward:
             rows.append(
                 _bench(
                     "dense_triton_rbf_type_reference_semantics",
                     lambda q, k, v, w, tb: _dense_rbf_type_triton(data, args, q, k, v, w, tb),
+                    data,
+                    args,
+                    device,
+                    backward=True,
+                )
+            )
+            rows.append(
+                _bench(
+                    "radius_sparse_triton_forward_torch_backward",
+                    lambda q, k, v, w, tb: _radius_sparse_triton(data, args, q, k, v, w, tb),
                     data,
                     args,
                     device,

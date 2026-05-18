@@ -11,6 +11,7 @@ from matterformer.models.platonic.triton_attention import (
     TRITON_PLATONIC_ATTENTION_AVAILABLE,
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
+    platonic_radius_sparse_attention_flat_triton,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "lift_scalars",
     "platonic_attention_flat_torch_reference",
     "platonic_attention_flat_triton",
+    "platonic_radius_sparse_attention_flat_triton",
     "readout_scalars",
     "tetrahedral_permutation",
 ]

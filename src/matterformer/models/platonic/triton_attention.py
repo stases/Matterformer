@@ -112,9 +112,13 @@ def platonic_attention_split_head_dim_tail(head_dim: int) -> int | None:
     mode = os.environ.get("MATTERFORMER_PLATONIC_TRITON_SPLIT_HEAD_DIM", "auto").strip().lower()
     if mode in {"0", "false", "off", "no", "disable", "disabled"}:
         return None
-    if head_dim != 160:
-        return None
-    return 32
+    if head_dim == 160:
+        return 32
+    if head_dim == 256 and mode in {"all", "large"}:
+        return 128
+    if head_dim == 192 and mode in {"all", "large"}:
+        return 64
+    return None
 
 
 def _triton_meta_int_env(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
@@ -535,6 +539,370 @@ def platonic_radius_block_sparse_attention_torch_reference(
 
 
 if TRITON_PLATONIC_ATTENTION_AVAILABLE:
+
+    @triton.jit
+    def _radius_rbf_type_score_tile(
+        pos_ptr,
+        atom_type_ptr,
+        rbf_weight_ptr,
+        type_bias_ptr,
+        centers_ptr,
+        gamma_ptr,
+        m_abs,
+        n_abs,
+        m_mask,
+        n_mask,
+        head_idx: tl.tensor,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
+        has_type_bias: tl.constexpr,
+        diag_zero: tl.constexpr,
+        include_self: tl.constexpr,
+        envelope_in_score: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pos_i_base = m_abs * 3
+        pos_j_base = n_abs * 3
+        xi = tl.load(pos_ptr + pos_i_base + 0, mask=m_mask, other=0.0)[:, None]
+        yi = tl.load(pos_ptr + pos_i_base + 1, mask=m_mask, other=0.0)[:, None]
+        zi = tl.load(pos_ptr + pos_i_base + 2, mask=m_mask, other=0.0)[:, None]
+        xj = tl.load(pos_ptr + pos_j_base + 0, mask=n_mask, other=0.0)[None, :]
+        yj = tl.load(pos_ptr + pos_j_base + 1, mask=n_mask, other=0.0)[None, :]
+        zj = tl.load(pos_ptr + pos_j_base + 2, mask=n_mask, other=0.0)[None, :]
+        dx = xj - xi
+        dy = yj - yi
+        dz = zj - zi
+        dist2 = tl.maximum(dx * dx + dy * dy + dz * dz, 0.0)
+        dist = tl.sqrt(dist2)
+        same = m_abs[:, None] == n_abs[None, :]
+        local = dist < cutoff
+        if include_self:
+            local = local | same
+        else:
+            local = local & ~same
+
+        x = tl.minimum(tl.maximum(dist / cutoff, 0.0), 1.0)
+        x2 = x * x
+        x3 = x2 * x
+        env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+        env = tl.where(dist < cutoff, env, 0.0)
+
+        env_bias = env
+        if diag_zero:
+            env_bias = tl.where(same, 0.0, env_bias)
+
+        env_score = env
+        if include_self:
+            env_score = tl.where(same, 1.0, env_score)
+
+        subhead = head_idx % heads_per_frame
+        gamma = tl.load(gamma_ptr).to(tl.float32)
+        raw_bias = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for rb in range(0, num_rbf):
+            center = tl.load(centers_ptr + rb).to(tl.float32)
+            weight = tl.load(rbf_weight_ptr + subhead * num_rbf + rb).to(tl.float32)
+            rho = tl.exp(-gamma * (dist - center) * (dist - center))
+            raw_bias += weight * rho
+
+        if has_type_bias:
+            zi_atom = tl.load(atom_type_ptr + m_abs, mask=m_mask, other=0)[:, None]
+            zj_atom = tl.load(atom_type_ptr + n_abs, mask=n_mask, other=0)[None, :]
+            zi_atom = tl.minimum(tl.maximum(zi_atom, 0), max_atomic_number)
+            zj_atom = tl.minimum(tl.maximum(zj_atom, 0), max_atomic_number)
+            zdim = max_atomic_number + 1
+            type_index = ((zi_atom * zdim + zj_atom) * heads_per_frame + subhead)
+            raw_bias += tl.load(
+                type_bias_ptr + type_index,
+                mask=m_mask[:, None] & n_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+        bias = env_bias * raw_bias
+        if envelope_in_score:
+            bias += tl.log(tl.maximum(env_score, 1.0e-20))
+        pair_mask = m_mask[:, None] & n_mask[None, :] & local
+        return bias, pair_mask
+
+    @triton.jit
+    def _radius_sparse_online_softmax_update(
+        scores,
+        v,
+        acc,
+        m_i,
+        l_i,
+        input_precision: tl.constexpr,
+    ):
+        tile_m = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, tile_m)
+        has_prev = m_i > -float("inf")
+        has_any = m_new > -float("inf")
+        m_new_safe = tl.where(has_any, m_new, 0.0)
+        m_i_safe = tl.where(has_prev, m_i, m_new_safe)
+        probs = tl.exp(scores - m_new_safe[:, None])
+        probs = tl.where(scores > -float("inf"), probs, 0.0)
+        alpha = tl.where(has_prev, tl.exp(m_i_safe - m_new_safe), 0.0)
+        l_i = l_i * alpha + tl.sum(probs, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(probs.to(v.dtype), v, input_precision=input_precision)
+        return acc, m_new, l_i
+
+    @triton.jit
+    def _radius_sparse_fwd_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        pos_ptr,
+        atom_type_ptr,
+        rbf_weight_ptr,
+        type_bias_ptr,
+        centers_ptr,
+        gamma_ptr,
+        q_block_start_ptr,
+        q_block_end_ptr,
+        k_block_start_ptr,
+        k_block_end_ptr,
+        block_ptr,
+        block_col,
+        out_ptr,
+        lse_ptr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        scale: tl.constexpr,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
+        has_type_bias: tl.constexpr,
+        diag_zero: tl.constexpr,
+        include_self: tl.constexpr,
+        envelope_in_score: tl.constexpr,
+        input_precision: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        q_block = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        m_start = tl.load(q_block_start_ptr + q_block).to(tl.int64)
+        m_end = tl.load(q_block_end_ptr + q_block).to(tl.int64)
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        m_mask = offs_m < m_end
+        d_mask = offs_d < head_dim
+        q = tl.load(
+            q_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+            mask=m_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        p = tl.load(block_ptr + q_block)
+        p_end = tl.load(block_ptr + q_block + 1)
+        offs_n_base = tl.arange(0, BLOCK_N)
+        while p < p_end:
+            k_block = tl.load(block_col + p)
+            n_start = tl.load(k_block_start_ptr + k_block).to(tl.int64)
+            n_end = tl.load(k_block_end_ptr + k_block).to(tl.int64)
+            offs_n = n_start + offs_n_base
+            n_mask = offs_n < n_end
+            k = tl.load(
+                k_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            v = tl.load(
+                v_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+                mask=n_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            scores = tl.dot(q, tl.trans(k), input_precision=input_precision).to(tl.float32) * scale
+            bias, pair_mask = _radius_rbf_type_score_tile(
+                pos_ptr,
+                atom_type_ptr,
+                rbf_weight_ptr,
+                type_bias_ptr,
+                centers_ptr,
+                gamma_ptr,
+                offs_m,
+                offs_n,
+                m_mask,
+                n_mask,
+                head_idx,
+                heads_per_frame,
+                num_rbf,
+                cutoff,
+                max_atomic_number,
+                has_type_bias,
+                diag_zero,
+                include_self,
+                envelope_in_score,
+                BLOCK_M,
+                BLOCK_N,
+            )
+            scores += bias
+            scores = tl.where(pair_mask, scores, -float("inf"))
+            acc, m_i, l_i = _radius_sparse_online_softmax_update(scores, v, acc, m_i, l_i, input_precision)
+            p += 1
+
+        acc = acc / tl.maximum(l_i[:, None], 1.0e-20)
+        tl.store(
+            out_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+            acc,
+            mask=m_mask[:, None] & d_mask[None, :],
+        )
+        lse = tl.where(l_i > 0.0, m_i + tl.log(tl.maximum(l_i, 1.0e-20)), -float("inf"))
+        tl.store(lse_ptr + offs_m * num_heads + head_idx, lse, mask=m_mask)
+
+    @triton.jit
+    def _radius_sparse_fwd_kernel_d128_tail(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        pos_ptr,
+        atom_type_ptr,
+        rbf_weight_ptr,
+        type_bias_ptr,
+        centers_ptr,
+        gamma_ptr,
+        q_block_start_ptr,
+        q_block_end_ptr,
+        k_block_start_ptr,
+        k_block_end_ptr,
+        block_ptr,
+        block_col,
+        out_ptr,
+        lse_ptr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        scale: tl.constexpr,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
+        has_type_bias: tl.constexpr,
+        diag_zero: tl.constexpr,
+        include_self: tl.constexpr,
+        envelope_in_score: tl.constexpr,
+        input_precision: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_D_TAIL: tl.constexpr,
+    ):
+        q_block = tl.program_id(0)
+        head_idx = tl.program_id(1)
+        m_start = tl.load(q_block_start_ptr + q_block).to(tl.int64)
+        m_end = tl.load(q_block_end_ptr + q_block).to(tl.int64)
+        offs_m = m_start + tl.arange(0, BLOCK_M)
+        offs_d0 = tl.arange(0, 128)
+        offs_dt = tl.arange(0, BLOCK_D_TAIL)
+        offs_d1 = 128 + offs_dt
+        m_mask = offs_m < m_end
+        d0_mask = offs_d0 < head_dim
+        d1_mask = offs_d1 < head_dim
+        q0 = tl.load(
+            q_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d0[None, :]),
+            mask=m_mask[:, None] & d0_mask[None, :],
+            other=0.0,
+        )
+        q1 = tl.load(
+            q_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d1[None, :]),
+            mask=m_mask[:, None] & d1_mask[None, :],
+            other=0.0,
+        )
+        acc0 = tl.zeros((BLOCK_M, 128), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_M, BLOCK_D_TAIL), dtype=tl.float32)
+        m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        p = tl.load(block_ptr + q_block)
+        p_end = tl.load(block_ptr + q_block + 1)
+        offs_n_base = tl.arange(0, BLOCK_N)
+        while p < p_end:
+            k_block = tl.load(block_col + p)
+            n_start = tl.load(k_block_start_ptr + k_block).to(tl.int64)
+            n_end = tl.load(k_block_end_ptr + k_block).to(tl.int64)
+            offs_n = n_start + offs_n_base
+            n_mask = offs_n < n_end
+            k0 = tl.load(
+                k_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d0[None, :]),
+                mask=n_mask[:, None] & d0_mask[None, :],
+                other=0.0,
+            )
+            k1 = tl.load(
+                k_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d1[None, :]),
+                mask=n_mask[:, None] & d1_mask[None, :],
+                other=0.0,
+            )
+            scores = tl.dot(q0, tl.trans(k0), input_precision=input_precision).to(tl.float32)
+            scores += tl.dot(q1, tl.trans(k1), input_precision=input_precision).to(tl.float32)
+            scores *= scale
+            bias, pair_mask = _radius_rbf_type_score_tile(
+                pos_ptr,
+                atom_type_ptr,
+                rbf_weight_ptr,
+                type_bias_ptr,
+                centers_ptr,
+                gamma_ptr,
+                offs_m,
+                offs_n,
+                m_mask,
+                n_mask,
+                head_idx,
+                heads_per_frame,
+                num_rbf,
+                cutoff,
+                max_atomic_number,
+                has_type_bias,
+                diag_zero,
+                include_self,
+                envelope_in_score,
+                BLOCK_M,
+                BLOCK_N,
+            )
+            scores += bias
+            scores = tl.where(pair_mask, scores, -float("inf"))
+            tile_m = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, tile_m)
+            has_prev = m_i > -float("inf")
+            has_any = m_new > -float("inf")
+            m_new_safe = tl.where(has_any, m_new, 0.0)
+            m_i_safe = tl.where(has_prev, m_i, m_new_safe)
+            probs = tl.exp(scores - m_new_safe[:, None])
+            probs = tl.where(scores > -float("inf"), probs, 0.0)
+            alpha = tl.where(has_prev, tl.exp(m_i_safe - m_new_safe), 0.0)
+            l_i = l_i * alpha + tl.sum(probs, axis=1)
+            v0 = tl.load(
+                v_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d0[None, :]),
+                mask=n_mask[:, None] & d0_mask[None, :],
+                other=0.0,
+            )
+            v1 = tl.load(
+                v_ptr + ((offs_n[:, None] * num_heads + head_idx) * head_dim + offs_d1[None, :]),
+                mask=n_mask[:, None] & d1_mask[None, :],
+                other=0.0,
+            )
+            acc0 = acc0 * alpha[:, None] + tl.dot(probs.to(v0.dtype), v0, input_precision=input_precision)
+            acc1 = acc1 * alpha[:, None] + tl.dot(probs.to(v1.dtype), v1, input_precision=input_precision)
+            m_i = m_new
+            p += 1
+
+        inv_l = 1.0 / tl.maximum(l_i, 1.0e-20)
+        acc0 = acc0 * inv_l[:, None]
+        acc1 = acc1 * inv_l[:, None]
+        tl.store(
+            out_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d0[None, :]),
+            acc0,
+            mask=m_mask[:, None] & d0_mask[None, :],
+        )
+        tl.store(
+            out_ptr + ((offs_m[:, None] * num_heads + head_idx) * head_dim + offs_d1[None, :]),
+            acc1,
+            mask=m_mask[:, None] & d1_mask[None, :],
+        )
+        lse = tl.where(l_i > 0.0, m_i + tl.log(tl.maximum(l_i, 1.0e-20)), -float("inf"))
+        tl.store(lse_ptr + offs_m * num_heads + head_idx, lse, mask=m_mask)
 
     @triton.jit
     def _radial_bias_tile(
@@ -2388,6 +2756,393 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             d_gate if ctx.has_rbf else None,
             d_type_bias if ctx.has_rbf and _is_rbf_type_bias_mode(ctx.bias_mode) else None,
         )
+
+
+def _validate_radius_sparse_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    pos: torch.Tensor,
+    atom_types: torch.Tensor | None,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    type_bias: torch.Tensor | None,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    max_atomic_number: int | None,
+    radius_layout: RadiusBlockSparseLayout,
+) -> tuple[torch.Tensor, torch.Tensor | None, int, bool, RadiusBlockSparseLayout]:
+    _validate_flat_inputs(q, k, v, radius_layout.cu_seqlens)
+    if float(cutoff) <= 0.0:
+        raise ValueError("cutoff must be positive for radius sparse attention")
+    if pos.ndim != 2 or pos.shape != (q.shape[0], 3):
+        raise ValueError(f"pos must have shape [{q.shape[0]}, 3], got {tuple(pos.shape)}")
+    if int(heads_per_frame) <= 0 or q.shape[1] % int(heads_per_frame) != 0:
+        raise ValueError("heads_per_frame must divide num_heads for radius sparse attention")
+    if rbf_weight.ndim != 2 or rbf_weight.shape[0] != int(heads_per_frame):
+        raise ValueError("rbf_weight must have shape [heads_per_frame, num_rbf]")
+    if centers.ndim != 1 or centers.numel() != rbf_weight.shape[1]:
+        raise ValueError("centers must be 1D and match rbf_weight.shape[1]")
+    if gamma.ndim > 0 and gamma.numel() != 1:
+        raise ValueError("gamma must be a scalar tensor")
+    if radius_layout.block_m <= 0 or radius_layout.block_n <= 0:
+        raise ValueError("radius_layout block sizes must be positive")
+    if radius_layout.block_m != int(radius_layout.block_m) or radius_layout.block_n != int(radius_layout.block_n):
+        raise ValueError("radius_layout block sizes must be integers")
+    if int(radius_layout.perm.numel()) != int(q.shape[0]):
+        raise ValueError("radius_layout.perm length must match q.shape[0]")
+    if int(radius_layout.cu_seqlens[-1].item()) != int(q.shape[0]):
+        raise ValueError("radius_layout.cu_seqlens[-1] must match q.shape[0]")
+
+    if radius_layout.q_block_start.device != q.device:
+        radius_layout = radius_layout.to(q.device)
+    if q.is_cuda and TRITON_PLATONIC_ATTENTION_AVAILABLE and (
+        int(radius_layout.block_m) < 16 or int(radius_layout.block_n) < 16
+    ):
+        raise ValueError("radius sparse Triton attention requires block_m and block_n >= 16 for tl.dot tiles")
+
+    has_type_bias = type_bias is not None
+    if has_type_bias:
+        assert type_bias is not None
+        if atom_types is None:
+            raise ValueError("type_bias requires atom_types")
+        if atom_types.ndim != 1 or atom_types.shape[0] != q.shape[0]:
+            raise ValueError(f"atom_types must have shape [{q.shape[0]}], got {tuple(atom_types.shape)}")
+        if type_bias.ndim != 3 or type_bias.shape[0] != type_bias.shape[1]:
+            raise ValueError("type_bias must have shape [max_z + 1, max_z + 1, heads_per_frame]")
+        if type_bias.shape[-1] != int(heads_per_frame):
+            raise ValueError("type_bias last dimension must equal heads_per_frame")
+        inferred_max_z = int(type_bias.shape[0] - 1)
+        if max_atomic_number is None:
+            max_atomic_number = inferred_max_z
+        elif int(max_atomic_number) > inferred_max_z:
+            raise ValueError(
+                f"max_atomic_number={max_atomic_number} exceeds type_bias capacity {inferred_max_z}"
+            )
+    else:
+        if atom_types is None:
+            atom_types = torch.empty((q.shape[0],), device=q.device, dtype=torch.long)
+        if max_atomic_number is None:
+            max_atomic_number = 0
+    return atom_types, type_bias, int(max_atomic_number), bool(has_type_bias), radius_layout
+
+
+def _radius_sparse_forward_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    pos: torch.Tensor,
+    atom_types: torch.Tensor,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    type_bias: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    max_atomic_number: int,
+    has_type_bias: bool,
+    diag_zero: bool,
+    include_self: bool,
+    envelope_in_score: bool,
+    radius_layout: RadiusBlockSparseLayout,
+    precision: str,
+) -> torch.Tensor:
+    if not TRITON_PLATONIC_ATTENTION_AVAILABLE or not q.is_cuda:
+        raise RuntimeError("radius sparse Triton forward requires CUDA and Triton")
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    pos = pos.contiguous()
+    atom_types = atom_types.contiguous()
+    rbf_weight = rbf_weight.contiguous()
+    type_bias = type_bias.contiguous()
+    centers = centers.contiguous()
+    gamma = gamma.contiguous()
+    radius_layout = radius_layout.to(q.device)
+    total_tokens, num_heads, head_dim = q.shape
+    out = torch.empty_like(q)
+    lse = torch.empty((total_tokens, num_heads), device=q.device, dtype=torch.float32)
+    input_precision = _kernel_input_precision(normalize_platonic_attention_precision(precision))
+    block_m = int(radius_layout.block_m)
+    block_n = int(radius_layout.block_n)
+    split_tail = platonic_attention_split_head_dim_tail(head_dim)
+    fwd_num_stages = _triton_meta_int_env("MATTERFORMER_PLATONIC_TRITON_FWD_NUM_STAGES", 3, min_value=1, max_value=8)
+    grid = (int(radius_layout.q_block_start.numel()), num_heads)
+    if split_tail is not None:
+        _radius_sparse_fwd_kernel_d128_tail[grid](
+            q,
+            k,
+            v,
+            pos,
+            atom_types,
+            rbf_weight,
+            type_bias,
+            centers,
+            gamma,
+            radius_layout.q_block_start.contiguous(),
+            radius_layout.q_block_end.contiguous(),
+            radius_layout.k_block_start.contiguous(),
+            radius_layout.k_block_end.contiguous(),
+            radius_layout.block_ptr.contiguous(),
+            radius_layout.block_col.contiguous(),
+            out,
+            lse,
+            num_heads,
+            head_dim,
+            1.0 / math.sqrt(head_dim),
+            int(heads_per_frame),
+            int(rbf_weight.shape[-1]),
+            float(cutoff),
+            int(max_atomic_number),
+            bool(has_type_bias),
+            bool(diag_zero),
+            bool(include_self),
+            bool(envelope_in_score),
+            input_precision,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D_TAIL=int(split_tail),
+            num_warps=4,
+            num_stages=fwd_num_stages,
+        )
+    else:
+        block_d = platonic_attention_block_d_for_head_dim(head_dim)
+        _radius_sparse_fwd_kernel[grid](
+            q,
+            k,
+            v,
+            pos,
+            atom_types,
+            rbf_weight,
+            type_bias,
+            centers,
+            gamma,
+            radius_layout.q_block_start.contiguous(),
+            radius_layout.q_block_end.contiguous(),
+            radius_layout.k_block_start.contiguous(),
+            radius_layout.k_block_end.contiguous(),
+            radius_layout.block_ptr.contiguous(),
+            radius_layout.block_col.contiguous(),
+            out,
+            lse,
+            num_heads,
+            head_dim,
+            1.0 / math.sqrt(head_dim),
+            int(heads_per_frame),
+            int(rbf_weight.shape[-1]),
+            float(cutoff),
+            int(max_atomic_number),
+            bool(has_type_bias),
+            bool(diag_zero),
+            bool(include_self),
+            bool(envelope_in_score),
+            input_precision,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=fwd_num_stages,
+        )
+    return out
+
+
+class _PlatonicRadiusSparseAttentionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        atom_types: torch.Tensor,
+        rbf_weight: torch.Tensor,
+        type_bias: torch.Tensor,
+        centers: torch.Tensor,
+        gamma: torch.Tensor,
+        radius_layout: RadiusBlockSparseLayout,
+        cutoff: float,
+        max_atomic_number: int,
+        heads_per_frame: int,
+        has_type_bias: bool,
+        diag_zero: bool,
+        include_self: bool,
+        envelope_in_score: bool,
+        precision: str,
+    ) -> torch.Tensor:
+        out = _radius_sparse_forward_cuda(
+            q,
+            k,
+            v,
+            pos=pos,
+            atom_types=atom_types,
+            heads_per_frame=int(heads_per_frame),
+            rbf_weight=rbf_weight,
+            type_bias=type_bias,
+            centers=centers,
+            gamma=gamma,
+            cutoff=float(cutoff),
+            max_atomic_number=int(max_atomic_number),
+            has_type_bias=bool(has_type_bias),
+            diag_zero=bool(diag_zero),
+            include_self=bool(include_self),
+            envelope_in_score=bool(envelope_in_score),
+            radius_layout=radius_layout,
+            precision=precision,
+        )
+        ctx.save_for_backward(q, k, v, pos, atom_types, rbf_weight, type_bias, centers, gamma)
+        ctx.radius_layout = radius_layout
+        ctx.cutoff = float(cutoff)
+        ctx.max_atomic_number = int(max_atomic_number)
+        ctx.heads_per_frame = int(heads_per_frame)
+        ctx.has_type_bias = bool(has_type_bias)
+        ctx.diag_zero = bool(diag_zero)
+        ctx.include_self = bool(include_self)
+        ctx.envelope_in_score = bool(envelope_in_score)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        q, k, v, pos, atom_types, rbf_weight, type_bias, centers, gamma = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ref = q.detach().requires_grad_(True)
+            k_ref = k.detach().requires_grad_(True)
+            v_ref = v.detach().requires_grad_(True)
+            weight_ref = rbf_weight.detach().requires_grad_(True)
+            type_ref = type_bias.detach().requires_grad_(ctx.has_type_bias)
+            ref_out = platonic_radius_block_sparse_attention_torch_reference(
+                q_ref,
+                k_ref,
+                v_ref,
+                pos=pos,
+                atom_types=atom_types if ctx.has_type_bias else None,
+                heads_per_frame=ctx.heads_per_frame,
+                rbf_weight=weight_ref,
+                type_bias=type_ref if ctx.has_type_bias else None,
+                centers=centers,
+                gamma=gamma,
+                cutoff=ctx.cutoff,
+                diag_zero=ctx.diag_zero,
+                include_self=ctx.include_self,
+                envelope_in_score=ctx.envelope_in_score,
+                radius_layout=ctx.radius_layout,
+            )
+            grad_inputs = (
+                q_ref,
+                k_ref,
+                v_ref,
+                weight_ref,
+                type_ref,
+            )
+            dq, dk, dv, dw, dt = torch.autograd.grad(
+                ref_out,
+                grad_inputs,
+                dout,
+                allow_unused=True,
+            )
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            dw,
+            dt if ctx.has_type_bias else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+@_disable_dynamo_if_available
+def platonic_radius_sparse_attention_flat_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    pos: torch.Tensor,
+    atom_types: torch.Tensor | None,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    type_bias: torch.Tensor | None,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    max_atomic_number: int | None,
+    diag_zero: bool,
+    include_self: bool,
+    envelope_in_score: bool,
+    radius_layout: RadiusBlockSparseLayout,
+    precision: str = "tf32",
+    strict: bool = False,
+) -> torch.Tensor:
+    atom_types, type_bias, max_atomic_number, has_type_bias, radius_layout = _validate_radius_sparse_inputs(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=int(heads_per_frame),
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=float(cutoff),
+        max_atomic_number=max_atomic_number,
+        radius_layout=radius_layout,
+    )
+    if type_bias is None:
+        type_bias = torch.empty((1, 1, 1), device=q.device, dtype=torch.float32)
+    if strict and q.is_cuda and not TRITON_PLATONIC_ATTENTION_AVAILABLE:
+        raise RuntimeError("radius sparse Triton attention requested, but Triton is not available")
+    if not q.is_cuda or not TRITON_PLATONIC_ATTENTION_AVAILABLE:
+        return platonic_radius_block_sparse_attention_torch_reference(
+            q,
+            k,
+            v,
+            pos=pos,
+            atom_types=atom_types if has_type_bias else None,
+            heads_per_frame=int(heads_per_frame),
+            rbf_weight=rbf_weight,
+            type_bias=type_bias if has_type_bias else None,
+            centers=centers,
+            gamma=gamma,
+            cutoff=float(cutoff),
+            diag_zero=bool(diag_zero),
+            include_self=bool(include_self),
+            envelope_in_score=bool(envelope_in_score),
+            radius_layout=radius_layout,
+        )
+    return _PlatonicRadiusSparseAttentionFunction.apply(
+        q,
+        k,
+        v,
+        pos,
+        atom_types,
+        rbf_weight,
+        type_bias,
+        centers,
+        gamma,
+        radius_layout,
+        float(cutoff),
+        int(max_atomic_number),
+        int(heads_per_frame),
+        bool(has_type_bias),
+        bool(diag_zero),
+        bool(include_self),
+        bool(envelope_in_score),
+        normalize_platonic_attention_precision(precision),
+    )
 
 
 @_disable_dynamo_if_available

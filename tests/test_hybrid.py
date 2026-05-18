@@ -24,6 +24,7 @@ from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, Platoni
 from matterformer.models.platonic.triton_attention import (
     TRITON_PLATONIC_ATTENTION_AVAILABLE,
     platonic_radius_block_sparse_attention_torch_reference,
+    platonic_radius_sparse_attention_flat_triton,
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
 )
@@ -574,6 +575,70 @@ def test_radius_sparse_all_inf_rows_are_zero_not_nan():
     torch.testing.assert_close(sparse, torch.zeros_like(sparse))
 
 
+def test_platonic_radius_sparse_public_triton_entrypoint_cpu_matches_sparse_reference():
+    torch.manual_seed(119)
+    q = torch.randn(6, 4, 8)
+    k = torch.randn(6, 4, 8)
+    v = torch.randn(6, 4, 8)
+    pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.4, 0.0, 0.0],
+            [8.0, 0.0, 0.0],
+        ]
+    )
+    atom_types = torch.tensor([1, 6, 8, 1, 7, 6])
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    heads_per_frame = 1
+    rbf_weight = torch.randn(heads_per_frame, 4) * 0.01
+    type_bias = torch.randn(9, 9, heads_per_frame) * 0.01
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(9.0)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=1.0, block_m=16, block_n=16)
+
+    out = platonic_radius_sparse_attention_flat_triton(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        max_atomic_number=8,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+        strict=False,
+    )
+    ref = platonic_radius_block_sparse_attention_torch_reference(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+
+    torch.testing.assert_close(out, ref)
+
+
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
     torch.manual_seed(103)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -878,6 +943,7 @@ def test_platonic_flat_rbf_type_without_type_pair_runs_without_atom_types():
         ("torch_reference", {"kind": "rbf_type_enveloped"}, "torch_reference", "rbf_type_enveloped"),
         ("torch_rbf_type_bias", {}, "torch_reference", "rbf_type_enveloped"),
         ("torch_radius_sparse", {}, "torch_reference", "radius_rbf_type_enveloped"),
+        ("triton_radius_sparse", {}, "triton", "radius_rbf_type_enveloped"),
     ],
 )
 def test_platonic_attention_backend_bias_names_normalize(backend, bias, expected_backend, expected_kind):
@@ -1010,6 +1076,65 @@ def test_platonic_flat_triton_radial_cuda_matches_reference_forward_backward():
     torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(weight.grad, weight_ref.grad, atol=5e-5, rtol=5e-5)
     torch.testing.assert_close(gate.grad, gate_ref.grad, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+@pytest.mark.parametrize("head_dim", [16, 160, 256])
+def test_platonic_radius_sparse_triton_cuda_forward_matches_sparse_reference(head_dim):
+    torch.manual_seed(121)
+    device = torch.device("cuda")
+    num_tokens = 32
+    q = torch.randn(num_tokens, 4, head_dim, device=device, dtype=torch.float32)
+    k = torch.randn(num_tokens, 4, head_dim, device=device, dtype=torch.float32)
+    v = torch.randn(num_tokens, 4, head_dim, device=device, dtype=torch.float32)
+    pos = torch.randn(num_tokens, 3, device=device, dtype=torch.float32) * 4.0
+    atom_types = torch.randint(1, 9, (num_tokens,), device=device)
+    cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device=device)
+    rbf_weight = torch.randn(2, 4, device=device) * 0.01
+    type_bias = torch.randn(9, 9, 2, device=device) * 0.01
+    centers = torch.linspace(0.0, 2.0, 4, device=device)
+    gamma = torch.tensor(2.25, device=device)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=2.0, block_m=16, block_n=16)
+
+    out = platonic_radius_sparse_attention_flat_triton(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=2,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=2.0,
+        max_atomic_number=8,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+        precision="tf32x3",
+        strict=True,
+    )
+    ref = platonic_radius_block_sparse_attention_torch_reference(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=2,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=2.0,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+
+    torch.testing.assert_close(out, ref, atol=5e-4, rtol=5e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")

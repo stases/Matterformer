@@ -12,6 +12,7 @@ from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout
 from matterformer.models.platonic.rope import PlatonicRoPE
 from matterformer.models.platonic.triton_attention import (
     platonic_radius_block_sparse_attention_torch_reference,
+    platonic_radius_sparse_attention_flat_triton,
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
 )
@@ -27,6 +28,8 @@ TRITON_BIAS_BACKEND_ALIASES = {
     "triton_radial_r2": "radial_r2",
     "triton_radial_slope": "radial_slope",
     "triton_rbf_type_bias": "rbf_type_enveloped",
+    "triton_radius_sparse": "radius_rbf_type_enveloped",
+    "triton_esen_local": "radius_rbf_type_enveloped",
 }
 TORCH_BIAS_BACKEND_ALIASES = {
     "torch_rbf_type_bias": "rbf_type_enveloped",
@@ -221,11 +224,6 @@ class PlatonicAttention(nn.Module):
             if self.attention_backend not in {"triton", "torch_reference"}:
                 raise ValueError(
                     f"attention_bias.kind={bias_kind!r} requires attention_backend='triton' or 'torch_reference'"
-                )
-            if self.attention_backend == "triton" and bias_kind == "radius_rbf_type_enveloped":
-                raise ValueError(
-                    "attention_bias.kind='radius_rbf_type_enveloped' is currently implemented by "
-                    "attention_backend='torch_reference'/'torch_radius_sparse'; the Triton sparse kernel is not wired yet"
                 )
             if self.attention_backend == "torch_reference" and bias_kind not in {
                 "rbf_type_enveloped",
@@ -586,6 +584,29 @@ class PlatonicAttention(nn.Module):
                     raise ValueError(
                         f"attention_backend='triton' with attention_bias.kind={self.radial_bias_kind!r} "
                         "requires atom_types in forward_flat"
+                    )
+                if self.radial_bias_kind == "radius_rbf_type_enveloped":
+                    if radius_layout is None:
+                        raise ValueError("radius sparse Triton attention requires radius_layout")
+                    return platonic_radius_sparse_attention_flat_triton(
+                        q,
+                        k,
+                        v,
+                        pos=pos,
+                        atom_types=atom_types,
+                        heads_per_frame=self.heads_per_frame,
+                        rbf_weight=self.rbf_weight,
+                        type_bias=self.rbf_type_bias,
+                        centers=self.rbf_centers,
+                        gamma=self.rbf_gamma,
+                        cutoff=self.local_cutoff,
+                        max_atomic_number=self.local_max_atomic_number,
+                        diag_zero=self.rbf_diag_zero,
+                        include_self=self.local_include_self,
+                        envelope_in_score=self.local_envelope_in_score,
+                        radius_layout=radius_layout,
+                        precision=self.triton_precision,
+                        strict=self.triton_strict,
                     )
                 return platonic_attention_flat_triton(
                     q,
