@@ -49,6 +49,29 @@ def load_hybrid_config(value: str | None) -> dict | None:
     return load_json_config(value)
 
 
+def apply_tetra_attention_block_overrides(config: dict | None, args: argparse.Namespace) -> None:
+    if config is None:
+        return
+    block_m = args.tetra_attention_block_m
+    block_n = args.tetra_attention_block_n
+    if block_m is None and block_n is None:
+        return
+    tetra = config.setdefault("tetra", {})
+    if not isinstance(tetra, dict):
+        raise ValueError("hybrid_config.tetra must be a mapping to override Triton attention block sizes")
+    attention_bias = tetra.setdefault("attention_bias", {})
+    if not isinstance(attention_bias, dict):
+        raise ValueError("hybrid_config.tetra.attention_bias must be a mapping to override Triton attention block sizes")
+    if block_m is not None:
+        if block_m <= 0:
+            raise ValueError("--tetra-attention-block-m must be positive")
+        attention_bias["block_m"] = int(block_m)
+    if block_n is not None:
+        if block_n <= 0:
+            raise ValueError("--tetra-attention-block-n must be positive")
+        attention_bias["block_n"] = int(block_n)
+
+
 def load_allscaip_config(value: str | None) -> dict | None:
     return load_json_config(value)
 
@@ -727,6 +750,7 @@ def main(args: argparse.Namespace) -> None:
     device = default_device()
     args.model_backend = str(args.model_backend).lower().replace("-", "_")
     args.hybrid_config = load_hybrid_config(args.hybrid_config_json) if args.model_backend == "matterformer" else None
+    apply_tetra_attention_block_overrides(args.hybrid_config, args)
     args.allscaip_strict_config = (
         load_allscaip_config(args.allscaip_strict_config_json)
         if args.model_backend == "allscaip_direct"
@@ -1200,6 +1224,18 @@ if __name__ == "__main__":
         choices=["matterformer", "allscaip_direct", "allscaip-direct"],
     )
     parser.add_argument("--hybrid-config-json", type=str, default="configs/omol/scalar_sit_d768_l8.json")
+    parser.add_argument(
+        "--tetra-attention-block-m",
+        type=int,
+        default=None,
+        help="Override hybrid_config.tetra.attention_bias.block_m for Triton Platonic attention.",
+    )
+    parser.add_argument(
+        "--tetra-attention-block-n",
+        type=int,
+        default=None,
+        help="Override hybrid_config.tetra.attention_bias.block_n for Triton Platonic attention.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--val-batch-size", type=int, default=None)
     parser.add_argument("--max-graphs-per-batch", type=int, default=None)

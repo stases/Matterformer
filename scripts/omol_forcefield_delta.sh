@@ -14,6 +14,8 @@ VALIDATION_MODE="${VALIDATION_MODE:-heldout}"
 ELEMENT_REFS_JSON="${ELEMENT_REFS_JSON:-$REPO_ROOT/configs/omol/element_refs.json}"
 HYBRID_CONFIG_JSON="${HYBRID_CONFIG_JSON:-$REPO_ROOT/configs/omol/tetra_t_only_h1920_l8_pt2.json}"
 MODEL_BACKEND="${MODEL_BACKEND:-matterformer}"
+TETRA_ATTENTION_BLOCK_M="${TETRA_ATTENTION_BLOCK_M:-}"
+TETRA_ATTENTION_BLOCK_N="${TETRA_ATTENTION_BLOCK_N:-}"
 
 D_MODEL="${D_MODEL:-1920}"
 N_HEADS="${N_HEADS:-60}"
@@ -257,6 +259,8 @@ EXTRA_ARGS=()
 [ -n "$ALLSCAIP_CONFIG_JSON" ] && EXTRA_ARGS+=(--allscaip-config-json "$ALLSCAIP_CONFIG_JSON")
 [ -n "$ALLSCAIP_STRICT_CONFIG_JSON" ] && EXTRA_ARGS+=(--allscaip-strict-config-json "$ALLSCAIP_STRICT_CONFIG_JSON")
 [ -n "$ALLSCAIP_FREQUENCY_LIST" ] && EXTRA_ARGS+=(--allscaip-frequency-list "$ALLSCAIP_FREQUENCY_LIST")
+[ -n "$TETRA_ATTENTION_BLOCK_M" ] && EXTRA_ARGS+=(--tetra-attention-block-m "$TETRA_ATTENTION_BLOCK_M")
+[ -n "$TETRA_ATTENTION_BLOCK_N" ] && EXTRA_ARGS+=(--tetra-attention-block-n "$TETRA_ATTENTION_BLOCK_N")
 [ "$MUON_HIDDEN_ONLY" = "1" ] && EXTRA_ARGS+=(--muon-hidden-only) || EXTRA_ARGS+=(--no-muon-hidden-only)
 [ -n "$MUON_ADAM_LR" ] && EXTRA_ARGS+=(--muon-adam-lr "$MUON_ADAM_LR")
 [ -n "$MUON_ADAM_WEIGHT_DECAY" ] && EXTRA_ARGS+=(--muon-adam-weight-decay "$MUON_ADAM_WEIGHT_DECAY")
@@ -274,6 +278,8 @@ echo "train_data_path:         $TRAIN_DATA_PATH"
 echo "val_data_path:           $VAL_DATA_PATH"
 echo "model_backend:           $MODEL_BACKEND"
 echo "hybrid_config_json:      $HYBRID_CONFIG_JSON"
+echo "tetra_attn_block_m:      ${TETRA_ATTENTION_BLOCK_M:-config_default}"
+echo "tetra_attn_block_n:      ${TETRA_ATTENTION_BLOCK_N:-config_default}"
 echo "d_model:                 $D_MODEL"
 echo "n_heads:                 $N_HEADS"
 echo "n_layers:                $N_LAYERS"

@@ -22,6 +22,8 @@
       "gate_init": 0.0,
       "diag_zero": true,
       "precision": "tf32x3",
+      "block_m": 16,
+      "block_n": 32,
       "strict": true
     },
     "activation": "sin",
