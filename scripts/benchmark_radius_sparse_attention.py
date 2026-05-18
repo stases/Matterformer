@@ -371,6 +371,7 @@ def main() -> None:
     parser.add_argument("--backward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--precision", type=str, default="tf32x3")
+    parser.add_argument("--matmul-precision", type=str, default="high", choices=["highest", "high", "medium"])
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
@@ -384,7 +385,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision(args.matmul_precision)
 
     data = _make_inputs(args, device)
     layout = data["layout"]
