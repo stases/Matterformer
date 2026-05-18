@@ -391,15 +391,29 @@ def distributed_eval_average(totals: dict[str, float], graphs: int) -> dict[str,
 
 
 def configure_compile_for_distributed(args: argparse.Namespace) -> None:
-    if not (bool(getattr(args, "distributed", False)) and bool(getattr(args, "compile", False))):
+    if not bool(getattr(args, "compile", False)):
         return
     try:
         import torch._dynamo
 
-        torch._dynamo.config.optimize_ddp = False
-        main_process_print(args, "compile: disabled torch._dynamo.config.optimize_ddp for DDP compatibility")
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            torch._dynamo.config.cache_size_limit = 256
+        elif hasattr(torch._dynamo.config, "recompile_limit"):
+            torch._dynamo.config.recompile_limit = 256
+        if hasattr(torch._dynamo.config, "force_parameter_static_shapes"):
+            torch._dynamo.config.force_parameter_static_shapes = False
+        if hasattr(torch._dynamo.config, "capture_scalar_outputs"):
+            torch._dynamo.config.capture_scalar_outputs = True
+        main_process_print(
+            args,
+            "compile: set Dynamo dynamic-batch knobs "
+            "(cache/recompile limit=256, force_parameter_static_shapes=False, capture_scalar_outputs=True)",
+        )
+        if bool(getattr(args, "distributed", False)) and hasattr(torch._dynamo.config, "optimize_ddp"):
+            torch._dynamo.config.optimize_ddp = False
+            main_process_print(args, "compile: disabled torch._dynamo.config.optimize_ddp for DDP compatibility")
     except Exception as exc:
-        main_process_print(args, f"compile: could not disable Dynamo DDP optimizer: {exc}")
+        main_process_print(args, f"compile: could not configure Dynamo compile/DDP knobs: {exc}")
 
 
 def maybe_init_wandb(args: argparse.Namespace):
@@ -761,6 +775,40 @@ def initialize_model_parameters(
             )
 
 
+def warmup_compiled_model_from_loader(
+    *,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    bf16_enabled: bool,
+    args: argparse.Namespace,
+) -> None:
+    if not (bool(getattr(args, "compile", False)) and str(getattr(args, "compile_scope", "none")) != "none"):
+        return
+    iterator = iter(loader)
+    try:
+        batch = next(iterator)
+    except StopIteration:
+        return
+    batch = batch.to(device)
+    was_training = model.training
+    model.train()
+    with torch.enable_grad():
+        with make_autocast_context(device, bf16_enabled):
+            output = model(
+                batch.atomic_numbers,
+                batch.coords,
+                batch.pad_mask,
+                charge=batch.charge,
+                spin=batch.spin,
+            )
+    del output
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    model.train(was_training)
+    main_process_print(args, "compile: warmed compiled training forward on one real local batch before DDP wrapping")
+
+
 @torch.no_grad()
 def evaluate(
     *,
@@ -966,6 +1014,15 @@ def main(args: argparse.Namespace) -> None:
             raise ValueError(f"Unknown --compile-scope {args.compile_scope!r}")
     elif args.compile:
         print("compile: AllScAIP backend skips the outer torch.compile wrapper; use --allscaip-compile to control its internal compile path")
+
+    if args.distributed:
+        warmup_compiled_model_from_loader(
+            model=model,
+            loader=train_loader,
+            device=device,
+            bf16_enabled=args.bf16,
+            args=args,
+        )
 
     if args.distributed:
         if device.type != "cuda":
