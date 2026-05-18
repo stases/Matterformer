@@ -4,6 +4,17 @@ from dataclasses import dataclass
 
 import torch
 
+try:
+    import torch._dynamo as _torch_dynamo
+except ImportError:  # pragma: no cover - older PyTorch without Dynamo.
+    _torch_dynamo = None
+
+
+def _disable_dynamo_if_available(fn):
+    if _torch_dynamo is None:
+        return fn
+    return _torch_dynamo.disable(fn)
+
 
 @dataclass(frozen=True)
 class RadiusBlockSparseLayout:
@@ -120,6 +131,7 @@ def _prefix_from_lengths(lengths: list[int]) -> list[int]:
     return out
 
 
+@_disable_dynamo_if_available
 def build_radius_block_sparse_layout(
     pos: torch.Tensor,
     cu_seqlens: torch.Tensor,
