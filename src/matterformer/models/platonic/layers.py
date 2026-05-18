@@ -567,10 +567,10 @@ class PlatonicAttention(nn.Module):
         if self.radial_bias_kind is not None:
             if self.rbf_weight is None:
                 raise RuntimeError(f"{self.attention_backend} backend was initialized without radial parameters")
-            if self.radial_bias_kind == "rbf_type_enveloped":
+            if self.radial_bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped"}:
                 if self.rbf_type_bias is not None and atom_types is None:
                     raise ValueError(
-                        "attention_backend='triton' with attention_bias.kind='rbf_type_enveloped' "
+                        f"attention_backend='triton' with attention_bias.kind={self.radial_bias_kind!r} "
                         "requires atom_types in forward_flat"
                     )
                 return platonic_attention_flat_triton(

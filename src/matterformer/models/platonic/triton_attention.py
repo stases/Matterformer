@@ -78,6 +78,13 @@ def normalize_platonic_attention_bias_mode(value: str | int | None, *, has_bias:
     return PLATONIC_ATTENTION_BIAS_MODES[key]
 
 
+def _is_rbf_type_bias_mode(bias_mode: int) -> bool:
+    return int(bias_mode) in {
+        PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
+        PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
+    }
+
+
 def _next_power_of_2(value: int) -> int:
     value = int(value)
     if value <= 1:
@@ -329,10 +336,7 @@ def platonic_attention_flat_torch_reference(
         raise ValueError("Platonic flat reference attention only supports dropout_p=0")
     use_rbf = rbf_weight is not None
     bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
-    use_rbf_type = use_rbf and bias_mode in {
-        PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
-        PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
-    }
+    use_rbf_type = use_rbf and _is_rbf_type_bias_mode(bias_mode)
     use_radius_sparse = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"]
     if use_rbf:
         if pos is None or heads_per_frame is None or centers is None or gamma is None:
@@ -1740,6 +1744,39 @@ if TRITON_PLATONIC_ATTENTION_AVAILABLE:
         )
 
 
+def _platonic_flat_attention_backward_return(
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    d_rbf_weight: torch.Tensor | None = None,
+    d_gate: torch.Tensor | None = None,
+    d_type_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, ...]:
+    return (
+        dq,
+        dk,
+        dv,
+        None,
+        None,
+        None,
+        None,
+        d_rbf_weight,
+        d_gate,
+        d_type_bias,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
 class _PlatonicFlatAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1781,7 +1818,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 heads_per_frame=heads_per_frame if has_rbf else None,
                 rbf_weight=rbf_weight if has_rbf else None,
                 gate=gate if has_rbf else None,
-                type_bias=type_bias if has_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
+                type_bias=type_bias if has_rbf and _is_rbf_type_bias_mode(bias_mode) else None,
                 centers=centers if has_rbf else None,
                 gamma=gamma if has_rbf else None,
                 cutoff=cutoff if has_rbf else None,
@@ -1897,7 +1934,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 k_ref = k.detach().requires_grad_(True)
                 v_ref = v.detach().requires_grad_(True)
                 weight_ref = rbf_weight.detach().requires_grad_(ctx.has_rbf)
-                is_rbf_type = ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
+                is_rbf_type = _is_rbf_type_bias_mode(ctx.bias_mode)
                 gate_ref = gate.detach().requires_grad_(ctx.has_rbf and not is_rbf_type)
                 type_ref = type_bias.detach().requires_grad_(ctx.has_rbf and is_rbf_type)
                 ref_out = platonic_attention_flat_torch_reference(
@@ -1939,29 +1976,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             else:
                 dq, dk, dv = grads
                 dw = dg = dt = None
-            return (
-                dq,
-                dk,
-                dv,
-                None,
-                None,
-                None,
-                None,
-                dw,
-                dg,
-                dt,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            return _platonic_flat_attention_backward_return(dq, dk, dv, dw, dg, dt)
 
         dout = dout.contiguous()
         dq = torch.empty_like(q)
@@ -2046,6 +2061,7 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             not in {
                 PLATONIC_ATTENTION_BIAS_MODES["radial_rbf"],
                 PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
+                PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
             }
         )
         if use_atomic_bwd:
@@ -2091,28 +2107,13 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 num_warps=4,
                 num_stages=bwd_num_stages,
             )
-            return (
+            return _platonic_flat_attention_backward_return(
                 dq,
                 dk,
                 dv,
-                None,
-                None,
-                None,
-                None,
                 d_rbf_weight if ctx.has_rbf else None,
                 d_gate if ctx.has_rbf else None,
-                d_type_bias if ctx.has_rbf and ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                d_type_bias if ctx.has_rbf and _is_rbf_type_bias_mode(ctx.bias_mode) else None,
             )
         if split_tail is not None:
             dq_grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
@@ -2189,30 +2190,13 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
                 num_warps=4,
                 num_stages=bwd_num_stages,
             )
-            return (
+            return _platonic_flat_attention_backward_return(
                 dq,
                 dk,
                 dv,
-                None,
-                None,
-                None,
-                None,
                 d_rbf_weight if ctx.has_rbf else None,
                 d_gate if ctx.has_rbf else None,
-                d_type_bias if ctx.has_rbf and ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                d_type_bias if ctx.has_rbf and _is_rbf_type_bias_mode(ctx.bias_mode) else None,
             )
         dq_grid = (triton.cdiv(max(max_seqlen, 1), ctx.block_m), q.shape[1], batch_size)
         _platonic_flat_attention_bwd_dq_kernel[dq_grid](
@@ -2288,30 +2272,13 @@ class _PlatonicFlatAttentionFunction(torch.autograd.Function):
             num_warps=4,
             num_stages=bwd_num_stages,
         )
-        return (
+        return _platonic_flat_attention_backward_return(
             dq,
             dk,
             dv,
-            None,
-            None,
-            None,
-            None,
             d_rbf_weight if ctx.has_rbf else None,
             d_gate if ctx.has_rbf else None,
-            d_type_bias if ctx.has_rbf and ctx.bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"] else None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            d_type_bias if ctx.has_rbf and _is_rbf_type_bias_mode(ctx.bias_mode) else None,
         )
 
 
@@ -2348,10 +2315,7 @@ def platonic_attention_flat_triton(
     kernel_precision = _kernel_input_precision(normalized_precision)
     use_rbf = rbf_weight is not None
     bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
-    use_rbf_type = use_rbf and bias_mode in {
-        PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
-        PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
-    }
+    use_rbf_type = use_rbf and _is_rbf_type_bias_mode(bias_mode)
     if use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"] and q.is_cuda:
         raise ValueError(
             "radius_rbf_type_enveloped is a torch reference backend today; "

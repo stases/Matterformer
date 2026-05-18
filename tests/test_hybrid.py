@@ -26,6 +26,7 @@ from matterformer.models.platonic.triton_attention import (
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
 )
+from matterformer.models.platonic.radius_sparse import build_radius_block_sparse_layout
 from matterformer.models.platonic.layers import flash_attn_varlen_func
 from matterformer.models.triton_compact_simplicial_attention import TRITON_COMPACT_SIMPLICIAL_AVAILABLE
 from matterformer.models.triton_grouped_compact_simplicial_attention import (
@@ -298,6 +299,111 @@ def test_platonic_radius_sparse_rbf_type_masks_far_pairs_and_gates_cutoff():
     assert type_bias.grad is not None
     assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
     assert torch.count_nonzero(type_bias.grad.abs() > 0) > 0
+
+
+def test_platonic_radius_sparse_cpu_triton_wrapper_uses_reference_path():
+    torch.manual_seed(117)
+    q = torch.randn(4, 2, 4, requires_grad=True)
+    k = torch.randn(4, 2, 4, requires_grad=True)
+    v = torch.randn(4, 2, 4, requires_grad=True)
+    pos = torch.tensor([[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [3.0, 0.0, 0.0], [3.4, 0.0, 0.0]])
+    atom_types = torch.tensor([1, 6, 8, 1])
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(1.0)
+    rbf_weight = (torch.randn(1, 4) * 0.01).requires_grad_()
+    type_bias = (torch.randn(9, 9, 1) * 0.01).requires_grad_()
+
+    ref = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=2,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        radial_bias_kind="radius_rbf_type_enveloped",
+        include_self=True,
+        envelope_in_score=True,
+    )
+    wrapped = platonic_attention_flat_triton(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=2,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        radial_bias_kind="radius_rbf_type_enveloped",
+    )
+
+    torch.testing.assert_close(wrapped, ref, atol=1e-6, rtol=1e-6)
+
+
+def test_radius_block_sparse_layout_covers_all_radius_edges_without_knn_cap():
+    pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+            [2.8, 0.0, 0.0],
+            [3.2, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+        ]
+    )
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+    layout = build_radius_block_sparse_layout(
+        pos,
+        cu_seqlens,
+        cutoff=1.0,
+        block_m=2,
+        block_n=2,
+        sort="cell",
+        include_self=True,
+    )
+
+    assert sorted(layout.perm.cpu().tolist()) == list(range(pos.shape[0]))
+    assert torch.equal(layout.perm[layout.inv_perm], torch.arange(pos.shape[0]))
+    assert layout.block_ptr.shape == (layout.num_q_blocks + 1,)
+    assert layout.block_ptr_t.shape == (layout.num_k_blocks + 1,)
+    assert layout.num_live_block_pairs > 0
+    assert layout.effective_tile_density > 0.0
+
+    sorted_pos = pos[layout.perm.cpu()]
+    active = set()
+    for qb in range(layout.num_q_blocks):
+        start = int(layout.block_ptr[qb].item())
+        end = int(layout.block_ptr[qb + 1].item())
+        for ptr in range(start, end):
+            active.add((qb, int(layout.block_col[ptr].item())))
+
+    def owner_block(starts: torch.Tensor, ends: torch.Tensor, token: int) -> int:
+        for block_idx, (start, end) in enumerate(zip(starts.cpu().tolist(), ends.cpu().tolist())):
+            if int(start) <= int(token) < int(end):
+                return block_idx
+        raise AssertionError(f"token {token} is not covered by any block")
+
+    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+        for i in range(int(start), int(end)):
+            for j in range(int(start), int(end)):
+                dist = torch.linalg.vector_norm(sorted_pos[i] - sorted_pos[j])
+                if i == j or float(dist.item()) < 1.0:
+                    qb = owner_block(layout.q_block_start, layout.q_block_end, i)
+                    kb = owner_block(layout.k_block_start, layout.k_block_end, j)
+                    assert (qb, kb) in active
 
 
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
