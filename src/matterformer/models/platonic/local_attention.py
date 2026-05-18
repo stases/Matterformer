@@ -55,13 +55,14 @@ class NoFixedKLocalBias(FixedKLocalBias):
         atom_types: torch.Tensor | None,
     ) -> FixedKLocalBiasResult:
         del k, v, neighbor_idx, dist, rbf, atom_types
+        mask = neighbor_mask.to(device=q.device, dtype=torch.bool)
         return FixedKLocalBiasResult(
             bias=torch.zeros(
-                (q.shape[0], q.shape[1], neighbor_mask.shape[-1]),
+                (q.shape[0], q.shape[1], mask.shape[-1]),
                 device=q.device,
                 dtype=q.dtype,
             ),
-            mask=neighbor_mask,
+            mask=mask,
         )
 
 
@@ -131,6 +132,8 @@ class ESENEnvelopedRBFTypeFixedKBias(FixedKLocalBias):
             type_bias = torch.as_tensor(type_bias)
             if type_bias.ndim != 3 or int(type_bias.shape[-1]) != int(heads_per_frame):
                 raise ValueError("type_bias must have shape [Z, Z, heads_per_frame]")
+            if int(type_bias.shape[0]) != int(type_bias.shape[1]):
+                raise ValueError("type_bias must be square in the atomic-number dimensions")
 
         _as_trainable_or_buffer(self, "rbf_weight", rbf_weight, trainable=trainable)
         _as_trainable_or_buffer(self, "centers", centers, trainable=False)
@@ -159,19 +162,25 @@ class ESENEnvelopedRBFTypeFixedKBias(FixedKLocalBias):
         del k, v
         if dist is None:
             raise ValueError("ESENEnvelopedRBFTypeFixedKBias requires dist")
+        dist = dist.to(device=q.device, dtype=q.dtype)
+        neighbor_mask = neighbor_mask.to(device=q.device, dtype=torch.bool)
+        neighbor_idx = neighbor_idx.to(device=q.device, dtype=torch.long).masked_fill(~neighbor_mask, 0)
         if rbf is None:
-            centers = self.centers.to(device=dist.device, dtype=dist.dtype)
-            gamma = self.gamma.to(device=dist.device, dtype=dist.dtype)
+            centers = self.centers.to(device=q.device, dtype=q.dtype)
+            gamma = self.gamma.to(device=q.device, dtype=q.dtype)
             rbf = torch.exp(-gamma * (dist[..., None] - centers.view(1, 1, -1)).square())
+        else:
+            rbf = rbf.to(device=q.device, dtype=q.dtype)
         if q.shape[1] % self.heads_per_frame != 0:
             raise ValueError("heads_per_frame must divide the number of attention heads")
         if rbf.shape[-1] != self.rbf_weight.shape[-1]:
             raise ValueError(f"rbf last dimension {rbf.shape[-1]} does not match rbf_weight {self.rbf_weight.shape[-1]}")
 
-        mask = neighbor_mask.bool()
-        same = neighbor_idx.to(device=q.device) == torch.arange(q.shape[0], device=q.device)[:, None]
-        env = _c2_quintic_envelope(dist.to(dtype=q.dtype), self.cutoff)
-        env = torch.where(mask, env, torch.zeros_like(env))
+        same = neighbor_idx == torch.arange(q.shape[0], device=q.device)[:, None]
+        local_mask = neighbor_mask & (dist < self.cutoff)
+        local_mask = local_mask | (same & neighbor_mask)
+        env = _c2_quintic_envelope(dist, self.cutoff)
+        env = torch.where(neighbor_mask, env, torch.zeros_like(env))
 
         env_bias = env
         if self.diag_zero:
@@ -179,7 +188,7 @@ class ESENEnvelopedRBFTypeFixedKBias(FixedKLocalBias):
 
         raw_subhead = torch.einsum(
             "nkr,sr->nks",
-            rbf.to(device=q.device, dtype=q.dtype),
+            rbf,
             self.rbf_weight.to(device=q.device, dtype=q.dtype),
         )
         if self.type_bias is not None:
@@ -187,7 +196,7 @@ class ESENEnvelopedRBFTypeFixedKBias(FixedKLocalBias):
                 raise ValueError("type_bias requires atom_types")
             zmax = self.type_bias.shape[0] - 1
             zi = atom_types.to(device=q.device).long().clamp(min=0, max=zmax)
-            zj = zi.index_select(0, neighbor_idx.reshape(-1).to(device=q.device).long()).reshape_as(neighbor_idx)
+            zj = zi.index_select(0, neighbor_idx.reshape(-1)).reshape_as(neighbor_idx)
             pair_type = self.type_bias.to(device=q.device, dtype=q.dtype)[zi[:, None], zj]
             raw_subhead = raw_subhead + pair_type
 
@@ -196,9 +205,9 @@ class ESENEnvelopedRBFTypeFixedKBias(FixedKLocalBias):
         bias = subhead_bias.index_select(dim=-1, index=head_subidx).permute(0, 2, 1).contiguous()
 
         if self.envelope_in_score:
-            env_score = env.masked_fill(same, 1.0)
+            env_score = env.masked_fill(same & neighbor_mask, 1.0)
             bias = bias + env_score.clamp_min(1.0e-20).log().unsqueeze(1).to(dtype=bias.dtype)
-        return FixedKLocalBiasResult(bias=bias, mask=mask)
+        return FixedKLocalBiasResult(bias=bias, mask=local_mask)
 
 
 def _gather_neighbor_tokens(values: torch.Tensor, neighbor_idx: torch.Tensor) -> torch.Tensor:
@@ -244,8 +253,8 @@ def fixed_k_local_attention_torch_reference(
     if dropout_p != 0.0 and not training:
         raise ValueError("dropout_p is only supported with training=True")
 
-    neighbor_idx = neighbor_idx.to(device=q.device, dtype=torch.long).masked_fill(~neighbor_mask.to(device=q.device), 0)
     neighbor_mask = neighbor_mask.to(device=q.device, dtype=torch.bool)
+    neighbor_idx = neighbor_idx.to(device=q.device, dtype=torch.long).masked_fill(~neighbor_mask, 0)
     k_neighbors = _gather_neighbor_tokens(k, neighbor_idx)
     v_neighbors = _gather_neighbor_tokens(v, neighbor_idx)
 

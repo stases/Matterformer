@@ -7,6 +7,7 @@ import torch
 from matterformer.models.platonic.local_attention import (
     ESENEnvelopedRBFTypeFixedKBias,
     FixedKLocalBias,
+    NoFixedKLocalBias,
     fixed_k_local_attention_torch_reference,
 )
 from matterformer.models.platonic.triton_attention import (
@@ -52,7 +53,13 @@ def _fallback_or_raise(
     dist: torch.Tensor | None,
     rbf: torch.Tensor | None,
     atom_types: torch.Tensor | None,
+    return_lse: bool = False,
 ) -> torch.Tensor:
+    if return_lse:
+        raise RuntimeError(
+            "return_lse=True is only implemented by the fixed-K Triton forward path; "
+            f"fallback was required because {reason}"
+        )
     if strict:
         raise RuntimeError(f"fixed-K local Triton attention is unavailable: {reason}")
     return fixed_k_local_attention_torch_reference(
@@ -224,6 +231,8 @@ def fixed_k_local_attention_triton(
         out = torch.empty_like(q)
         lse = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
         return (out, lse) if return_lse else out
+    if isinstance(bias, NoFixedKLocalBias):
+        bias = None
 
     if not TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
         return _fallback_or_raise(
@@ -238,6 +247,7 @@ def fixed_k_local_attention_triton(
             dist=dist,
             rbf=rbf,
             atom_types=atom_types,
+            return_lse=return_lse,
         )
     if q.device.type != "cuda":
         return _fallback_or_raise(
@@ -252,6 +262,7 @@ def fixed_k_local_attention_triton(
             dist=dist,
             rbf=rbf,
             atom_types=atom_types,
+            return_lse=return_lse,
         )
     if torch.is_grad_enabled() and _requires_grad(q, k, v):
         return _fallback_or_raise(
@@ -266,6 +277,7 @@ def fixed_k_local_attention_triton(
             dist=dist,
             rbf=rbf,
             atom_types=atom_types,
+            return_lse=return_lse,
         )
 
     bias_mode = _FIXED_K_BIAS_NONE
@@ -293,6 +305,7 @@ def fixed_k_local_attention_triton(
                 dist=dist,
                 rbf=rbf,
                 atom_types=atom_types,
+                return_lse=return_lse,
             )
         if dist is None:
             raise ValueError("ESEN fixed-K Triton bias requires dist")
@@ -313,6 +326,7 @@ def fixed_k_local_attention_triton(
                 dist=dist,
                 rbf=rbf,
                 atom_types=atom_types,
+                return_lse=return_lse,
             )
         bias_mode = _FIXED_K_BIAS_ESEN_RBF_TYPE
         rbf_weight = bias.rbf_weight.to(device=q.device, dtype=torch.float32).contiguous()
