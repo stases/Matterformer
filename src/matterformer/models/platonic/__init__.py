@@ -5,10 +5,12 @@ from matterformer.models.platonic.groups import (
 )
 from matterformer.models.platonic.local_attention import (
     ESENEnvelopedRBFTypeFixedKBias,
+    ESENFixedKLocalAttentionFeatures,
     FixedKLocalBias,
     FixedKLocalBiasResult,
     NoFixedKLocalBias,
     fixed_k_local_attention_torch_reference,
+    prepare_esen_fixed_k_local_attention_features,
 )
 from matterformer.models.platonic.local_attention_triton import (
     TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE,
@@ -28,6 +30,7 @@ from matterformer.models.platonic.triton_attention import (
 __all__ = [
     "PLATONIC_GROUPS",
     "ESENEnvelopedRBFTypeFixedKBias",
+    "ESENFixedKLocalAttentionFeatures",
     "FixedKLocalBias",
     "FixedKLocalBiasResult",
     "NoFixedKLocalBias",
@@ -40,6 +43,7 @@ __all__ = [
     "lift_scalars",
     "fixed_k_local_attention_torch_reference",
     "fixed_k_local_attention_triton",
+    "prepare_esen_fixed_k_local_attention_features",
     "platonic_attention_flat_torch_reference",
     "platonic_attention_flat_triton",
     "platonic_radius_sparse_attention_flat_triton",

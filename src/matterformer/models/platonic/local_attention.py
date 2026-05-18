@@ -21,6 +21,22 @@ class FixedKLocalBiasResult:
     mask: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class ESENFixedKLocalAttentionFeatures:
+    """Precomputed eSEN fixed-K edge features shared across heads/layers.
+
+    These tensors are geometry-derived and intentionally detached.  They are a
+    fast path for direct-force settings where fixed-K attention does not need
+    gradients through distances/coordinates.
+    """
+
+    local_mask: torch.Tensor
+    env_bias: torch.Tensor
+    log_env: torch.Tensor
+    rho_env: torch.Tensor
+    type_base: torch.Tensor
+
+
 class FixedKLocalBias(nn.Module):
     """Base class for replaceable fixed-K local attention biases."""
 
@@ -80,6 +96,70 @@ def _c2_quintic_envelope(dist: torch.Tensor, cutoff: float) -> torch.Tensor:
     x3 = x2 * x
     env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
     return torch.where(dist < float(cutoff), env, torch.zeros_like(env))
+
+
+@torch.no_grad()
+def prepare_esen_fixed_k_local_attention_features(
+    *,
+    neighbor_idx: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+    dist: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: torch.Tensor | float,
+    cutoff: float,
+    heads_per_frame: int,
+    atom_types: torch.Tensor | None = None,
+    max_atomic_number: int | None = None,
+    diag_zero: bool = True,
+    envelope_in_score: bool = True,
+) -> ESENFixedKLocalAttentionFeatures:
+    """Precompute fixed-K eSEN bias features for the Triton fast path."""
+
+    if neighbor_idx.ndim != 2 or neighbor_mask.shape != neighbor_idx.shape or dist.shape != neighbor_idx.shape:
+        raise ValueError("neighbor_idx, neighbor_mask, and dist must have shape [N, K]")
+    if int(heads_per_frame) <= 0:
+        raise ValueError("heads_per_frame must be positive")
+    if float(cutoff) <= 0.0:
+        raise ValueError("cutoff must be positive")
+    device = dist.device
+    dtype = torch.float32
+    mask = neighbor_mask.to(device=device, dtype=torch.bool)
+    idx = neighbor_idx.to(device=device, dtype=torch.long).masked_fill(~mask, 0)
+    dist_f = dist.to(device=device, dtype=dtype)
+    centers_f = centers.to(device=device, dtype=dtype)
+    gamma_f = torch.as_tensor(gamma, device=device, dtype=dtype).reshape(())
+    if centers_f.ndim != 1:
+        raise ValueError("centers must have shape [R]")
+
+    same = idx == torch.arange(idx.shape[0], device=device, dtype=torch.long)[:, None]
+    local_mask = mask & (dist_f < float(cutoff))
+    local_mask = local_mask | (same & mask)
+
+    env = _c2_quintic_envelope(dist_f, float(cutoff))
+    env = torch.where(mask, env, torch.zeros_like(env))
+    env_bias = env.masked_fill(same, 0.0) if bool(diag_zero) else env
+    env_score = env.masked_fill(same & mask, 1.0)
+    log_env = env_score.clamp_min(1.0e-20).log() if bool(envelope_in_score) else torch.zeros_like(env_score)
+    log_env = torch.where(local_mask, log_env, torch.zeros_like(log_env))
+
+    rho = torch.exp(-gamma_f * (dist_f[..., None] - centers_f.view(1, 1, -1)).square())
+    rho_env = env_bias[..., None] * rho
+
+    type_base = torch.zeros_like(idx, dtype=torch.long)
+    if atom_types is not None:
+        zmax = int(max_atomic_number) if max_atomic_number is not None else int(atom_types.max().item())
+        zi = atom_types.to(device=device, dtype=torch.long).clamp(min=0, max=zmax)
+        zj = zi.index_select(0, idx.reshape(-1)).reshape_as(idx)
+        zdim = int(zmax) + 1
+        type_base = (zi[:, None] * zdim + zj) * int(heads_per_frame)
+
+    return ESENFixedKLocalAttentionFeatures(
+        local_mask=local_mask.contiguous(),
+        env_bias=env_bias.contiguous(),
+        log_env=log_env.contiguous(),
+        rho_env=rho_env.contiguous(),
+        type_base=type_base.contiguous(),
+    )
 
 
 def _as_trainable_or_buffer(module: nn.Module, name: str, value: torch.Tensor, *, trainable: bool) -> None:
