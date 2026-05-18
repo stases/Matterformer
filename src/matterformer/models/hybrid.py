@@ -117,7 +117,7 @@ def _tetra_config_for_layer(base_config: dict[str, Any], layer_idx: int) -> dict
     if not _use_scheduled_local_attention(layer_idx, local_cfg):
         return base_config
     scheduled = dict(base_config)
-    scheduled["attention_backend"] = str(local_cfg.get("backend", "triton_rbf_type_bias"))
+    scheduled["attention_backend"] = str(local_cfg.get("backend", "triton"))
     attention_bias = {
         key: value
         for key, value in local_cfg.items()

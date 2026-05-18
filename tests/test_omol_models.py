@@ -628,7 +628,7 @@ def test_omol_internal_flat_tetra_triton_zero_init_matches_flash_flat():
         n_heads=4,
         n_layers=1,
         hybrid_config=_tetra_config(
-            "triton_radial_rbf",
+            "triton",
             {"kind": "radial_rbf", "num_rbf": 8, "zero_init": True, "gate_init": 0.0},
         ),
         chgspin_mode="add",

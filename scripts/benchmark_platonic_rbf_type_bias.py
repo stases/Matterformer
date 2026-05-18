@@ -366,7 +366,7 @@ def _full_model_cfg(base_cfg: dict[str, Any], variant: str) -> dict[str, Any]:
         tetra.pop("attention_bias", None)
         tetra["local_attention_mod"] = {
             "enabled": True,
-            "backend": "triton_rbf_type_bias",
+            "backend": "triton",
             "every": 4,
             "offset": 3,
             "kind": "rbf_type_enveloped",
@@ -381,7 +381,7 @@ def _full_model_cfg(base_cfg: dict[str, Any], variant: str) -> dict[str, Any]:
             "block_n": 32,
         }
     elif variant == "local_rbf_type_all":
-        tetra["attention_backend"] = "triton_rbf_type_bias"
+        tetra["attention_backend"] = "triton"
         tetra["attention_bias"] = {
             "kind": "rbf_type_enveloped",
             "num_rbf": 4,

@@ -17,7 +17,7 @@
     "attention_backend": "flash",
     "local_attention_mod": {
       "enabled": true,
-      "backend": "triton_rbf_type_bias",
+      "backend": "triton",
       "every": 2,
       "offset": 1,
       "kind": "rbf_type_enveloped",

@@ -369,7 +369,7 @@ def test_platonic_block_flat_triton_backends_match_flash_zero_init():
         dim_feedforward=12 * 8,
         solid_name="tetrahedron",
         dropout=0.0,
-        attention_backend="triton_radial_rbf",
+        attention_backend="triton",
         attention_bias={"kind": "radial_rbf", "num_rbf": 8, "zero_init": True},
     )
     triton_block.load_state_dict(flash.state_dict())
@@ -389,7 +389,7 @@ def test_platonic_block_flat_triton_backends_match_flash_zero_init():
     torch.testing.assert_close(radial_out, triton_out, atol=1e-6, rtol=1e-6)
 
 
-def test_platonic_block_flat_torch_rbf_type_bias_matches_triton_zero_init():
+def test_platonic_block_flat_rbf_type_bias_torch_reference_matches_triton_zero_init():
     torch.manual_seed(114)
     triton_block = PlatonicBlock(
         d_model=12 * 4,
@@ -406,7 +406,7 @@ def test_platonic_block_flat_torch_rbf_type_bias_matches_triton_zero_init():
         dim_feedforward=12 * 8,
         solid_name="tetrahedron",
         dropout=0.0,
-        attention_backend="torch_rbf_type_bias",
+        attention_backend="torch_reference",
         attention_bias={
             "kind": "rbf_type_enveloped",
             "num_rbf": 4,
@@ -421,7 +421,7 @@ def test_platonic_block_flat_torch_rbf_type_bias_matches_triton_zero_init():
         dim_feedforward=12 * 8,
         solid_name="tetrahedron",
         dropout=0.0,
-        attention_backend="triton_rbf_type_bias",
+        attention_backend="triton",
         attention_bias={
             "kind": "rbf_type_enveloped",
             "num_rbf": 4,
@@ -458,6 +458,31 @@ def test_platonic_block_flat_torch_rbf_type_bias_matches_triton_zero_init():
         )
     torch.testing.assert_close(local_out, triton_out, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(local_triton_out, triton_out, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("backend", "bias", "expected_backend", "expected_kind"),
+    [
+        ("triton", {"kind": "rbf_type_enveloped"}, "triton", "rbf_type_enveloped"),
+        ("triton_rbf_type_bias", {}, "triton", "rbf_type_enveloped"),
+        ("triton_radial_r2", {}, "triton", "radial_r2"),
+        ("torch_reference", {"kind": "rbf_type_enveloped"}, "torch_reference", "rbf_type_enveloped"),
+        ("torch_rbf_type_bias", {}, "torch_reference", "rbf_type_enveloped"),
+    ],
+)
+def test_platonic_attention_backend_bias_names_normalize(backend, bias, expected_backend, expected_kind):
+    block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend=backend,
+        attention_bias=bias,
+    )
+    assert block.attn.attention_backend == expected_backend
+    assert block.attn.attention_bias_config["kind"] == expected_kind
+    assert block.attn.radial_bias_kind == expected_kind
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
@@ -925,7 +950,8 @@ def test_hybrid_tetra_scheduled_local_attention_mod_selects_requested_layers():
                 "attention_backend": "flash",
                 "local_attention_mod": {
                     "enabled": True,
-                    "backend": "torch_rbf_type_bias",
+                    "backend": "torch_reference",
+                    "kind": "rbf_type_enveloped",
                     "every": 2,
                     "offset": 1,
                     "num_rbf": 4,
@@ -942,7 +968,7 @@ def test_hybrid_tetra_scheduled_local_attention_mod_selects_requested_layers():
         for layer in block.sublayers
         if hasattr(layer, "block")
     ]
-    assert backends == ["flash", "torch_rbf_type_bias", "flash", "torch_rbf_type_bias"]
+    assert backends == ["flash", "torch_reference", "flash", "torch_reference"]
 
 
 def test_hybrid_trunk_builds_geometry_cache_when_required():

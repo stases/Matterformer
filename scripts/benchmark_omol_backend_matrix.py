@@ -49,8 +49,8 @@ ATTENTION_MODES: dict[str, dict[str, Any]] = {
         "attention_backend": "triton",
         "attention_bias": {"precision": "bf16_flash_compat", "strict": True},
     },
-    "triton_radial_r2": {
-        "attention_backend": "triton_radial_r2",
+    "triton_bias_r2": {
+        "attention_backend": "triton",
         "attention_bias": {
             "kind": "radial_r2",
             "zero_init": True,
@@ -60,8 +60,8 @@ ATTENTION_MODES: dict[str, dict[str, Any]] = {
             "strict": True,
         },
     },
-    "triton_radial_slope": {
-        "attention_backend": "triton_radial_slope",
+    "triton_bias_slope": {
+        "attention_backend": "triton",
         "attention_bias": {
             "kind": "radial_slope",
             "zero_init": True,
@@ -71,8 +71,8 @@ ATTENTION_MODES: dict[str, dict[str, Any]] = {
             "strict": True,
         },
     },
-    "triton_radial_rbf8": {
-        "attention_backend": "triton_radial_rbf",
+    "triton_bias_rbf8": {
+        "attention_backend": "triton",
         "attention_bias": {
             "kind": "radial_rbf",
             "num_rbf": 8,
@@ -343,7 +343,7 @@ def main() -> None:
     parser.add_argument("--max-atoms-per-graph", type=int, default=220)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--attention-modes", nargs="+", default=["flash", "triton_tf32x3", "triton_bf16compat", "triton_radial_r2", "triton_radial_slope", "triton_radial_rbf8"])
+    parser.add_argument("--attention-modes", nargs="+", default=["flash", "triton_tf32x3", "triton_bf16compat", "triton_bias_r2", "triton_bias_slope", "triton_bias_rbf8"])
     parser.add_argument("--linear-modes", nargs="+", default=["spatial_recompute", "spatial_fast", "ffn_fourier_direct", "all_fourier_direct"])
     parser.add_argument("--compile-scopes", nargs="+", default=["none", "trunk_flat"])
     parser.add_argument("--precision-modes", nargs="+", default=["fp32_high"])

@@ -19,7 +19,9 @@ There are two independent backend concepts.
 - `flash`: use FlashAttention when available.
 - `sdpa`: use PyTorch scaled dot-product attention.
 - `triton`: use the custom Platonic Triton attention path.
-- `triton_radial_rbf`, `triton_radial_r2`, `triton_radial_slope`: use custom Triton attention with geometric radial bias.
+
+Geometric attention bias is selected independently with `attention_bias.kind`, for example
+`radial_rbf`, `radial_r2`, `radial_slope`, or `rbf_type_enveloped`.
 
 `linear_backend`, `attention_linear_backend`, and `ffn_linear_backend` control how Platonic group-convolution linear maps are evaluated:
 
@@ -214,7 +216,7 @@ or, with geometric bias:
 ```json
 {
   "tetra": {
-    "attention_backend": "triton_radial_r2",
+    "attention_backend": "triton",
     "attention_bias": {
       "kind": "radial_r2",
       "zero_init": true

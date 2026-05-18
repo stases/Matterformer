@@ -14,7 +14,7 @@
     "freq_init": "random",
     "use_key": false,
     "rope_on_values": true,
-    "attention_backend": "triton_radial_rbf",
+    "attention_backend": "triton",
     "attention_bias": {
       "kind": "radial_rbf",
       "num_rbf": 8,

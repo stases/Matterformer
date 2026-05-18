@@ -20,17 +20,72 @@ except (ImportError, OSError):
     flash_attn_varlen_func = None
 
 
-TRITON_RADIAL_BACKENDS = {
+TRITON_BIAS_BACKEND_ALIASES = {
     "triton_radial_rbf": "radial_rbf",
     "triton_radial_r2": "radial_r2",
     "triton_radial_slope": "radial_slope",
     "triton_rbf_type_bias": "rbf_type_enveloped",
 }
-TORCH_LOCAL_BIAS_BACKENDS = {
+TORCH_BIAS_BACKEND_ALIASES = {
     "torch_rbf_type_bias": "rbf_type_enveloped",
     "torch_smooth_local": "rbf_type_enveloped",
 }
-LOCAL_BIAS_BACKENDS = {**TRITON_RADIAL_BACKENDS, **TORCH_LOCAL_BIAS_BACKENDS}
+TRITON_RADIAL_BACKENDS = TRITON_BIAS_BACKEND_ALIASES
+TORCH_LOCAL_BIAS_BACKENDS = TORCH_BIAS_BACKEND_ALIASES
+LOCAL_BIAS_BACKENDS = {**TRITON_BIAS_BACKEND_ALIASES, **TORCH_BIAS_BACKEND_ALIASES}
+CANONICAL_ATTENTION_BACKENDS = {"sdpa", "flash", "triton", "torch_reference"}
+CANONICAL_ATTENTION_BIAS_KINDS = {"radial_rbf", "radial_r2", "radial_slope", "rbf_type_enveloped"}
+
+
+def _normalize_attention_bias_kind(value: str | None) -> str | None:
+    if value is None:
+        return None
+    key = str(value).lower().replace("-", "_")
+    if key in {"rbf", "radial"}:
+        key = "radial_rbf"
+    elif key in {"r2", "radial_square", "radial_squared"}:
+        key = "radial_r2"
+    elif key in {"slope", "radial_linear"}:
+        key = "radial_slope"
+    elif key in {"rbf_type", "type_rbf", "rbf_type_bias", "smooth_local", "smooth_local_mod"}:
+        key = "rbf_type_enveloped"
+    if key not in CANONICAL_ATTENTION_BIAS_KINDS:
+        raise ValueError(f"attention_bias.kind must be one of {sorted(CANONICAL_ATTENTION_BIAS_KINDS)}, got {value!r}")
+    return key
+
+
+def _normalize_attention_backend_and_bias(
+    attention_backend: str,
+    attention_bias: dict,
+) -> tuple[str, dict]:
+    backend = str(attention_backend).lower().replace("-", "_")
+    if backend == "default":
+        backend = "sdpa"
+    bias = dict(attention_bias)
+    alias_kind: str | None = None
+    if backend in TRITON_BIAS_BACKEND_ALIASES:
+        alias_kind = TRITON_BIAS_BACKEND_ALIASES[backend]
+        backend = "triton"
+    elif backend in TORCH_BIAS_BACKEND_ALIASES:
+        alias_kind = TORCH_BIAS_BACKEND_ALIASES[backend]
+        backend = "torch_reference"
+    elif backend == "torch":
+        backend = "torch_reference"
+    if backend not in CANONICAL_ATTENTION_BACKENDS:
+        raise ValueError(f"attention_backend must be one of {sorted(CANONICAL_ATTENTION_BACKENDS)}")
+    raw_kind = bias.get("kind")
+    bias_kind = _normalize_attention_bias_kind(raw_kind) if raw_kind is not None else None
+    if alias_kind is not None:
+        if bias_kind is not None and bias_kind != alias_kind:
+            raise ValueError(
+                f"legacy attention_backend alias requires attention_bias.kind={alias_kind!r}, got {raw_kind!r}"
+            )
+        bias_kind = alias_kind
+    if bias_kind is not None:
+        bias["kind"] = bias_kind
+    elif "kind" in bias:
+        bias.pop("kind")
+    return backend, bias
 
 
 class GroupLayerNorm(nn.Module):
@@ -108,12 +163,11 @@ class PlatonicAttention(nn.Module):
         self.qk_norm = bool(qk_norm)
         if self.fused_qv and self.use_key:
             raise ValueError("fused_qv=True is only supported when use_key=False")
-        self.attention_backend = str(attention_backend).lower()
-        if self.attention_backend == "default":
-            self.attention_backend = "sdpa"
-        if self.attention_backend not in {"sdpa", "flash", "triton", *LOCAL_BIAS_BACKENDS}:
-            allowed = sorted({"sdpa", "flash", "triton", *LOCAL_BIAS_BACKENDS})
-            raise ValueError(f"attention_backend must be one of {allowed}")
+        self.attention_bias_config = dict(attention_bias or {})
+        self.attention_backend, self.attention_bias_config = _normalize_attention_backend_and_bias(
+            attention_backend,
+            self.attention_bias_config,
+        )
         if self.fused_qv:
             self.qv_proj = PlatonicLinear(self.d_model, 2 * self.d_model, solid=solid_name, linear_backend=linear_backend)
             self.q_proj = None
@@ -130,7 +184,6 @@ class PlatonicAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
         self.out_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
-        self.attention_bias_config = dict(attention_bias or {})
         self.triton_block_m = int(self.attention_bias_config.get("block_m", 16))
         self.triton_block_n = int(self.attention_bias_config.get("block_n", 32))
         self.triton_strict = bool(self.attention_bias_config.get("strict", False))
@@ -139,21 +192,15 @@ class PlatonicAttention(nn.Module):
         self.rbf_gate: nn.Parameter | None
         self.rbf_type_bias: nn.Parameter | None
         self.radial_bias_kind: str | None
-        if self.attention_backend in LOCAL_BIAS_BACKENDS:
-            default_bias_kind = LOCAL_BIAS_BACKENDS[self.attention_backend]
-            bias_kind = str(self.attention_bias_config.get("kind", default_bias_kind)).lower().replace("-", "_")
-            if bias_kind in {"rbf", "radial"}:
-                bias_kind = "radial_rbf"
-            elif bias_kind in {"r2", "radial_square", "radial_squared"}:
-                bias_kind = "radial_r2"
-            elif bias_kind in {"slope", "radial_linear"}:
-                bias_kind = "radial_slope"
-            elif bias_kind in {"rbf_type", "type_rbf", "rbf_type_bias", "smooth_local", "smooth_local_mod"}:
-                bias_kind = "rbf_type_enveloped"
-            if bias_kind != default_bias_kind:
+        bias_kind = self.attention_bias_config.get("kind")
+        if bias_kind is not None:
+            bias_kind = _normalize_attention_bias_kind(str(bias_kind))
+            if self.attention_backend not in {"triton", "torch_reference"}:
                 raise ValueError(
-                    f"attention_backend={self.attention_backend!r} requires attention_bias.kind={default_bias_kind!r}"
+                    f"attention_bias.kind={bias_kind!r} requires attention_backend='triton' or 'torch_reference'"
                 )
+            if self.attention_backend == "torch_reference" and bias_kind != "rbf_type_enveloped":
+                raise ValueError("attention_backend='torch_reference' only supports attention_bias.kind='rbf_type_enveloped'")
             self.radial_bias_kind = bias_kind
             if bias_kind == "rbf_type_enveloped":
                 default_num_rbf = 4
@@ -474,12 +521,15 @@ class PlatonicAttention(nn.Module):
         dropout_p = self.dropout if self.training else 0.0
         if dropout_p != 0.0:
             raise ValueError("Platonic Triton flat attention currently requires dropout=0")
-        if self.attention_backend in TRITON_RADIAL_BACKENDS:
+        if self.radial_bias_kind is not None:
             if self.rbf_weight is None:
                 raise RuntimeError(f"{self.attention_backend} backend was initialized without radial parameters")
             if self.radial_bias_kind == "rbf_type_enveloped":
                 if self.rbf_type_bias is not None and atom_types is None:
-                    raise ValueError("attention_backend='triton_rbf_type_bias' requires atom_types in forward_flat")
+                    raise ValueError(
+                        "attention_backend='triton' with attention_bias.kind='rbf_type_enveloped' "
+                        "requires atom_types in forward_flat"
+                    )
                 return platonic_attention_flat_triton(
                     q,
                     k,
@@ -581,7 +631,7 @@ class PlatonicAttention(nn.Module):
         q = q.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(batch_size, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        if self.attention_backend in {"triton", *LOCAL_BIAS_BACKENDS}:
+        if self.attention_backend in {"triton", "torch_reference"}:
             raise ValueError(
                 "Platonic Triton/local-bias attention is implemented for forward_flat only; "
                 "use omol_runtime_mode='internal_flat_tetra' or switch attention_backend to 'flash'/'sdpa'."
@@ -616,7 +666,7 @@ class PlatonicAttention(nn.Module):
         v = v.reshape(num_tokens, self.num_heads, self.head_dim)
         if self.attention_backend == "flash":
             out = self._flash_attention_flat(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen))
-        elif self.attention_backend in {"triton", *TRITON_RADIAL_BACKENDS}:
+        elif self.attention_backend == "triton":
             out = self._triton_attention_flat(
                 q,
                 k,
@@ -626,7 +676,7 @@ class PlatonicAttention(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=int(max_seqlen),
             )
-        elif self.attention_backend in TORCH_LOCAL_BIAS_BACKENDS:
+        elif self.attention_backend == "torch_reference":
             out = self._torch_local_bias_attention_flat(
                 q,
                 k,
