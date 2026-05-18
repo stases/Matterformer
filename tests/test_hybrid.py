@@ -1138,6 +1138,149 @@ def test_platonic_radius_sparse_triton_cuda_forward_matches_sparse_reference(hea
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
+@pytest.mark.parametrize("has_type_bias", [True, False])
+def test_platonic_radius_sparse_triton_cuda_backward_d128_matches_sparse_reference(has_type_bias):
+    torch.manual_seed(122)
+    device = torch.device("cuda")
+    num_tokens = 48
+    num_heads = 4
+    head_dim = 128
+    q0 = torch.randn(num_tokens, num_heads, head_dim, device=device, dtype=torch.float32)
+    k0 = torch.randn(num_tokens, num_heads, head_dim, device=device, dtype=torch.float32)
+    v0 = torch.randn(num_tokens, num_heads, head_dim, device=device, dtype=torch.float32)
+    pos = torch.randn(num_tokens, 3, device=device, dtype=torch.float32) * 2.0
+    atom_types = torch.randint(1, 9, (num_tokens,), device=device)
+    cu_seqlens = torch.tensor([0, 16, 31, 48], dtype=torch.int32, device=device)
+    heads_per_frame = 2
+    rbf_weight0 = torch.randn(heads_per_frame, 4, device=device) * 0.01
+    type_bias0 = torch.randn(9, 9, heads_per_frame, device=device) * 0.01 if has_type_bias else None
+    centers = torch.linspace(0.0, 2.5, 4, device=device)
+    gamma = torch.tensor(2.25, device=device)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=2.5, block_m=16, block_n=16)
+    perm = layout.perm
+    pos = pos.index_select(0, perm).contiguous()
+    atom_types = atom_types.index_select(0, perm).contiguous()
+    q_sorted = q0.index_select(0, perm).contiguous()
+    k_sorted = k0.index_select(0, perm).contiguous()
+    v_sorted = v0.index_select(0, perm).contiguous()
+
+    q = q_sorted.detach().clone().requires_grad_(True)
+    k = k_sorted.detach().clone().requires_grad_(True)
+    v = v_sorted.detach().clone().requires_grad_(True)
+    rbf_weight = rbf_weight0.detach().clone().requires_grad_(True)
+    type_bias = None if type_bias0 is None else type_bias0.detach().clone().requires_grad_(True)
+    out = platonic_radius_sparse_attention_flat_triton(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=atom_types if has_type_bias else None,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=2.5,
+        max_atomic_number=8,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+        precision="tf32x3",
+        strict=True,
+    )
+
+    q_ref = q_sorted.detach().clone().requires_grad_(True)
+    k_ref = k_sorted.detach().clone().requires_grad_(True)
+    v_ref = v_sorted.detach().clone().requires_grad_(True)
+    rbf_weight_ref = rbf_weight0.detach().clone().requires_grad_(True)
+    type_bias_ref = None if type_bias0 is None else type_bias0.detach().clone().requires_grad_(True)
+    ref = platonic_radius_block_sparse_attention_torch_reference(
+        q_ref,
+        k_ref,
+        v_ref,
+        pos=pos,
+        atom_types=atom_types if has_type_bias else None,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight_ref,
+        type_bias=type_bias_ref,
+        centers=centers,
+        gamma=gamma,
+        cutoff=2.5,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+
+    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(rbf_weight.grad, rbf_weight_ref.grad, atol=8e-3, rtol=8e-3)
+    if has_type_bias:
+        assert type_bias is not None and type_bias_ref is not None
+        torch.testing.assert_close(type_bias.grad, type_bias_ref.grad, atol=2e-2, rtol=2e-2)
+
+
+def test_platonic_radius_sparse_rejects_mismatched_layout_cutoff_and_include_self():
+    torch.manual_seed(123)
+    q = torch.randn(8, 2, 16)
+    k = torch.randn(8, 2, 16)
+    v = torch.randn(8, 2, 16)
+    pos = torch.randn(8, 3)
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+    rbf_weight = torch.randn(1, 4) * 0.01
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(9.0)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=1.0, block_m=16, block_n=16, include_self=True)
+
+    with pytest.raises(ValueError, match="does not match attention cutoff"):
+        platonic_radius_sparse_attention_flat_triton(
+            q,
+            k,
+            v,
+            pos=pos,
+            atom_types=None,
+            heads_per_frame=1,
+            rbf_weight=rbf_weight,
+            type_bias=None,
+            centers=centers,
+            gamma=gamma,
+            cutoff=1.5,
+            max_atomic_number=0,
+            diag_zero=True,
+            include_self=True,
+            envelope_in_score=True,
+            radius_layout=layout,
+            strict=False,
+        )
+    with pytest.raises(ValueError, match="does not match attention include_self"):
+        platonic_radius_sparse_attention_flat_triton(
+            q,
+            k,
+            v,
+            pos=pos,
+            atom_types=None,
+            heads_per_frame=1,
+            rbf_weight=rbf_weight,
+            type_bias=None,
+            centers=centers,
+            gamma=gamma,
+            cutoff=1.0,
+            max_atomic_number=0,
+            diag_zero=True,
+            include_self=False,
+            envelope_in_score=True,
+            radius_layout=layout,
+            strict=False,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not TRITON_PLATONIC_ATTENTION_AVAILABLE, reason="requires CUDA and Triton")
 def test_platonic_flat_triton_rbf_type_cuda_matches_reference_forward_backward():
     torch.manual_seed(115)
     device = torch.device("cuda")

@@ -27,6 +27,7 @@ class RadiusBlockSparseLayout:
     block_m: int
     block_n: int
     cutoff: float
+    include_self: bool
     dense_pair_count: int
     radius_edge_count: int
     max_block_row_length: int
@@ -78,6 +79,7 @@ class RadiusBlockSparseLayout:
             block_m=self.block_m,
             block_n=self.block_n,
             cutoff=self.cutoff,
+            include_self=self.include_self,
             dense_pair_count=self.dense_pair_count,
             radius_edge_count=self.radius_edge_count,
             max_block_row_length=self.max_block_row_length,
@@ -242,6 +244,7 @@ def build_radius_block_sparse_layout(
         block_m=int(block_m),
         block_n=int(block_n),
         cutoff=float(cutoff),
+        include_self=bool(include_self),
         dense_pair_count=int(dense_pair_count),
         radius_edge_count=int(radius_edge_count),
         max_block_row_length=int(max_block_row_length),

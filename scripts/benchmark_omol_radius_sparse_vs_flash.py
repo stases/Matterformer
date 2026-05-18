@@ -421,9 +421,9 @@ def main() -> None:
 
     rows = [
         _bench("global_flash_attention_bf16", _flash_global, args, device, backward=False, clone_inputs=clone_flash),
-        _bench("radius_sparse_triton_forward_torch_backward", _sparse_triton, args, device, backward=False, clone_inputs=clone_sparse),
+        _bench("radius_sparse_triton", _sparse_triton, args, device, backward=False, clone_inputs=clone_sparse),
         _bench("global_flash_attention_bf16", _flash_global, args, device, backward=True, clone_inputs=clone_flash),
-        _bench("radius_sparse_triton_forward_torch_backward", _sparse_triton, args, device, backward=True, clone_inputs=clone_sparse),
+        _bench("radius_sparse_triton", _sparse_triton, args, device, backward=True, clone_inputs=clone_sparse),
     ]
 
     result = {
@@ -448,7 +448,7 @@ def main() -> None:
         "benchmarks": rows,
         "notes": {
             "flash_attention": "global per molecule, FlashAttention varlen, q/k/v cast to bf16 like PlatonicAttention._flash_attention_flat",
-            "radius_sparse": "Triton sparse forward over radius block layout; backward currently uses the torch block-sparse reference fallback, so fwd_bwd is not final sparse Triton backward performance",
+            "radius_sparse": "Triton sparse forward over radius block layout. For non-split head dimensions such as 128, backward uses the sparse Triton dq/dkv kernels; split-D dimensions still fall back to the torch block-sparse reference.",
             "position_gradients": "positions are treated as conditioning tensors here; dpos is not benchmarked",
         },
     }
