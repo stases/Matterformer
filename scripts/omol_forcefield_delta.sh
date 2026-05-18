@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/home/thadziv/GitHub/Matterformer}"
 PYTHON_BIN="${PYTHON_BIN:-/home/thadziv/GitHub/erwin/erwin/bin/python}"
 SLURM_RUN_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-${SLURM_GPUS_ON_NODE:-1}}"
 
 OMOL_DATA_ROOT="${OMOL_DATA_ROOT:-/home/ebekker/data/omol/open_mol}"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-$OMOL_DATA_ROOT/train_4M}"
@@ -274,6 +275,7 @@ echo "start_time:              $(date -Iseconds)"
 echo "host:                    $(hostname)"
 echo "repo_root:               $REPO_ROOT"
 echo "python_bin:              $PYTHON_BIN"
+echo "nproc_per_node:          $NPROC_PER_NODE"
 echo "train_data_path:         $TRAIN_DATA_PATH"
 echo "val_data_path:           $VAL_DATA_PATH"
 echo "model_backend:           $MODEL_BACKEND"
@@ -362,7 +364,12 @@ echo "wandb_run_name:          $WANDB_RUN_NAME"
 echo "wandb_mode:              $WANDB_MODE"
 echo "============================================================"
 
-"$PYTHON_BIN" scripts/train_omol_forcefield.py \
+TRAIN_CMD=("$PYTHON_BIN")
+if [ "$NPROC_PER_NODE" != "1" ]; then
+  TRAIN_CMD=("$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node "$NPROC_PER_NODE")
+fi
+
+"${TRAIN_CMD[@]}" scripts/train_omol_forcefield.py \
   --train-data-path "$TRAIN_DATA_PATH" \
   --val-data-path "$VAL_DATA_PATH" \
   --validation-mode "$VALIDATION_MODE" \

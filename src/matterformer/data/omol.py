@@ -351,9 +351,18 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         batching_mode: str = "random",
         bucket_window_size: int = 4096,
         bucket_shuffle_groups: int = 8,
+        num_replicas: int = 1,
+        rank: int = 0,
+        pad_distributed_batches: bool = True,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
+        num_replicas = int(num_replicas)
+        rank = int(rank)
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
         batching_mode = str(batching_mode).lower().replace("-", "_")
         if batching_mode not in {"random", "bucketed"}:
             raise ValueError("batching_mode must be one of {'random', 'bucketed'}")
@@ -367,6 +376,9 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         self.batching_mode = batching_mode
         self.bucket_window_size = max(1, int(bucket_window_size))
         self.bucket_shuffle_groups = max(1, int(bucket_shuffle_groups))
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.pad_distributed_batches = bool(pad_distributed_batches)
         self.epoch = 0
         self._atom_count_cache: dict[int, int] = {}
 
@@ -421,14 +433,14 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         if self.max_atoms is None:
-            return max(1, math.ceil(len(self.dataset) / self.max_batch_size))
+            batches = max(1, math.ceil(len(self.dataset) / self.max_batch_size))
+            return max(1, math.ceil(batches / self.num_replicas))
         avg_atoms = max(1, min(self.max_atoms, 64))
-        return max(1, math.ceil(len(self.dataset) / max(1, self.max_atoms // avg_atoms)))
+        batches = max(1, math.ceil(len(self.dataset) / max(1, self.max_atoms // avg_atoms)))
+        return max(1, math.ceil(batches / self.num_replicas))
 
-    def __iter__(self):
-        size = len(self.dataset)
-        indices = self._ordered_indices(size)
-
+    def _pack_batches(self, indices: list[int]) -> list[list[int]]:
+        batches: list[list[int]] = []
         batch: list[int] = []
         atom_total = 0
         edge_total = 0
@@ -441,7 +453,7 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
                 or (self.max_edges is not None and edge_total + edges > self.max_edges)
             )
             if should_flush:
-                yield batch
+                batches.append(batch)
                 batch = []
                 atom_total = 0
                 edge_total = 0
@@ -450,7 +462,7 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
                 self.max_edges is not None and edges > self.max_edges
             ):
                 if self.max_edges is None or edges <= self.max_edges:
-                    yield [int(idx)]
+                    batches.append([int(idx)])
                 continue
 
             batch.append(int(idx))
@@ -458,6 +470,25 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
             edge_total += edges
 
         if batch and (not self.drop_last or len(batch) == self.max_batch_size):
+            batches.append(batch)
+        return batches
+
+    def __iter__(self):
+        size = len(self.dataset)
+        indices = self._ordered_indices(size)
+        batches = self._pack_batches(indices)
+
+        if self.num_replicas > 1:
+            if self.pad_distributed_batches:
+                padding = (-len(batches)) % self.num_replicas
+                if padding:
+                    if not batches:
+                        return
+                    repeats = (padding + len(batches) - 1) // len(batches)
+                    batches = batches + (batches * repeats)[:padding]
+            batches = batches[self.rank :: self.num_replicas]
+
+        for batch in batches:
             yield batch
 
 

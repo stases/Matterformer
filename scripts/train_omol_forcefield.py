@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, is_dataclass
@@ -16,7 +17,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 
 from matterformer.data import (
     FairChemOMolDataset,
@@ -337,7 +341,58 @@ class CudaPhaseTimer:
         return results
 
 
+def setup_distributed_from_env(args: argparse.Namespace) -> torch.device:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    args.world_size = world_size
+    args.rank = rank
+    args.local_rank = local_rank
+    args.distributed = world_size > 1
+
+    if args.distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+            device = torch.device("cuda", local_rank)
+        else:
+            backend = "gloo"
+            device = torch.device("cpu")
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+        return device
+    return default_device()
+
+
+def cleanup_distributed(args: argparse.Namespace) -> None:
+    if bool(getattr(args, "distributed", False)) and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(args: argparse.Namespace) -> bool:
+    return int(getattr(args, "rank", 0)) == 0
+
+
+def main_process_print(args: argparse.Namespace, *values, **kwargs) -> None:
+    if is_main_process(args):
+        print(*values, **kwargs)
+
+
+def distributed_eval_average(totals: dict[str, float], graphs: int) -> dict[str, float]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return {key: value / max(graphs, 1) for key, value in totals.items()}
+
+    keys = sorted(totals)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    values = torch.tensor([totals[key] for key in keys] + [float(graphs)], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    total_graphs = max(float(values[-1].item()), 1.0)
+    return {key: float(values[idx].item() / total_graphs) for idx, key in enumerate(keys)}
+
+
 def maybe_init_wandb(args: argparse.Namespace):
+    if not is_main_process(args):
+        return None
     if args.wandb_mode == "disabled":
         return None
     try:
@@ -371,6 +426,8 @@ def build_loader(
     batching_mode: str = "random",
     bucket_window_size: int = 4096,
     bucket_shuffle_groups: int = 8,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     kwargs = {
         "num_workers": int(num_workers),
@@ -392,11 +449,28 @@ def build_loader(
             batching_mode=batching_mode,
             bucket_window_size=bucket_window_size,
             bucket_shuffle_groups=bucket_shuffle_groups,
+            num_replicas=world_size,
+            rank=rank,
+            pad_distributed_batches=shuffle,
         )
         loader = DataLoader(dataset, batch_sampler=sampler, **kwargs)
         loader.set_epoch = sampler.set_epoch  # type: ignore[attr-defined]
         return loader
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, **kwargs)
+    sampler = None
+    if int(world_size) > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=int(world_size),
+            rank=int(rank),
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=False,
+        )
+        shuffle = False
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, **kwargs)
+    if sampler is not None:
+        loader.set_epoch = sampler.set_epoch  # type: ignore[attr-defined]
+    return loader
 
 
 def summarize_loader_startup(name: str, loader: DataLoader, run) -> None:
@@ -511,7 +585,18 @@ def apply_rotation_augmentation(batch: OMolBatch, mode: str) -> OMolBatch:
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return getattr(model, "_orig_mod", model)
+    unwrapped = model
+    seen: set[int] = set()
+    while id(unwrapped) not in seen:
+        seen.add(id(unwrapped))
+        if hasattr(unwrapped, "module"):
+            unwrapped = getattr(unwrapped, "module")
+            continue
+        if hasattr(unwrapped, "_orig_mod"):
+            unwrapped = getattr(unwrapped, "_orig_mod")
+            continue
+        break
+    return unwrapped
 
 
 def close_dataset_handles(dataset: Dataset, seen: set[int] | None = None) -> None:
@@ -694,7 +779,7 @@ def evaluate(
             totals[key] = totals.get(key, 0.0) + float(value.detach().item()) * batch_graphs
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
-    return {key: value / max(graphs, 1) for key, value in totals.items()}
+    return distributed_eval_average(totals, graphs)
 
 
 def log_metrics(run, metrics: dict[str, float], *, prefix: str, step: int, extra: dict[str, float] | None = None) -> None:
@@ -744,10 +829,10 @@ def batch_runtime_metrics(
 
 
 def main(args: argparse.Namespace) -> None:
+    device = setup_distributed_from_env(args)
     seed_everything(args.seed)
     if args.float32_matmul_precision is not None:
         torch.set_float32_matmul_precision(args.float32_matmul_precision)
-    device = default_device()
     args.model_backend = str(args.model_backend).lower().replace("-", "_")
     args.hybrid_config = load_hybrid_config(args.hybrid_config_json) if args.model_backend == "matterformer" else None
     apply_tetra_attention_block_overrides(args.hybrid_config, args)
@@ -772,6 +857,8 @@ def main(args: argparse.Namespace) -> None:
         batching_mode=args.batching_mode,
         bucket_window_size=args.bucket_window_size,
         bucket_shuffle_groups=args.bucket_shuffle_groups,
+        rank=args.rank,
+        world_size=args.world_size,
     )
     val_loader = build_loader(
         val_dataset,
@@ -787,6 +874,8 @@ def main(args: argparse.Namespace) -> None:
         batching_mode=args.batching_mode,
         bucket_window_size=args.bucket_window_size,
         bucket_shuffle_groups=args.bucket_shuffle_groups,
+        rank=args.rank,
+        world_size=args.world_size,
     )
     test_loader = build_loader(
         test_dataset,
@@ -802,6 +891,8 @@ def main(args: argparse.Namespace) -> None:
         batching_mode=args.batching_mode,
         bucket_window_size=args.bucket_window_size,
         bucket_shuffle_groups=args.bucket_shuffle_groups,
+        rank=args.rank,
+        world_size=args.world_size,
     )
 
     element_refs = load_omol_element_references(args.element_refs_json).to(device)
@@ -824,7 +915,6 @@ def main(args: argparse.Namespace) -> None:
     close_dataset_handles(train_dataset)
     close_dataset_handles(val_dataset)
     close_dataset_handles(test_dataset)
-    ema = EMA(model, args.ema_decay) if args.ema_decay > 0.0 else None
     if args.compile and args.model_backend == "matterformer":
         if args.compile_scope == "model":
             model = torch.compile(model, mode=args.compile_mode)  # type: ignore[assignment]
@@ -864,6 +954,26 @@ def main(args: argparse.Namespace) -> None:
     elif args.compile:
         print("compile: AllScAIP backend skips the outer torch.compile wrapper; use --allscaip-compile to control its internal compile path")
 
+    if args.distributed:
+        if device.type != "cuda":
+            model = DistributedDataParallel(
+                model,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+        else:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+        main_process_print(
+            args,
+            f"ddp: world_size={args.world_size} rank={args.rank} local_rank={args.local_rank} "
+            f"find_unused_parameters={args.ddp_find_unused_parameters}",
+        )
+
+    ema = EMA(unwrap_model(model), args.ema_decay) if args.ema_decay > 0.0 else None
     optimizer = build_optimizer(model, args)
     scheduler_max_iters = resolve_scheduler_max_iters(args, train_loader)
     scheduler_min_lrs = resolve_scheduler_min_lrs(optimizer, args)
@@ -886,7 +996,7 @@ def main(args: argparse.Namespace) -> None:
 
     checkpoint_path = Path(args.output)
     latest_checkpoint_path = checkpoint_path.with_name("latest.pt")
-    if args.save_checkpoint:
+    if args.save_checkpoint and is_main_process(args):
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     best_val_total = float("inf")
     best_state_in_memory: dict[str, torch.Tensor] | None = None
@@ -939,8 +1049,9 @@ def main(args: argparse.Namespace) -> None:
     print(f"precision: bf16={args.bf16} matmul={args.float32_matmul_precision}")
     print(f"normalization: rmsd={args.normalizer_rmsd} energy_weight={args.energy_weight} force_weight={args.force_weight}")
     print("scheduler: " + json.dumps(args.scheduler_resolved, sort_keys=True))
-    summarize_loader_startup("train", train_loader, run)
-    summarize_loader_startup("val", val_loader, run)
+    if is_main_process(args):
+        summarize_loader_startup("train", train_loader, run)
+        summarize_loader_startup("val", val_loader, run)
     if hasattr(base_model, "allscaip_config"):
         print("allscaip_config_resolved: " + json.dumps(args.allscaip_config_runtime, sort_keys=True))
     if run is not None:
@@ -1005,6 +1116,21 @@ def main(args: argparse.Namespace) -> None:
                 skip_reason = "nonfinite_loss"
             elif args.skip_loss_above > 0.0 and loss_value > args.skip_loss_above:
                 skip_reason = "loss_above_threshold"
+            if args.distributed:
+                skip_code = 0
+                if skip_reason == "nonfinite_loss":
+                    skip_code = 2
+                elif skip_reason == "loss_above_threshold":
+                    skip_code = 1
+                skip_tensor = torch.tensor([skip_code], device=device, dtype=torch.int32)
+                dist.all_reduce(skip_tensor, op=dist.ReduceOp.MAX)
+                global_skip_code = int(skip_tensor.item())
+                if global_skip_code == 2:
+                    skip_reason = "nonfinite_loss"
+                elif global_skip_code == 1:
+                    skip_reason = "loss_above_threshold"
+                else:
+                    skip_reason = ""
             if skip_reason:
                 step_seconds = time.perf_counter() - step_start
                 global_step += 1
@@ -1117,9 +1243,10 @@ def main(args: argparse.Namespace) -> None:
                 is_best = val_total < best_val_total
                 if is_best:
                     best_val_total = val_total
-                    best_state_in_memory = clone_model_state_to_cpu(model)
-                    best_ema_state_in_memory = None if ema is None else ema.state_dict()
-                if args.save_checkpoint:
+                    if is_main_process(args):
+                        best_state_in_memory = clone_model_state_to_cpu(model)
+                        best_ema_state_in_memory = None if ema is None else ema.state_dict()
+                if args.save_checkpoint and is_main_process(args):
                     payload = build_checkpoint_payload(
                         model=model,
                         ema=ema,
@@ -1158,9 +1285,10 @@ def main(args: argparse.Namespace) -> None:
     is_best = val_total < best_val_total
     if is_best:
         best_val_total = val_total
-        best_state_in_memory = clone_model_state_to_cpu(model)
-        best_ema_state_in_memory = None if ema is None else ema.state_dict()
-    if args.save_checkpoint:
+        if is_main_process(args):
+            best_state_in_memory = clone_model_state_to_cpu(model)
+            best_ema_state_in_memory = None if ema is None else ema.state_dict()
+    if args.save_checkpoint and is_main_process(args):
         payload = build_checkpoint_payload(
             model=model,
             ema=ema,
@@ -1181,15 +1309,17 @@ def main(args: argparse.Namespace) -> None:
     )
     log_metrics(run, val_metrics, prefix="val", step=global_step, extra={"val/total": val_total})
 
-    if best_state_in_memory is not None:
-        unwrap_model(model).load_state_dict(best_state_in_memory)
-        if ema is not None and best_ema_state_in_memory is not None:
-            ema.load_state_dict(best_ema_state_in_memory)
-    elif args.save_checkpoint and checkpoint_path.is_file():
+    if args.distributed and args.save_checkpoint:
+        dist.barrier()
+    if args.save_checkpoint and checkpoint_path.is_file():
         checkpoint = torch.load(checkpoint_path, map_location=device)
         unwrap_model(model).load_state_dict(checkpoint["model_state"])
         if ema is not None and checkpoint.get("ema_state_dict") is not None:
             ema.load_state_dict(checkpoint["ema_state_dict"])
+    elif best_state_in_memory is not None:
+        unwrap_model(model).load_state_dict(best_state_in_memory)
+        if ema is not None and best_ema_state_in_memory is not None:
+            ema.load_state_dict(best_ema_state_in_memory)
     test_metrics = evaluate_with_ema(
         model=model,
         ema=ema,
@@ -1393,6 +1523,12 @@ if __name__ == "__main__":
             "'trunk_flat' compiles only the flat trunk path and leaves dynamic padding/scatter eager."
         ),
     )
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Passed to DistributedDataParallel when launched under torchrun/srun with WORLD_SIZE > 1.",
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=100.0)
     parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)
@@ -1411,4 +1547,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-mode", type=str, default="online")
     parser.add_argument("--wandb-dir", type=str, default="./outputs/Matterformer_OMol/wandb")
     parser.add_argument("--save-checkpoint", action=argparse.BooleanOptionalAction, default=True)
-    main(parser.parse_args())
+    parsed_args = parser.parse_args()
+    try:
+        main(parsed_args)
+    finally:
+        cleanup_distributed(parsed_args)
