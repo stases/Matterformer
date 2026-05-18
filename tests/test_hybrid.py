@@ -243,6 +243,63 @@ def test_platonic_rbf_type_enveloped_zero_init_is_noop_and_weights_get_grad():
     assert torch.count_nonzero(type_bias.grad.abs() > 0) > 0
 
 
+def test_platonic_radius_sparse_rbf_type_masks_far_pairs_and_gates_cutoff():
+    torch.manual_seed(115)
+    q = torch.zeros(3, 2, 2, requires_grad=True)
+    k = torch.zeros(3, 2, 2, requires_grad=True)
+    v = torch.randn(3, 2, 2, requires_grad=True)
+    pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    atom_types = torch.tensor([1, 6, 8])
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(1.0)
+    rbf_weight = torch.zeros(1, 4, requires_grad=True)
+    type_bias = torch.zeros(9, 9, 1, requires_grad=True)
+
+    out = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        pos=pos,
+        atom_types=atom_types,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        radial_bias_kind="radius_rbf_type_enveloped",
+        include_self=True,
+        envelope_in_score=True,
+        diag_zero=True,
+    )
+
+    dist = torch.cdist(pos, pos)
+    x = (dist / 1.0).clamp(min=0.0, max=1.0)
+    env = 1.0 - 10.0 * x.pow(3) + 15.0 * x.pow(4) - 6.0 * x.pow(5)
+    mask = dist < 1.0
+    diagonal = torch.eye(3, dtype=torch.bool)
+    mask = mask | diagonal
+    env = env.masked_fill(diagonal, 1.0)
+    scores = env.clamp_min(1.0e-20).log().masked_fill(~mask, -torch.inf)
+    probs = torch.softmax(scores, dim=-1)
+    manual = torch.einsum("ij,jhd->ihd", probs, v)
+
+    torch.testing.assert_close(out, manual, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(out[2], v[2], atol=1e-6, rtol=1e-6)
+
+    dense = platonic_attention_flat_torch_reference(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=3)
+    assert not torch.allclose(out[2], dense[2])
+
+    out.square().sum().backward()
+    assert rbf_weight.grad is not None
+    assert type_bias.grad is not None
+    assert torch.count_nonzero(rbf_weight.grad.abs() > 0) > 0
+    assert torch.count_nonzero(type_bias.grad.abs() > 0) > 0
+
+
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
     torch.manual_seed(103)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -460,6 +517,53 @@ def test_platonic_block_flat_rbf_type_bias_torch_reference_matches_triton_zero_i
     torch.testing.assert_close(local_triton_out, triton_out, atol=1e-6, rtol=1e-6)
 
 
+def test_platonic_block_flat_radius_sparse_reference_forward_backward():
+    torch.manual_seed(116)
+    block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="torch_radius_sparse",
+        attention_bias={
+            "num_rbf": 4,
+            "cutoff": 1.0,
+            "max_atomic_number": 8,
+            "include_self": True,
+            "envelope_in_score": True,
+            "zero_init": True,
+        },
+    )
+    x = torch.randn(5, 12 * 4, requires_grad=True)
+    pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.5, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+        ]
+    )
+    atom_types = torch.tensor([1, 6, 8, 1, 7])
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    out = block.forward_flat(
+        x,
+        pos=pos,
+        atom_types=atom_types,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+    )
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    out.square().mean().backward()
+    assert x.grad is not None
+    assert block.attn.rbf_weight is not None and block.attn.rbf_weight.grad is not None
+    assert block.attn.rbf_type_bias is not None and block.attn.rbf_type_bias.grad is not None
+
+
 @pytest.mark.parametrize(
     ("backend", "bias", "expected_backend", "expected_kind"),
     [
@@ -468,6 +572,7 @@ def test_platonic_block_flat_rbf_type_bias_torch_reference_matches_triton_zero_i
         ("triton_radial_r2", {}, "triton", "radial_r2"),
         ("torch_reference", {"kind": "rbf_type_enveloped"}, "torch_reference", "rbf_type_enveloped"),
         ("torch_rbf_type_bias", {}, "torch_reference", "rbf_type_enveloped"),
+        ("torch_radius_sparse", {}, "torch_reference", "radius_rbf_type_enveloped"),
     ],
 )
 def test_platonic_attention_backend_bias_names_normalize(backend, bias, expected_backend, expected_kind):

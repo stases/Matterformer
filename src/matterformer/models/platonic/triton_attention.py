@@ -27,6 +27,7 @@ PLATONIC_ATTENTION_BIAS_MODES = {
     "radial_r2": 2,
     "radial_slope": 3,
     "rbf_type_enveloped": 4,
+    "radius_rbf_type_enveloped": 5,
 }
 
 
@@ -60,6 +61,18 @@ def normalize_platonic_attention_bias_mode(value: str | int | None, *, has_bias:
         key = "radial_slope"
     elif key in {"rbf_type", "type_rbf", "rbf_type_bias", "smooth_local", "smooth_local_mod"}:
         key = "rbf_type_enveloped"
+    elif key in {
+        "radius_rbf_type",
+        "radius_rbf_type_bias",
+        "radius_rbf_type_enveloped",
+        "radius_sparse_rbf_type",
+        "radius_sparse_rbf_type_enveloped",
+        "sparse_rbf_type",
+        "sparse_rbf_type_enveloped",
+        "esen_local",
+        "esen_like",
+    }:
+        key = "radius_rbf_type_enveloped"
     if key not in PLATONIC_ATTENTION_BIAS_MODES:
         raise ValueError(f"unknown Platonic attention bias mode: {value!r}")
     return PLATONIC_ATTENTION_BIAS_MODES[key]
@@ -221,6 +234,66 @@ def _rbf_type_bias_reference(
     return subhead_bias.index_select(dim=-1, index=head_subidx).permute(2, 0, 1).contiguous()
 
 
+def _radius_rbf_type_sparse_score_reference(
+    pos_i: torch.Tensor,
+    pos_j: torch.Tensor,
+    atom_i: torch.Tensor | None,
+    atom_j: torch.Tensor | None,
+    *,
+    num_heads: int,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    type_bias: torch.Tensor | None = None,
+    diag_zero: bool,
+    include_self: bool,
+    envelope_in_score: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if heads_per_frame <= 0 or num_heads % int(heads_per_frame) != 0:
+        raise ValueError("heads_per_frame must divide num_heads for Platonic radius-sparse attention")
+    delta = pos_j[None, :, :] - pos_i[:, None, :]
+    dist = delta.square().sum(dim=-1).clamp_min(0.0).sqrt()
+    env = _c2_quintic_envelope(dist, cutoff).to(dtype=dist.dtype)
+    local_mask = dist < float(cutoff)
+    diagonal = None
+    if pos_i.shape[0] == pos_j.shape[0]:
+        diagonal = torch.eye(pos_i.shape[0], device=pos_i.device, dtype=torch.bool)
+        if include_self:
+            local_mask = local_mask | diagonal
+
+    env_for_bias = env
+    if diag_zero and diagonal is not None:
+        env_for_bias = env_for_bias.masked_fill(diagonal, 0.0)
+
+    centers = centers.to(device=dist.device, dtype=dist.dtype)
+    gamma = gamma.to(device=dist.device, dtype=dist.dtype)
+    rbf = torch.exp(-gamma * (dist[..., None] - centers.view(1, 1, -1)).square())
+    rbf = rbf * env_for_bias[..., None]
+    weights = rbf_weight.to(device=dist.device, dtype=dist.dtype)
+    subhead_bias = torch.einsum("ijm,hm->ijh", rbf, weights)
+
+    if type_bias is not None:
+        if atom_i is None or atom_j is None:
+            raise ValueError("type_bias requires atom_i and atom_j")
+        zmax = type_bias.shape[0] - 1
+        zi = atom_i.to(device=dist.device).long().clamp(min=0, max=zmax)
+        zj = atom_j.to(device=dist.device).long().clamp(min=0, max=zmax)
+        pair_type = type_bias.to(device=dist.device, dtype=dist.dtype)[zi[:, None], zj[None, :]]
+        subhead_bias = subhead_bias + env_for_bias[..., None] * pair_type
+
+    head_subidx = torch.arange(num_heads, device=pos_i.device) % int(heads_per_frame)
+    bias = subhead_bias.index_select(dim=-1, index=head_subidx).permute(2, 0, 1).contiguous()
+
+    if envelope_in_score:
+        env_for_score = env
+        if diagonal is not None and include_self:
+            env_for_score = env_for_score.masked_fill(diagonal, 1.0)
+        bias = bias + env_for_score.clamp_min(1.0e-20).log().unsqueeze(0).to(dtype=bias.dtype)
+    return bias, local_mask
+
+
 def platonic_attention_flat_torch_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -239,6 +312,8 @@ def platonic_attention_flat_torch_reference(
     cutoff: float | None = None,
     radial_bias_kind: str | int | None = None,
     diag_zero: bool = True,
+    include_self: bool = True,
+    envelope_in_score: bool = True,
     dropout_p: float = 0.0,
     training: bool = False,
 ) -> torch.Tensor:
@@ -254,7 +329,11 @@ def platonic_attention_flat_torch_reference(
         raise ValueError("Platonic flat reference attention only supports dropout_p=0")
     use_rbf = rbf_weight is not None
     bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
-    use_rbf_type = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
+    use_rbf_type = use_rbf and bias_mode in {
+        PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
+        PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
+    }
+    use_radius_sparse = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"]
     if use_rbf:
         if pos is None or heads_per_frame is None or centers is None or gamma is None:
             raise ValueError("Radial bias requires pos, heads_per_frame, centers, and gamma")
@@ -279,7 +358,27 @@ def platonic_attention_flat_torch_reference(
         k_seg = k[start_i:end_i].transpose(0, 1)
         v_seg = v[start_i:end_i].transpose(0, 1)
         scores = torch.matmul(q_seg, k_seg.transpose(-2, -1)) * scale
-        if use_rbf_type:
+        if use_radius_sparse:
+            assert pos is not None
+            bias, local_mask = _radius_rbf_type_sparse_score_reference(
+                pos[start_i:end_i],
+                pos[start_i:end_i],
+                None if atom_types is None else atom_types[start_i:end_i],
+                None if atom_types is None else atom_types[start_i:end_i],
+                num_heads=q.shape[1],
+                heads_per_frame=int(heads_per_frame),
+                rbf_weight=rbf_weight,
+                type_bias=type_bias,
+                centers=centers,
+                gamma=gamma,
+                cutoff=float(cutoff),
+                diag_zero=diag_zero,
+                include_self=include_self,
+                envelope_in_score=envelope_in_score,
+            )
+            scores = scores + bias.to(dtype=scores.dtype)
+            scores = scores.masked_fill(~local_mask.unsqueeze(0), -torch.inf)
+        elif use_rbf_type:
             assert pos is not None
             bias = _rbf_type_bias_reference(
                 pos[start_i:end_i],
@@ -312,6 +411,9 @@ def platonic_attention_flat_torch_reference(
             )
             scores = scores + bias.to(dtype=scores.dtype)
         probs = torch.softmax(scores, dim=-1)
+        if use_radius_sparse:
+            row_has_neighbor = torch.isfinite(scores).any(dim=-1, keepdim=True)
+            probs = torch.where(row_has_neighbor, probs, torch.zeros_like(probs))
         if training and dropout_p > 0.0:
             probs = torch.nn.functional.dropout(probs, p=float(dropout_p), training=True)
         outputs.append(torch.matmul(probs, v_seg).transpose(0, 1).contiguous())
@@ -2246,7 +2348,15 @@ def platonic_attention_flat_triton(
     kernel_precision = _kernel_input_precision(normalized_precision)
     use_rbf = rbf_weight is not None
     bias_mode = normalize_platonic_attention_bias_mode(radial_bias_kind, has_bias=use_rbf)
-    use_rbf_type = use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"]
+    use_rbf_type = use_rbf and bias_mode in {
+        PLATONIC_ATTENTION_BIAS_MODES["rbf_type_enveloped"],
+        PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"],
+    }
+    if use_rbf and bias_mode == PLATONIC_ATTENTION_BIAS_MODES["radius_rbf_type_enveloped"] and q.is_cuda:
+        raise ValueError(
+            "radius_rbf_type_enveloped is a torch reference backend today; "
+            "the Triton radius-sparse kernel is not wired yet"
+        )
     if use_rbf:
         if pos is None or heads_per_frame is None or centers is None or gamma is None:
             raise ValueError("Platonic radial Triton attention requires pos, heads_per_frame, centers, and gamma")

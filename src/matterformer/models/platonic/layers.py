@@ -29,12 +29,21 @@ TRITON_BIAS_BACKEND_ALIASES = {
 TORCH_BIAS_BACKEND_ALIASES = {
     "torch_rbf_type_bias": "rbf_type_enveloped",
     "torch_smooth_local": "rbf_type_enveloped",
+    "torch_radius_sparse": "radius_rbf_type_enveloped",
+    "torch_radius_rbf_type_bias": "radius_rbf_type_enveloped",
+    "torch_esen_local": "radius_rbf_type_enveloped",
 }
 TRITON_RADIAL_BACKENDS = TRITON_BIAS_BACKEND_ALIASES
 TORCH_LOCAL_BIAS_BACKENDS = TORCH_BIAS_BACKEND_ALIASES
 LOCAL_BIAS_BACKENDS = {**TRITON_BIAS_BACKEND_ALIASES, **TORCH_BIAS_BACKEND_ALIASES}
 CANONICAL_ATTENTION_BACKENDS = {"sdpa", "flash", "triton", "torch_reference"}
-CANONICAL_ATTENTION_BIAS_KINDS = {"radial_rbf", "radial_r2", "radial_slope", "rbf_type_enveloped"}
+CANONICAL_ATTENTION_BIAS_KINDS = {
+    "radial_rbf",
+    "radial_r2",
+    "radial_slope",
+    "rbf_type_enveloped",
+    "radius_rbf_type_enveloped",
+}
 
 
 def _normalize_attention_bias_kind(value: str | None) -> str | None:
@@ -49,6 +58,18 @@ def _normalize_attention_bias_kind(value: str | None) -> str | None:
         key = "radial_slope"
     elif key in {"rbf_type", "type_rbf", "rbf_type_bias", "smooth_local", "smooth_local_mod"}:
         key = "rbf_type_enveloped"
+    elif key in {
+        "radius_rbf_type",
+        "radius_rbf_type_bias",
+        "radius_rbf_type_enveloped",
+        "radius_sparse_rbf_type",
+        "radius_sparse_rbf_type_enveloped",
+        "sparse_rbf_type",
+        "sparse_rbf_type_enveloped",
+        "esen_local",
+        "esen_like",
+    }:
+        key = "radius_rbf_type_enveloped"
     if key not in CANONICAL_ATTENTION_BIAS_KINDS:
         raise ValueError(f"attention_bias.kind must be one of {sorted(CANONICAL_ATTENTION_BIAS_KINDS)}, got {value!r}")
     return key
@@ -199,17 +220,28 @@ class PlatonicAttention(nn.Module):
                 raise ValueError(
                     f"attention_bias.kind={bias_kind!r} requires attention_backend='triton' or 'torch_reference'"
                 )
-            if self.attention_backend == "torch_reference" and bias_kind != "rbf_type_enveloped":
-                raise ValueError("attention_backend='torch_reference' only supports attention_bias.kind='rbf_type_enveloped'")
+            if self.attention_backend == "triton" and bias_kind == "radius_rbf_type_enveloped":
+                raise ValueError(
+                    "attention_bias.kind='radius_rbf_type_enveloped' is currently implemented by "
+                    "attention_backend='torch_reference'/'torch_radius_sparse'; the Triton sparse kernel is not wired yet"
+                )
+            if self.attention_backend == "torch_reference" and bias_kind not in {
+                "rbf_type_enveloped",
+                "radius_rbf_type_enveloped",
+            }:
+                raise ValueError(
+                    "attention_backend='torch_reference' supports attention_bias.kind="
+                    "{'rbf_type_enveloped', 'radius_rbf_type_enveloped'}"
+                )
             self.radial_bias_kind = bias_kind
-            if bias_kind == "rbf_type_enveloped":
+            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped"}:
                 default_num_rbf = 4
             else:
                 default_num_rbf = 8 if bias_kind == "radial_rbf" else 1
             num_rbf = int(self.attention_bias_config.get("num_rbf", default_num_rbf))
             if num_rbf <= 0:
                 raise ValueError("attention_bias.num_rbf/num_basis must be positive")
-            if bias_kind in {"radial_rbf", "rbf_type_enveloped"}:
+            if bias_kind in {"radial_rbf", "rbf_type_enveloped", "radius_rbf_type_enveloped"}:
                 rbf_min = float(self.attention_bias_config.get("rbf_min", 0.0))
                 rbf_max = float(self.attention_bias_config.get("rbf_max", self.attention_bias_config.get("cutoff", 6.0)))
                 centers = torch.linspace(rbf_min, rbf_max, num_rbf)
@@ -226,7 +258,7 @@ class PlatonicAttention(nn.Module):
             self.rbf_weight = nn.Parameter(torch.zeros(self.heads_per_frame, num_rbf))
             if not zero_init:
                 nn.init.normal_(self.rbf_weight, mean=0.0, std=1.0e-3)
-            if bias_kind == "rbf_type_enveloped":
+            if bias_kind in {"rbf_type_enveloped", "radius_rbf_type_enveloped"}:
                 self.rbf_gate = None
                 self.local_cutoff = float(self.attention_bias_config.get("cutoff", 6.0))
                 self.local_max_atomic_number = int(self.attention_bias_config.get("max_atomic_number", 118))
@@ -240,6 +272,13 @@ class PlatonicAttention(nn.Module):
                         nn.init.normal_(self.rbf_type_bias, mean=0.0, std=1.0e-3)
                 else:
                     self.register_parameter("rbf_type_bias", None)
+                self.local_include_self = bool(self.attention_bias_config.get("include_self", True))
+                self.local_envelope_in_score = bool(
+                    self.attention_bias_config.get(
+                        "envelope_in_score",
+                        bias_kind == "radius_rbf_type_enveloped",
+                    )
+                )
             else:
                 self.rbf_gate = nn.Parameter(
                     torch.full((self.heads_per_frame,), float(self.attention_bias_config.get("gate_init", 0.0)))
@@ -247,6 +286,8 @@ class PlatonicAttention(nn.Module):
                 self.register_parameter("rbf_type_bias", None)
                 self.local_cutoff = 0.0
                 self.local_max_atomic_number = 0
+                self.local_include_self = True
+                self.local_envelope_in_score = False
             self.rbf_diag_zero = bool(self.attention_bias_config.get("diag_zero", True))
         else:
             self.radial_bias_kind = None
@@ -258,6 +299,8 @@ class PlatonicAttention(nn.Module):
             self.rbf_diag_zero = True
             self.local_cutoff = 0.0
             self.local_max_atomic_number = 0
+            self.local_include_self = True
+            self.local_envelope_in_score = False
         self.rope = PlatonicRoPE(
             embed_dim=self.d_model,
             num_heads=self.heads_per_frame,
@@ -616,6 +659,8 @@ class PlatonicAttention(nn.Module):
             cutoff=self.local_cutoff,
             radial_bias_kind=self.radial_bias_kind,
             diag_zero=self.rbf_diag_zero,
+            include_self=self.local_include_self,
+            envelope_in_score=self.local_envelope_in_score,
         )
 
     def forward(
