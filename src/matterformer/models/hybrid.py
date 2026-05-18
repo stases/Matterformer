@@ -210,6 +210,8 @@ class HybridConfig:
             "rope_cache": True,
             "constant_key_fastpath": True,
             "fused_qv": False,
+            "qk_norm": False,
+            "chgspin_film": False,
             "local_attention_mod": None,
             **dict(cfg.tetra),
         }
@@ -235,6 +237,7 @@ class ModelState:
     cond_emb: torch.Tensor | None = None
     sigma: torch.Tensor | None = None
     atom_types: torch.Tensor | None = None
+    chgspin_film: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1877,7 +1880,15 @@ class TetraPlatonicGlobalLayer(nn.Module):
             rope_cache=bool(config.get("rope_cache", True)),
             constant_key_fastpath=bool(config.get("constant_key_fastpath", True)),
             fused_qv=bool(config.get("fused_qv", False)),
+            qk_norm=bool(config.get("qk_norm", False)),
         )
+        self.chgspin_film = bool(config.get("chgspin_film", False))
+        if self.chgspin_film:
+            self.chgspin_film_proj = nn.Linear(self.dim_per_frame, 2 * self.dim_per_frame)
+            nn.init.zeros_(self.chgspin_film_proj.weight)
+            nn.init.zeros_(self.chgspin_film_proj.bias)
+        else:
+            self.chgspin_film_proj = None
 
     @staticmethod
     def _positions(pos: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -1886,10 +1897,32 @@ class TetraPlatonicGlobalLayer(nn.Module):
         pad = torch.zeros(pos.shape[0], seq_len - pos.shape[1], 3, device=pos.device, dtype=pos.dtype)
         return torch.cat([pos, pad], dim=1)
 
+    def _apply_chgspin_film(self, group: torch.Tensor, chgspin_film: torch.Tensor | None) -> torch.Tensor:
+        if not self.chgspin_film or chgspin_film is None:
+            return group
+        if self.chgspin_film_proj is None:
+            raise RuntimeError("Charge/spin FiLM is enabled but no FiLM projection is configured")
+        if chgspin_film.shape[-1] != self.dim_per_frame:
+            raise ValueError(
+                f"Expected chgspin_film last dim {self.dim_per_frame}, got {tuple(chgspin_film.shape)}"
+            )
+        film_out = self.chgspin_film_proj(chgspin_film.to(device=group.device, dtype=group.dtype))
+        gamma, beta = film_out.chunk(2, dim=-1)
+        if group.ndim == 4:
+            gamma = gamma.unsqueeze(-2)
+            beta = beta.unsqueeze(-2)
+        elif group.ndim == 3:
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
+        else:
+            raise ValueError(f"Expected group tensor with 3 or 4 dims, got {tuple(group.shape)}")
+        return (1 + gamma) * group + beta
+
     def forward(self, state: ModelState) -> ModelState:
         if state.group is None:
             return state
         with record_function("tetra_global/platonic_block"):
+            state.group = self._apply_chgspin_film(state.group, state.chgspin_film)
             group_shape = state.group.shape
             x = state.group.reshape(group_shape[0], group_shape[1], self.group_order * self.dim_per_frame)
             x = self.block(
@@ -1911,6 +1944,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        chgspin_film: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with record_function("tetra_global/platonic_block_flat"):
             if group.ndim != 3 or group.shape[1:] != (self.group_order, self.dim_per_frame):
@@ -1918,6 +1952,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
                     f"Expected flat group tensor [N, {self.group_order}, {self.dim_per_frame}], "
                     f"got {tuple(group.shape)}"
                 )
+            group = self._apply_chgspin_film(group, chgspin_film)
             x = group.reshape(group.shape[0], self.group_order * self.dim_per_frame)
             x = self.block.forward_flat(
                 x,
@@ -2327,6 +2362,7 @@ class HybridTransformerTrunk(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        chgspin_film: torch.Tensor | None = None,
         return_output: bool = False,
     ) -> torch.Tensor | HybridFlatTrunkOutput:
         if not self.supports_flat_tetra:
@@ -2357,6 +2393,7 @@ class HybridTransformerTrunk(nn.Module):
                         atom_types=atom_types,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=int(max_seqlen),
+                        chgspin_film=chgspin_film,
                     )
         if self.readout_kind == "platonic_ffn":
             scalar_out = group.reshape(group.shape[0], self.d_model)
@@ -2380,6 +2417,7 @@ class HybridTransformerTrunk(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         flat_geom: FlatGeometryCache | None,
+        chgspin_film: torch.Tensor | None = None,
         return_output: bool = False,
     ) -> torch.Tensor | HybridFlatTrunkOutput:
         if not self.supports_flat_hybrid:
@@ -2410,6 +2448,7 @@ class HybridTransformerTrunk(nn.Module):
                             atom_types=atom_types,
                             cu_seqlens=cu_seqlens,
                             max_seqlen=int(max_seqlen),
+                            chgspin_film=chgspin_film,
                         )
                     elif isinstance(layer, GroupFramewiseSimplicialLayer):
                         if flat_geom is None:
@@ -2520,6 +2559,7 @@ class HybridTransformerTrunk(nn.Module):
         lattice: torch.Tensor | None = None,
         sigma: torch.Tensor | None = None,
         atom_types: torch.Tensor | None = None,
+        chgspin_film: torch.Tensor | None = None,
         return_output: bool = False,
     ) -> torch.Tensor | HybridTrunkOutput:
         if pad_mask is not None and pad_mask.dtype != torch.bool:
@@ -2548,6 +2588,7 @@ class HybridTransformerTrunk(nn.Module):
             cond_emb=cond_emb,
             sigma=sigma,
             atom_types=atom_types,
+            chgspin_film=chgspin_film,
         )
         with record_function("hybrid_trunk/blocks"):
             for block in self.blocks:

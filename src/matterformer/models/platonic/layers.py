@@ -47,6 +47,20 @@ class GroupLayerNorm(nn.Module):
         return x.reshape(shape)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(self.dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_float = x.float()
+        rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x_norm = (x_float * rms).to(dtype=x.dtype)
+        return x_norm * self.weight.to(device=x.device, dtype=x.dtype)
+
+
 class PlatonicAttention(nn.Module):
     def __init__(
         self,
@@ -66,6 +80,7 @@ class PlatonicAttention(nn.Module):
         rope_cache: bool = True,
         constant_key_fastpath: bool = True,
         fused_qv: bool = False,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -90,6 +105,7 @@ class PlatonicAttention(nn.Module):
         self.rope_cache = bool(rope_cache)
         self.constant_key_fastpath = bool(constant_key_fastpath)
         self.fused_qv = bool(fused_qv)
+        self.qk_norm = bool(qk_norm)
         if self.fused_qv and self.use_key:
             raise ValueError("fused_qv=True is only supported when use_key=False")
         self.attention_backend = str(attention_backend).lower()
@@ -111,6 +127,8 @@ class PlatonicAttention(nn.Module):
             if self.use_key
             else None
         )
+        self.q_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
         self.out_proj = PlatonicLinear(self.d_model, self.d_model, solid=solid_name, linear_backend=linear_backend)
         self.attention_bias_config = dict(attention_bias or {})
         self.triton_block_m = int(self.attention_bias_config.get("block_m", 16))
@@ -257,8 +275,15 @@ class PlatonicAttention(nn.Module):
         pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         q, v = self._project_qv(x)
+        q = self.q_norm(q)
+        if self.k_proj is not None:
+            k_unrotated = self.k_norm(self._split(self.k_proj(x)))
+        elif self.qk_norm:
+            k_unrotated = self.k_norm(torch.ones_like(q))
+        else:
+            k_unrotated = None
         if not self.rope_cache:
-            k = self._split(self.k_proj(x)) if self.k_proj is not None else torch.ones_like(q)
+            k = k_unrotated if k_unrotated is not None else torch.ones_like(q)
             q = self.rope(q, pos)
             k = self.rope(k, pos)
             if self.rope_on_values:
@@ -267,8 +292,8 @@ class PlatonicAttention(nn.Module):
 
         cos, sin = self.rope.cos_sin(pos, dtype=q.dtype, device=q.device)
         q = self.rope.apply_from_cos_sin(q, cos, sin)
-        if self.k_proj is not None:
-            k = self.rope.apply_from_cos_sin(self._split(self.k_proj(x)), cos, sin)
+        if k_unrotated is not None:
+            k = self.rope.apply_from_cos_sin(k_unrotated, cos, sin)
         elif self.constant_key_fastpath:
             k = self.rope.constant_key_from_cos_sin(cos, sin)
         else:
@@ -643,6 +668,7 @@ class PlatonicBlock(nn.Module):
         rope_cache: bool = True,
         constant_key_fastpath: bool = True,
         fused_qv: bool = False,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         solid_name = solid_name.lower()
@@ -671,6 +697,7 @@ class PlatonicBlock(nn.Module):
             rope_cache=rope_cache,
             constant_key_fastpath=constant_key_fastpath,
             fused_qv=fused_qv,
+            qk_norm=qk_norm,
         )
         self.linear1 = PlatonicLinear(d_model, dim_feedforward, solid=solid_name, linear_backend=mlp_linear_backend)
         self.linear2 = PlatonicLinear(dim_feedforward, d_model, solid=solid_name, linear_backend=mlp_linear_backend)

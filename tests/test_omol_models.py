@@ -4,6 +4,7 @@ from matterformer.data import SyntheticOMolDataset, collate_omol
 from matterformer.geometry.cache import flatten_padded_geometry_cache
 from matterformer.models import MatterformerOMolForceField
 from matterformer.models.platonic import PLATONIC_GROUPS
+from matterformer.models.platonic.layers import RMSNorm, PlatonicAttention
 from matterformer.tasks import OMolDirectForceLoss, OMolElementReferences
 from matterformer.utils import random_rotation_matrices
 
@@ -29,7 +30,11 @@ def _scalar_config(d_model: int = 32):
     }
 
 
-def _tetra_config(attention_backend: str | None = None, attention_bias: dict | None = None):
+def _tetra_config(
+    attention_backend: str | None = None,
+    attention_bias: dict | None = None,
+    tetra_overrides: dict | None = None,
+):
     tetra = {
         "group": "tetrahedron",
         "group_order": 12,
@@ -44,6 +49,8 @@ def _tetra_config(attention_backend: str | None = None, attention_bias: dict | N
         tetra["attention_backend"] = attention_backend
     if attention_bias is not None:
         tetra["attention_bias"] = attention_bias
+    if tetra_overrides is not None:
+        tetra.update(tetra_overrides)
     return {
         "num_blocks": 1,
         "stream_type": "tetra",
@@ -140,6 +147,72 @@ def test_omol_tetra_model_forward_backward():
     criterion(outputs, batch).loss.backward()
 
 
+def test_platonic_attention_qk_norm_with_learned_keys_forward():
+    torch.manual_seed(19)
+    attn = PlatonicAttention(
+        d_model=24,
+        num_heads=12,
+        solid_name="tetrahedron",
+        rope_sigma=2.0,
+        learned_freqs=True,
+        freq_init="random",
+        use_key=True,
+        qk_norm=True,
+        rope_on_values=True,
+        attention_backend="sdpa",
+    )
+    x = torch.randn(2, 4, 24)
+    pos = torch.randn(2, 4, 3)
+    pad_mask = torch.tensor([[False, False, False, True], [False, False, False, False]])
+
+    out = attn(x, pos=pos, pad_mask=pad_mask)
+
+    assert out.shape == x.shape
+    assert isinstance(attn.q_norm, RMSNorm)
+    assert isinstance(attn.k_norm, RMSNorm)
+    assert torch.isfinite(out).all()
+
+
+def test_omol_tetra_qkn_uk_csfilm_forward_backward():
+    torch.manual_seed(20)
+    batch = _batch()
+    cfg = _tetra_config(
+        "sdpa",
+        tetra_overrides={
+            "use_key": True,
+            "qk_norm": True,
+            "chgspin_film": True,
+            "activation": "sin",
+        },
+    )
+    model = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config=cfg,
+        chgspin_mode="add",
+        chgspin_emb_dim=2,
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="gelu",
+    )
+    criterion = OMolDirectForceLoss(
+        OMolElementReferences(torch.zeros(119)),
+        normalizer_rmsd=1.0,
+        energy_weight=10.0,
+        force_weight=20.0,
+    )
+
+    outputs = model(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    assert outputs["energy"].shape == (2,)
+    assert outputs["forces"].shape == batch.forces.shape
+    assert torch.isfinite(outputs["energy"]).all()
+    assert torch.isfinite(outputs["forces"]).all()
+    criterion(outputs, batch).loss.backward()
+
+
 def test_omol_internal_flat_tetra_matches_padded_runtime():
     torch.manual_seed(12)
     batch = _batch()
@@ -179,6 +252,113 @@ def test_omol_internal_flat_tetra_matches_padded_runtime():
     torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
     padded_force_values = flat_out["forces"].masked_select(batch.pad_mask[..., None])
     assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
+
+
+def test_omol_qkn_uk_csfilm_flat_matches_padded_runtime():
+    torch.manual_seed(21)
+    batch = _batch()
+    cfg = _tetra_config(
+        "sdpa",
+        tetra_overrides={
+            "use_key": True,
+            "qk_norm": True,
+            "chgspin_film": True,
+            "activation": "sin",
+        },
+    )
+    padded = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config=cfg,
+        chgspin_mode="add",
+        chgspin_emb_dim=2,
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="gelu",
+        runtime_mode="padded",
+    )
+    flat = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config=cfg,
+        chgspin_mode="add",
+        chgspin_emb_dim=2,
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="gelu",
+        runtime_mode="internal_flat_tetra",
+    )
+    flat.load_state_dict(padded.state_dict())
+    padded.eval()
+    flat.eval()
+
+    with torch.no_grad():
+        padded_out = padded(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        flat_out = flat(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(flat_out["energy"], padded_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(flat_out["forces"][valid], padded_out["forces"][valid], atol=1e-5, rtol=1e-5)
+
+
+def test_omol_csfilm_zero_init_matches_without_film():
+    torch.manual_seed(22)
+    batch = _batch()
+    base_cfg = _tetra_config(
+        "sdpa",
+        tetra_overrides={"use_key": True, "qk_norm": True, "activation": "sin"},
+    )
+    film_cfg = _tetra_config(
+        "sdpa",
+        tetra_overrides={
+            "use_key": True,
+            "qk_norm": True,
+            "chgspin_film": True,
+            "activation": "sin",
+        },
+    )
+    base = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config=base_cfg,
+        chgspin_mode="add",
+        chgspin_emb_dim=2,
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="gelu",
+    )
+    film = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=12,
+        n_layers=1,
+        hybrid_config=film_cfg,
+        chgspin_mode="add",
+        chgspin_emb_dim=2,
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="gelu",
+    )
+    incompatible = film.load_state_dict(base.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert any("charge_spin.film_mix" in key for key in incompatible.missing_keys)
+    assert any("chgspin_film_proj" in key for key in incompatible.missing_keys)
+    base.eval()
+    film.eval()
+
+    with torch.no_grad():
+        base_out = base(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+        film_out = film(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    torch.testing.assert_close(film_out["energy"], base_out["energy"], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(film_out["forces"][valid], base_out["forces"][valid], atol=1e-5, rtol=1e-5)
 
 
 def test_omol_platonic_tetra_readout_flat_matches_padded_runtime():

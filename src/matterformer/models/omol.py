@@ -87,7 +87,14 @@ class ScalarFourierEmbedding(nn.Module):
 
 
 class ChargeSpinConditioning(nn.Module):
-    def __init__(self, d_model: int, *, mode: str = "add", embedding_dim: int | None = None) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        mode: str = "add",
+        embedding_dim: int | None = None,
+        film_dim: int | None = None,
+    ) -> None:
         super().__init__()
         mode = str(mode).lower().replace("-", "_")
         if mode in {"none", "false", "off"}:
@@ -97,18 +104,88 @@ class ChargeSpinConditioning(nn.Module):
         self.mode = mode
         self.d_model = int(d_model)
         self.embedding_dim = int(embedding_dim or d_model)
-        if mode == "off":
+        self.film_dim = int(film_dim) if film_dim is not None else None
+        if mode == "off" and self.film_dim is None:
             self.charge_embedding = None
             self.spin_embedding = None
             self.mix = None
+            self.film_mix = None
             self.concat_project = None
             return
         self.charge_embedding = ScalarFourierEmbedding(self.embedding_dim)
         self.spin_embedding = ScalarFourierEmbedding(self.embedding_dim, zero_when_input_zero=True)
-        self.mix = nn.Linear(2 * self.embedding_dim, self.d_model)
-        nn.init.normal_(self.mix.weight, std=0.02)
-        nn.init.zeros_(self.mix.bias)
+        self.mix = nn.Linear(2 * self.embedding_dim, self.d_model) if mode != "off" else None
+        if self.mix is not None:
+            nn.init.normal_(self.mix.weight, std=0.02)
+            nn.init.zeros_(self.mix.bias)
+        self.film_mix = nn.Linear(2 * self.embedding_dim, self.film_dim) if self.film_dim is not None else None
+        if self.film_mix is not None:
+            nn.init.normal_(self.film_mix.weight, std=0.02)
+            nn.init.zeros_(self.film_mix.bias)
         self.concat_project = nn.Linear(2 * self.d_model, self.d_model) if mode == "concat" else None
+
+    def _mixed_graph_values(
+        self,
+        *,
+        charge: torch.Tensor | None,
+        spin: torch.Tensor | None,
+        num_graphs: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        film: bool = False,
+    ) -> torch.Tensor:
+        mix = self.film_mix if film else self.mix
+        if self.charge_embedding is None or self.spin_embedding is None or mix is None:
+            raise RuntimeError("Charge/spin conditioning is not configured")
+        if charge is None:
+            charge = torch.zeros(int(num_graphs), device=device, dtype=torch.float32)
+        if spin is None:
+            spin = torch.zeros(int(num_graphs), device=device, dtype=torch.float32)
+        charge_emb = self.charge_embedding(charge.to(device=device, dtype=torch.float32))
+        spin_emb = self.spin_embedding(spin.to(device=device, dtype=torch.float32))
+        return torch.nn.functional.silu(mix(torch.cat([charge_emb, spin_emb], dim=-1))).to(dtype=dtype)
+
+    def film_tokens(
+        self,
+        *,
+        charge: torch.Tensor | None,
+        spin: torch.Tensor | None,
+        pad_mask: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if self.film_mix is None:
+            return None
+        batch_size, num_atoms = pad_mask.shape[:2]
+        mixed = self._mixed_graph_values(
+            charge=charge,
+            spin=spin,
+            num_graphs=batch_size,
+            device=pad_mask.device,
+            dtype=dtype,
+            film=True,
+        )
+        return mixed[:, None, :].expand(batch_size, num_atoms, -1).masked_fill(pad_mask[..., None], 0.0)
+
+    def film_tokens_flat(
+        self,
+        *,
+        charge: torch.Tensor | None,
+        spin: torch.Tensor | None,
+        batch_index: torch.Tensor,
+        num_graphs: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if self.film_mix is None:
+            return None
+        mixed = self._mixed_graph_values(
+            charge=charge,
+            spin=spin,
+            num_graphs=num_graphs,
+            device=batch_index.device,
+            dtype=dtype,
+            film=True,
+        )
+        return mixed[batch_index]
 
     def forward(
         self,
@@ -120,17 +197,14 @@ class ChargeSpinConditioning(nn.Module):
     ) -> torch.Tensor:
         if self.mode == "off":
             return token_features
-        if self.charge_embedding is None or self.spin_embedding is None or self.mix is None:
-            raise RuntimeError("Charge/spin conditioning is not configured")
         batch_size, num_atoms = token_features.shape[:2]
-        if charge is None:
-            charge = torch.zeros(batch_size, device=token_features.device, dtype=torch.float32)
-        if spin is None:
-            spin = torch.zeros(batch_size, device=token_features.device, dtype=torch.float32)
-        charge_emb = self.charge_embedding(charge.to(device=token_features.device, dtype=torch.float32))
-        spin_emb = self.spin_embedding(spin.to(device=token_features.device, dtype=torch.float32))
-        mixed = torch.nn.functional.silu(self.mix(torch.cat([charge_emb, spin_emb], dim=-1)))
-        mixed = mixed.to(dtype=token_features.dtype)
+        mixed = self._mixed_graph_values(
+            charge=charge,
+            spin=spin,
+            num_graphs=batch_size,
+            device=token_features.device,
+            dtype=token_features.dtype,
+        )
         mixed_nodes = mixed[:, None, :].expand(batch_size, num_atoms, -1).masked_fill(pad_mask[..., None], 0.0)
         if self.mode == "add":
             return token_features + mixed_nodes
@@ -149,16 +223,14 @@ class ChargeSpinConditioning(nn.Module):
     ) -> torch.Tensor:
         if self.mode == "off":
             return token_features
-        if self.charge_embedding is None or self.spin_embedding is None or self.mix is None:
-            raise RuntimeError("Charge/spin conditioning is not configured")
-        if charge is None:
-            charge = torch.zeros(int(num_graphs), device=token_features.device, dtype=torch.float32)
-        if spin is None:
-            spin = torch.zeros(int(num_graphs), device=token_features.device, dtype=torch.float32)
-        charge_emb = self.charge_embedding(charge.to(device=token_features.device, dtype=torch.float32))
-        spin_emb = self.spin_embedding(spin.to(device=token_features.device, dtype=torch.float32))
-        mixed = torch.nn.functional.silu(self.mix(torch.cat([charge_emb, spin_emb], dim=-1)))
-        mixed_nodes = mixed.to(dtype=token_features.dtype)[batch_index]
+        mixed = self._mixed_graph_values(
+            charge=charge,
+            spin=spin,
+            num_graphs=num_graphs,
+            device=token_features.device,
+            dtype=token_features.dtype,
+        )
+        mixed_nodes = mixed[batch_index]
         if self.mode == "add":
             return token_features + mixed_nodes
         if self.concat_project is None:
@@ -225,6 +297,10 @@ class MatterformerOMolForceField(nn.Module):
         self.pair_rbf_max = float(pair_rbf_max)
         self.hybrid_config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.stream_type = self.hybrid_config.stream_type
+        requested_chgspin_film = bool(self.hybrid_config.tetra.get("chgspin_film", False))
+        if requested_chgspin_film and self.stream_type != "tetra":
+            raise ValueError("tetra.chgspin_film=True requires stream_type='tetra'")
+        self.chgspin_film = requested_chgspin_film
         self.runtime_mode = str(runtime_mode).lower().replace("-", "_")
         if self.runtime_mode not in {"padded", "internal_flat_tetra", "internal_flat_hybrid"}:
             raise ValueError("runtime_mode must be one of {'padded', 'internal_flat_tetra', 'internal_flat_hybrid'}")
@@ -291,7 +367,13 @@ class MatterformerOMolForceField(nn.Module):
         nn.init.normal_(self.atom_embedding.weight, std=1.0 / math.sqrt(d_model))
         with torch.no_grad():
             self.atom_embedding.weight[0].zero_()
-        self.charge_spin = ChargeSpinConditioning(d_model, mode=chgspin_mode, embedding_dim=chgspin_emb_dim)
+        chgspin_film_dim = int(self.hybrid_config.tetra_dim_per_frame) if self.chgspin_film else None
+        self.charge_spin = ChargeSpinConditioning(
+            d_model,
+            mode=chgspin_mode,
+            embedding_dim=chgspin_emb_dim,
+            film_dim=chgspin_film_dim,
+        )
         self.trunk = HybridTransformerTrunk(
             d_model=d_model,
             n_heads=n_heads,
@@ -858,6 +940,13 @@ class MatterformerOMolForceField(nn.Module):
                 batch_index=batch_index,
                 num_graphs=batch_size,
             )
+            chgspin_film = self.charge_spin.film_tokens_flat(
+                charge=charge,
+                spin=spin,
+                batch_index=batch_index,
+                num_graphs=batch_size,
+                dtype=token_features.dtype,
+            )
 
         flat_geom = None
         if flat_hybrid and self.trunk.needs_compact_geometry:
@@ -887,6 +976,7 @@ class MatterformerOMolForceField(nn.Module):
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     flat_geom=flat_geom,
+                    chgspin_film=chgspin_film,
                     return_output=True,
                 )
             else:
@@ -896,6 +986,7 @@ class MatterformerOMolForceField(nn.Module):
                     atom_types=atomic_flat,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
+                    chgspin_film=chgspin_film,
                     return_output=True,
                 )
         if not isinstance(trunk_result, HybridFlatTrunkOutput) or trunk_result.group is None:
@@ -981,6 +1072,12 @@ class MatterformerOMolForceField(nn.Module):
             token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
             token_features = self.charge_spin(token_features, charge=charge, spin=spin, pad_mask=pad_mask)
             token_features = token_features.masked_fill(pad_mask[..., None], 0.0)
+            chgspin_film = self.charge_spin.film_tokens(
+                charge=charge,
+                spin=spin,
+                pad_mask=pad_mask,
+                dtype=token_features.dtype,
+            )
             sigma = torch.ones(atomic_numbers.shape[0], device=atomic_numbers.device, dtype=coords.dtype)
             diagnostics: dict[str, torch.Tensor] = {}
 
@@ -993,6 +1090,7 @@ class MatterformerOMolForceField(nn.Module):
                     coords=centered_coords,
                     sigma=sigma,
                     atom_types=atomic_numbers,
+                    chgspin_film=chgspin_film,
                     return_output=True,
                 )
             if not isinstance(trunk_result, HybridTrunkOutput) or trunk_result.group is None:
