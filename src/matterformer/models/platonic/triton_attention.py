@@ -5,6 +5,8 @@ import os
 
 import torch
 
+from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout
+
 try:
     import torch._dynamo as _torch_dynamo
 except ImportError:  # pragma: no cover - older PyTorch without Dynamo.
@@ -257,6 +259,8 @@ def _radius_rbf_type_sparse_score_reference(
     diag_zero: bool,
     include_self: bool,
     envelope_in_score: bool,
+    abs_i: torch.Tensor | None = None,
+    abs_j: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if heads_per_frame <= 0 or num_heads % int(heads_per_frame) != 0:
         raise ValueError("heads_per_frame must divide num_heads for Platonic radius-sparse attention")
@@ -265,10 +269,14 @@ def _radius_rbf_type_sparse_score_reference(
     env = _c2_quintic_envelope(dist, cutoff).to(dtype=dist.dtype)
     local_mask = dist < float(cutoff)
     diagonal = None
-    if pos_i.shape[0] == pos_j.shape[0]:
+    if abs_i is not None or abs_j is not None:
+        if abs_i is None or abs_j is None:
+            raise ValueError("abs_i and abs_j must be provided together")
+        diagonal = abs_i.to(device=dist.device)[:, None] == abs_j.to(device=dist.device)[None, :]
+    elif pos_i.shape[0] == pos_j.shape[0]:
         diagonal = torch.eye(pos_i.shape[0], device=pos_i.device, dtype=torch.bool)
-        if include_self:
-            local_mask = local_mask | diagonal
+    if diagonal is not None and include_self:
+        local_mask = local_mask | diagonal
 
     env_for_bias = env
     if diag_zero and diagonal is not None:
@@ -424,6 +432,100 @@ def platonic_attention_flat_torch_reference(
     if not outputs:
         return torch.zeros_like(q)
     return torch.cat(outputs, dim=0)
+
+
+def platonic_radius_block_sparse_attention_torch_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    pos: torch.Tensor,
+    atom_types: torch.Tensor | None,
+    heads_per_frame: int,
+    rbf_weight: torch.Tensor,
+    type_bias: torch.Tensor | None,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    cutoff: float,
+    diag_zero: bool,
+    include_self: bool,
+    envelope_in_score: bool,
+    radius_layout: RadiusBlockSparseLayout,
+) -> torch.Tensor:
+    """Block-sparse torch reference for radius-local RBF/type attention.
+
+    This keeps the same eSEN-like score semantics as the dense reference but
+    iterates only over live radius block pairs from ``RadiusBlockSparseLayout``.
+    It is intended for correctness/prototyping and autograd parity; the fast
+    CUDA path should use Triton kernels that consume the same layout.
+    """
+
+    if q.ndim != 3 or k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("q/k/v must have identical shape [N, H, D]")
+    if pos.ndim != 2 or pos.shape != (q.shape[0], 3):
+        raise ValueError(f"pos must have shape [{q.shape[0]}, 3], got {tuple(pos.shape)}")
+    if type_bias is not None and atom_types is None:
+        raise ValueError("type_bias requires atom_types")
+    if radius_layout.q_block_start.device != q.device:
+        radius_layout = radius_layout.to(q.device)
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    out = torch.zeros_like(q)
+    block_ptr = radius_layout.block_ptr.detach().cpu().tolist()
+    block_col = radius_layout.block_col.detach().cpu().tolist()
+    q_starts = radius_layout.q_block_start.detach().cpu().tolist()
+    q_ends = radius_layout.q_block_end.detach().cpu().tolist()
+    k_starts = radius_layout.k_block_start.detach().cpu().tolist()
+    k_ends = radius_layout.k_block_end.detach().cpu().tolist()
+
+    for q_block, (m_start, m_end) in enumerate(zip(q_starts, q_ends)):
+        m_start_i = int(m_start)
+        m_end_i = int(m_end)
+        if m_end_i <= m_start_i:
+            continue
+        score_chunks: list[torch.Tensor] = []
+        value_chunks: list[torch.Tensor] = []
+        q_tile = q[m_start_i:m_end_i]
+        pos_i = pos[m_start_i:m_end_i]
+        atom_i = None if atom_types is None else atom_types[m_start_i:m_end_i]
+        for ptr in range(int(block_ptr[q_block]), int(block_ptr[q_block + 1])):
+            k_block = int(block_col[ptr])
+            n_start_i = int(k_starts[k_block])
+            n_end_i = int(k_ends[k_block])
+            if n_end_i <= n_start_i:
+                continue
+            k_tile = k[n_start_i:n_end_i]
+            scores = torch.einsum("mhd,nhd->hmn", q_tile, k_tile) * scale
+            bias, local_mask = _radius_rbf_type_sparse_score_reference(
+                pos_i,
+                pos[n_start_i:n_end_i],
+                atom_i,
+                None if atom_types is None else atom_types[n_start_i:n_end_i],
+                num_heads=q.shape[1],
+                heads_per_frame=int(heads_per_frame),
+                rbf_weight=rbf_weight,
+                type_bias=type_bias,
+                centers=centers,
+                gamma=gamma,
+                cutoff=float(cutoff),
+                diag_zero=diag_zero,
+                include_self=include_self,
+                envelope_in_score=envelope_in_score,
+                abs_i=torch.arange(m_start_i, m_end_i, device=pos.device),
+                abs_j=torch.arange(n_start_i, n_end_i, device=pos.device),
+            )
+            scores = scores + bias.to(dtype=scores.dtype)
+            scores = scores.masked_fill(~local_mask.unsqueeze(0), -torch.inf)
+            score_chunks.append(scores)
+            value_chunks.append(v[n_start_i:n_end_i])
+        if not score_chunks:
+            continue
+        scores_full = torch.cat(score_chunks, dim=-1)
+        values_full = torch.cat(value_chunks, dim=0)
+        probs = torch.softmax(scores_full, dim=-1)
+        row_has_neighbor = torch.isfinite(scores_full).any(dim=-1, keepdim=True)
+        probs = torch.where(row_has_neighbor, probs, torch.zeros_like(probs))
+        out[m_start_i:m_end_i] = torch.einsum("hmn,nhd->mhd", probs, values_full)
+    return out
 
 
 if TRITON_PLATONIC_ATTENTION_AVAILABLE:
@@ -2327,10 +2429,23 @@ def platonic_attention_flat_triton(
         if not use_rbf_type and gate is None:
             raise ValueError("Platonic legacy radial Triton attention requires gate")
         if use_rbf_type:
-            if atom_types is None or type_bias is None or cutoff is None:
-                raise ValueError("Platonic RBF/type Triton attention requires atom_types, type_bias, and cutoff")
-            if atom_types.ndim != 1 or atom_types.shape[0] != q.shape[0]:
+            if cutoff is None:
+                raise ValueError("Platonic RBF/type Triton attention requires cutoff")
+            if atom_types is None:
+                if type_bias is not None:
+                    raise ValueError("Platonic RBF/type Triton attention with type_bias requires atom_types")
+                atom_types = torch.zeros((q.shape[0],), device=q.device, dtype=torch.long)
+            elif atom_types.ndim != 1 or atom_types.shape[0] != q.shape[0]:
                 raise ValueError(f"atom_types must have shape [{q.shape[0]}], got {tuple(atom_types.shape)}")
+            if type_bias is None:
+                if heads_per_frame is None:
+                    raise ValueError("heads_per_frame is required when type_bias is omitted")
+                zdim = int(max_atomic_number if max_atomic_number is not None else int(atom_types.detach().max().item())) + 1
+                type_bias = torch.zeros(
+                    (zdim, zdim, int(heads_per_frame)),
+                    device=q.device,
+                    dtype=torch.float32,
+                )
             if type_bias.ndim != 3 or type_bias.shape[-1] != int(heads_per_frame):
                 raise ValueError("type_bias must have shape [max_z + 1, max_z + 1, heads_per_frame]")
         if q.shape[1] % int(heads_per_frame) != 0:

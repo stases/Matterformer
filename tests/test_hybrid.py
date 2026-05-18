@@ -23,6 +23,7 @@ from matterformer.models import (
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.platonic.triton_attention import (
     TRITON_PLATONIC_ATTENTION_AVAILABLE,
+    platonic_radius_block_sparse_attention_torch_reference,
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
 )
@@ -406,6 +407,84 @@ def test_radius_block_sparse_layout_covers_all_radius_edges_without_knn_cap():
                     assert (qb, kb) in active
 
 
+def test_radius_block_sparse_torch_reference_matches_dense_radius_reference():
+    torch.manual_seed(118)
+    num_tokens = 7
+    num_heads = 4
+    head_dim = 6
+    q = torch.randn(num_tokens, num_heads, head_dim, requires_grad=True)
+    k = torch.randn(num_tokens, num_heads, head_dim, requires_grad=True)
+    v = torch.randn(num_tokens, num_heads, head_dim, requires_grad=True)
+    pos = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [1.3, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.3, 0.0, 0.0],
+            [4.6, 0.0, 0.0],
+            [9.0, 0.0, 0.0],
+        ]
+    )
+    atom_types = torch.tensor([1, 6, 8, 1, 7, 6, 1])
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+    heads_per_frame = 2
+    rbf_weight = torch.randn(heads_per_frame, 4, requires_grad=True) * 0.01
+    type_bias = torch.randn(9, 9, heads_per_frame, requires_grad=True) * 0.01
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(9.0)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=1.0, block_m=2, block_n=2)
+    perm = layout.perm
+    q_s = q.index_select(0, perm)
+    k_s = k.index_select(0, perm)
+    v_s = v.index_select(0, perm)
+    pos_s = pos.index_select(0, perm)
+    atom_s = atom_types.index_select(0, perm)
+
+    dense = platonic_attention_flat_torch_reference(
+        q_s,
+        k_s,
+        v_s,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        pos=pos_s,
+        atom_types=atom_s,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        radial_bias_kind="radius_rbf_type_enveloped",
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+    )
+    sparse = platonic_radius_block_sparse_attention_torch_reference(
+        q_s,
+        k_s,
+        v_s,
+        pos=pos_s,
+        atom_types=atom_s,
+        heads_per_frame=heads_per_frame,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        diag_zero=True,
+        include_self=True,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+
+    torch.testing.assert_close(sparse, dense, atol=1e-6, rtol=1e-6)
+    sparse.square().mean().backward()
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+
+
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():
     torch.manual_seed(103)
     group = PLATONIC_GROUPS["tetrahedron"]
@@ -668,6 +747,37 @@ def test_platonic_block_flat_radius_sparse_reference_forward_backward():
     assert x.grad is not None
     assert block.attn.rbf_weight is not None and block.attn.rbf_weight.grad is not None
     assert block.attn.rbf_type_bias is not None and block.attn.rbf_type_bias.grad is not None
+
+
+def test_platonic_flat_rbf_type_without_type_pair_runs_without_atom_types():
+    torch.manual_seed(117)
+    block = PlatonicBlock(
+        d_model=12 * 4,
+        nhead=12,
+        dim_feedforward=12 * 8,
+        solid_name="tetrahedron",
+        dropout=0.0,
+        attention_backend="triton",
+        attention_bias={
+            "kind": "rbf_type_enveloped",
+            "num_rbf": 4,
+            "cutoff": 1.5,
+            "include_type_pair": False,
+            "zero_init": True,
+        },
+    )
+    x = torch.randn(5, 12 * 4, requires_grad=True)
+    pos = torch.randn(5, 3)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    out = block.forward_flat(x, pos=pos, cu_seqlens=cu_seqlens, max_seqlen=3)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    out.square().mean().backward()
+    assert x.grad is not None
+    assert block.attn.rbf_weight is not None and block.attn.rbf_weight.grad is not None
+    assert block.attn.rbf_type_bias is None
 
 
 @pytest.mark.parametrize(

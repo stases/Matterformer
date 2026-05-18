@@ -147,6 +147,52 @@ def test_omol_tetra_model_forward_backward():
     criterion(outputs, batch).loss.backward()
 
 
+def test_omol_internal_flat_tetra_radius_sparse_reference_forward_backward():
+    torch.manual_seed(132)
+    batch = _batch()
+    cfg = _tetra_config(
+        "torch_radius_sparse",
+        {
+            "kind": "radius_rbf_type_enveloped",
+            "cutoff": 3.0,
+            "num_rbf": 4,
+            "rbf_max": 3.0,
+            "include_type_pair": True,
+            "include_self": True,
+            "envelope_in_score": True,
+            "sort": "cell",
+            "zero_init": True,
+        },
+    )
+    model = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=cfg,
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="internal_flat_tetra",
+    )
+    criterion = OMolDirectForceLoss(
+        OMolElementReferences(torch.zeros(119)),
+        normalizer_rmsd=1.0,
+        energy_weight=10.0,
+        force_weight=20.0,
+    )
+
+    outputs = model(batch.atomic_numbers, batch.coords, batch.pad_mask, charge=batch.charge, spin=batch.spin)
+
+    valid = ~batch.pad_mask
+    assert outputs["energy"].shape == (2,)
+    assert outputs["forces"].shape == batch.forces.shape
+    assert torch.isfinite(outputs["energy"]).all()
+    assert torch.isfinite(outputs["forces"][valid]).all()
+    criterion(outputs, batch).loss.backward()
+
+
 def test_platonic_attention_qk_norm_with_learned_keys_forward():
     torch.manual_seed(19)
     attn = PlatonicAttention(

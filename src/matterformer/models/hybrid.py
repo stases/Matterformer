@@ -14,6 +14,7 @@ from matterformer.geometry.cache import FlatGeometryCache, GeometryCache
 from matterformer.geometry.triton_nonperiodic_knn import build_triton_nonperiodic_knn_geometry_cache
 from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicBlock, PlatonicLinear
 from matterformer.models.platonic.layers import GroupLayerNorm
+from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout, build_radius_block_sparse_layout
 from matterformer.models.transformer import AdaLNBlock, GeometryBiasBuilder, _canonicalize_mha_position_mode
 from matterformer.models.triton_compact_simplicial_attention import (
     TRITON_COMPACT_SIMPLICIAL_AVAILABLE,
@@ -1890,6 +1891,9 @@ class TetraPlatonicGlobalLayer(nn.Module):
         else:
             self.chgspin_film_proj = None
 
+    def radius_sparse_layout_config(self) -> dict | None:
+        return self.block.radius_sparse_layout_config()
+
     @staticmethod
     def _positions(pos: torch.Tensor, seq_len: int) -> torch.Tensor:
         if pos.shape[1] == seq_len:
@@ -1945,6 +1949,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         chgspin_film: torch.Tensor | None = None,
+        radius_layout: RadiusBlockSparseLayout | None = None,
     ) -> torch.Tensor:
         with record_function("tetra_global/platonic_block_flat"):
             if group.ndim != 3 or group.shape[1:] != (self.group_order, self.dim_per_frame):
@@ -1960,6 +1965,7 @@ class TetraPlatonicGlobalLayer(nn.Module):
                 atom_types=atom_types,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                radius_layout=radius_layout,
             )
             return x.view_as(group)
 
@@ -2315,6 +2321,24 @@ class HybridTransformerTrunk(nn.Module):
         norm_affine = bool(norm_affine_when_no_adaln) and not bool(use_adaln_conditioning)
         self.norm_out = nn.LayerNorm(d_model, eps=eps, elementwise_affine=norm_affine) if self.use_final_norm else nn.Identity()
 
+    def _radius_sparse_layout_config(self) -> dict | None:
+        expected: dict | None = None
+        for block in self.blocks:
+            for layer in block.sublayers:
+                if not isinstance(layer, TetraPlatonicGlobalLayer):
+                    continue
+                cfg = layer.radius_sparse_layout_config()
+                if cfg is None:
+                    continue
+                if expected is None:
+                    expected = cfg
+                elif cfg != expected:
+                    raise ValueError(
+                        "All radius-sparse Platonic layers in a flat trunk must use the same "
+                        f"layout settings, got {cfg} and {expected}"
+                    )
+        return expected
+
     def _local_moment_lift_features(self, geom: GeometryCache, *, dtype: torch.dtype) -> torch.Tensor:
         if self.local_moment_mlp is None or self.local_moment_proj is None or self.local_moment_scale is None:
             raise RuntimeError("local moment input lift is not configured")
@@ -2380,6 +2404,28 @@ class HybridTransformerTrunk(nn.Module):
             raise ValueError(f"Expected flat atom_types [{x.shape[0]}], got {tuple(atom_types.shape)}")
 
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
+        radius_layout = None
+        radius_cfg = self._radius_sparse_layout_config()
+        if radius_cfg is not None:
+            with record_function("hybrid_trunk_flat/radius_sparse_layout"):
+                radius_layout = build_radius_block_sparse_layout(
+                    coords,
+                    cu_seqlens,
+                    cutoff=float(radius_cfg["cutoff"]),
+                    block_m=int(radius_cfg["block_m"]),
+                    block_n=int(radius_cfg["block_n"]),
+                    sort=str(radius_cfg["sort"]),
+                    include_self=bool(radius_cfg["include_self"]),
+                )
+            if radius_layout.block_ptr.numel() > 1 and torch.any(radius_layout.block_ptr[1:] <= radius_layout.block_ptr[:-1]):
+                raise RuntimeError("radius-sparse layout produced an empty query block; include_self=True is recommended")
+            perm = radius_layout.perm
+            x = x.index_select(0, perm)
+            coords = coords.index_select(0, perm)
+            if atom_types is not None:
+                atom_types = atom_types.index_select(0, perm)
+            if chgspin_film is not None:
+                chgspin_film = chgspin_film.index_select(0, perm)
         with record_function("hybrid_trunk_flat/lift_tetra_input"):
             group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
         with record_function("hybrid_trunk_flat/blocks"):
@@ -2394,7 +2440,10 @@ class HybridTransformerTrunk(nn.Module):
                         cu_seqlens=cu_seqlens,
                         max_seqlen=int(max_seqlen),
                         chgspin_film=chgspin_film,
+                        radius_layout=radius_layout,
                     )
+        if radius_layout is not None:
+            group = group.index_select(0, radius_layout.inv_perm)
         if self.readout_kind == "platonic_ffn":
             scalar_out = group.reshape(group.shape[0], self.d_model)
             if return_output:
@@ -2435,6 +2484,11 @@ class HybridTransformerTrunk(nn.Module):
         if atom_types is not None and atom_types.shape != (x.shape[0],):
             raise ValueError(f"Expected flat atom_types [{x.shape[0]}], got {tuple(atom_types.shape)}")
 
+        if self._radius_sparse_layout_config() is not None:
+            raise RuntimeError(
+                "radius-sparse Platonic attention is currently wired only for forward_flat_tetra; "
+                "forward_flat_hybrid would also need to permute FlatGeometryCache."
+            )
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         with record_function("hybrid_trunk_flat_hybrid/lift_tetra_input"):
             group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()

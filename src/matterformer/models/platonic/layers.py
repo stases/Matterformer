@@ -8,8 +8,10 @@ from torch import nn
 
 from matterformer.models.platonic.groups import PLATONIC_GROUPS
 from matterformer.models.platonic.linear import PlatonicLinear
+from matterformer.models.platonic.radius_sparse import RadiusBlockSparseLayout
 from matterformer.models.platonic.rope import PlatonicRoPE
 from matterformer.models.platonic.triton_attention import (
+    platonic_radius_block_sparse_attention_torch_reference,
     platonic_attention_flat_torch_reference,
     platonic_attention_flat_triton,
 )
@@ -311,6 +313,17 @@ class PlatonicAttention(nn.Module):
             freq_init=freq_init,
         )
 
+    def radius_sparse_layout_config(self) -> dict | None:
+        if self.radial_bias_kind != "radius_rbf_type_enveloped":
+            return None
+        return {
+            "cutoff": float(self.local_cutoff),
+            "block_m": int(self.triton_block_m),
+            "block_n": int(self.triton_block_n),
+            "sort": str(self.attention_bias_config.get("sort", "cell")),
+            "include_self": bool(self.local_include_self),
+        }
+
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(*x.shape[:-1], self.group_order, self.heads_per_frame, self.head_dim)
 
@@ -560,6 +573,7 @@ class PlatonicAttention(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        radius_layout: RadiusBlockSparseLayout | None = None,
     ) -> torch.Tensor:
         dropout_p = self.dropout if self.training else 0.0
         if dropout_p != 0.0:
@@ -638,11 +652,30 @@ class PlatonicAttention(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        radius_layout: RadiusBlockSparseLayout | None = None,
     ) -> torch.Tensor:
         if self.rbf_weight is None:
             raise RuntimeError(f"{self.attention_backend} backend was initialized without local bias parameters")
         if self.rbf_type_bias is not None and atom_types is None:
             raise ValueError(f"attention_backend={self.attention_backend!r} requires atom_types in forward_flat")
+        if self.radial_bias_kind == "radius_rbf_type_enveloped" and radius_layout is not None:
+            return platonic_radius_block_sparse_attention_torch_reference(
+                q,
+                k,
+                v,
+                pos=pos,
+                atom_types=atom_types,
+                heads_per_frame=self.heads_per_frame,
+                rbf_weight=self.rbf_weight,
+                type_bias=self.rbf_type_bias,
+                centers=self.rbf_centers,
+                gamma=self.rbf_gamma,
+                cutoff=self.local_cutoff,
+                diag_zero=self.rbf_diag_zero,
+                include_self=self.local_include_self,
+                envelope_in_score=self.local_envelope_in_score,
+                radius_layout=radius_layout,
+            )
         return platonic_attention_flat_torch_reference(
             q,
             k,
@@ -703,6 +736,7 @@ class PlatonicAttention(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        radius_layout: RadiusBlockSparseLayout | None = None,
     ) -> torch.Tensor:
         q, k, v, rope_factors = self._project_qkv_with_rope(x, pos)
         num_tokens = x.shape[0]
@@ -720,6 +754,7 @@ class PlatonicAttention(nn.Module):
                 atom_types=atom_types,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=int(max_seqlen),
+                radius_layout=radius_layout,
             )
         elif self.attention_backend == "torch_reference":
             out = self._torch_local_bias_attention_flat(
@@ -730,6 +765,7 @@ class PlatonicAttention(nn.Module):
                 atom_types=atom_types,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=int(max_seqlen),
+                radius_layout=radius_layout,
             )
         else:
             out = self._sdpa_attention_flat(q, k, v, cu_seqlens)
@@ -806,6 +842,9 @@ class PlatonicBlock(nn.Module):
             self.gamma_1 = nn.Parameter(init * torch.ones(self.channels_per_group))
             self.gamma_2 = nn.Parameter(init * torch.ones(self.channels_per_group))
 
+    def radius_sparse_layout_config(self) -> dict | None:
+        return self.attn.radius_sparse_layout_config()
+
     def _apply_layer_scale(self, x: torch.Tensor, gamma: torch.Tensor | None) -> torch.Tensor:
         if gamma is None:
             return x
@@ -836,6 +875,7 @@ class PlatonicBlock(nn.Module):
         atom_types: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        radius_layout: RadiusBlockSparseLayout | None = None,
     ) -> torch.Tensor:
         attn_out = self.dropout(
             self.attn.forward_flat(
@@ -844,6 +884,7 @@ class PlatonicBlock(nn.Module):
                 atom_types=atom_types,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                radius_layout=radius_layout,
             )
         )
         x = x + self._apply_layer_scale(attn_out, self.gamma_1)
