@@ -382,6 +382,10 @@ def test_radius_block_sparse_layout_covers_all_radius_edges_without_knn_cap():
     assert layout.block_ptr_t.shape == (layout.num_k_blocks + 1,)
     assert layout.num_live_block_pairs > 0
     assert layout.effective_tile_density > 0.0
+    assert layout.radius_edge_count > 0
+    assert layout.mean_radius_degree > 0.0
+    assert layout.true_edge_density > 0.0
+    assert layout.max_block_row_length > 0
 
     sorted_pos = pos[layout.perm.cpu()]
     active = set()
@@ -483,6 +487,91 @@ def test_radius_block_sparse_torch_reference_matches_dense_radius_reference():
     assert q.grad is not None
     assert k.grad is not None
     assert v.grad is not None
+
+
+def test_radius_sparse_include_self_false_excludes_diagonal_inside_live_blocks():
+    q = torch.randn(2, 2, 4)
+    k = torch.randn(2, 2, 4)
+    v = torch.arange(16, dtype=torch.float32).view(2, 2, 4)
+    pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    rbf_weight = torch.zeros(1, 4)
+    centers = torch.linspace(0.0, 1.0, 4)
+    gamma = torch.tensor(1.0)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=1.0, block_m=2, block_n=2, include_self=False)
+
+    out = platonic_radius_block_sparse_attention_torch_reference(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=None,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=None,
+        centers=centers,
+        gamma=gamma,
+        cutoff=1.0,
+        diag_zero=True,
+        include_self=False,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+
+    expected = torch.stack([v[1], v[0]], dim=0)
+    torch.testing.assert_close(out, expected)
+
+
+def test_radius_sparse_all_inf_rows_are_zero_not_nan():
+    q = torch.randn(3, 2, 4)
+    k = torch.randn(3, 2, 4)
+    v = torch.randn(3, 2, 4)
+    pos = torch.tensor([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    rbf_weight = torch.zeros(1, 4)
+    centers = torch.linspace(0.0, 0.5, 4)
+    gamma = torch.tensor(1.0)
+    layout = build_radius_block_sparse_layout(pos, cu_seqlens, cutoff=0.5, block_m=2, block_n=2, include_self=False)
+
+    dense = platonic_attention_flat_torch_reference(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=3,
+        pos=pos,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=None,
+        centers=centers,
+        gamma=gamma,
+        cutoff=0.5,
+        radial_bias_kind="radius_rbf_type_enveloped",
+        include_self=False,
+        envelope_in_score=True,
+    )
+    sparse = platonic_radius_block_sparse_attention_torch_reference(
+        q,
+        k,
+        v,
+        pos=pos,
+        atom_types=None,
+        heads_per_frame=1,
+        rbf_weight=rbf_weight,
+        type_bias=None,
+        centers=centers,
+        gamma=gamma,
+        cutoff=0.5,
+        diag_zero=True,
+        include_self=False,
+        envelope_in_score=True,
+        radius_layout=layout,
+    )
+
+    assert torch.isfinite(dense).all()
+    assert torch.isfinite(sparse).all()
+    torch.testing.assert_close(dense, torch.zeros_like(dense))
+    torch.testing.assert_close(sparse, torch.zeros_like(sparse))
 
 
 def test_platonic_radial_rbf_group_shared_bias_commutes_with_group_permutation():

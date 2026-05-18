@@ -199,6 +199,14 @@ def _c2_quintic_envelope(dist: torch.Tensor, cutoff: float) -> torch.Tensor:
     return torch.where(dist < float(cutoff), env, torch.zeros_like(env))
 
 
+def _safe_masked_softmax(scores: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    valid = torch.isfinite(scores)
+    row_has_neighbor = valid.any(dim=dim, keepdim=True)
+    scores_safe = torch.where(row_has_neighbor, scores, torch.zeros_like(scores))
+    probs = torch.softmax(scores_safe, dim=dim)
+    return torch.where(row_has_neighbor & valid, probs, torch.zeros_like(probs))
+
+
 def _rbf_type_bias_reference(
     pos_i: torch.Tensor,
     pos_j: torch.Tensor,
@@ -275,8 +283,11 @@ def _radius_rbf_type_sparse_score_reference(
         diagonal = abs_i.to(device=dist.device)[:, None] == abs_j.to(device=dist.device)[None, :]
     elif pos_i.shape[0] == pos_j.shape[0]:
         diagonal = torch.eye(pos_i.shape[0], device=pos_i.device, dtype=torch.bool)
-    if diagonal is not None and include_self:
-        local_mask = local_mask | diagonal
+    if diagonal is not None:
+        if include_self:
+            local_mask = local_mask | diagonal
+        else:
+            local_mask = local_mask & ~diagonal
 
     env_for_bias = env
     if diag_zero and diagonal is not None:
@@ -422,10 +433,7 @@ def platonic_attention_flat_torch_reference(
                 bias_mode=bias_mode,
             )
             scores = scores + bias.to(dtype=scores.dtype)
-        probs = torch.softmax(scores, dim=-1)
-        if use_radius_sparse:
-            row_has_neighbor = torch.isfinite(scores).any(dim=-1, keepdim=True)
-            probs = torch.where(row_has_neighbor, probs, torch.zeros_like(probs))
+        probs = _safe_masked_softmax(scores, dim=-1) if use_radius_sparse else torch.softmax(scores, dim=-1)
         if training and dropout_p > 0.0:
             probs = torch.nn.functional.dropout(probs, p=float(dropout_p), training=True)
         outputs.append(torch.matmul(probs, v_seg).transpose(0, 1).contiguous())
@@ -521,9 +529,7 @@ def platonic_radius_block_sparse_attention_torch_reference(
             continue
         scores_full = torch.cat(score_chunks, dim=-1)
         values_full = torch.cat(value_chunks, dim=0)
-        probs = torch.softmax(scores_full, dim=-1)
-        row_has_neighbor = torch.isfinite(scores_full).any(dim=-1, keepdim=True)
-        probs = torch.where(row_has_neighbor, probs, torch.zeros_like(probs))
+        probs = _safe_masked_softmax(scores_full, dim=-1)
         out[m_start_i:m_end_i] = torch.einsum("hmn,nhd->mhd", probs, values_full)
     return out
 

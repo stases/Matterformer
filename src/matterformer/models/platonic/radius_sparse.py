@@ -28,6 +28,8 @@ class RadiusBlockSparseLayout:
     block_n: int
     cutoff: float
     dense_pair_count: int
+    radius_edge_count: int
+    max_block_row_length: int
 
     @property
     def num_q_blocks(self) -> int:
@@ -48,6 +50,18 @@ class RadiusBlockSparseLayout:
         tile_pairs = self.num_live_block_pairs * int(self.block_m) * int(self.block_n)
         return float(tile_pairs / self.dense_pair_count)
 
+    @property
+    def true_edge_density(self) -> float:
+        if self.dense_pair_count <= 0:
+            return 0.0
+        return float(self.radius_edge_count / self.dense_pair_count)
+
+    @property
+    def mean_radius_degree(self) -> float:
+        if self.perm.numel() == 0:
+            return 0.0
+        return float(self.radius_edge_count / int(self.perm.numel()))
+
     def to(self, device: torch.device | str) -> "RadiusBlockSparseLayout":
         return RadiusBlockSparseLayout(
             q_block_start=self.q_block_start.to(device),
@@ -65,6 +79,8 @@ class RadiusBlockSparseLayout:
             block_n=self.block_n,
             cutoff=self.cutoff,
             dense_pair_count=self.dense_pair_count,
+            radius_edge_count=self.radius_edge_count,
+            max_block_row_length=self.max_block_row_length,
         )
 
 
@@ -166,6 +182,7 @@ def build_radius_block_sparse_layout(
 
     live_pairs: set[tuple[int, int]] = set()
     cutoff2 = float(cutoff) * float(cutoff)
+    radius_edge_count = 0
     for seg_idx, (start, end) in enumerate(zip(starts, ends)):
         start_i = int(start)
         end_i = int(end)
@@ -191,6 +208,7 @@ def build_radius_block_sparse_layout(
                         keep = float(delta.dot(delta).item()) < cutoff2
                     if not keep:
                         continue
+                    radius_edge_count += 1
                     q_block = q_block_bases[seg_idx] + local_i // int(block_m)
                     k_block = k_block_bases[seg_idx] + local_j // int(block_n)
                     live_pairs.add((q_block, k_block))
@@ -203,6 +221,7 @@ def build_radius_block_sparse_layout(
 
     block_lengths = [len(row) for row in block_rows]
     block_t_lengths = [len(row) for row in block_rows_t]
+    max_block_row_length = max(block_lengths, default=0)
     block_ptr = torch.tensor(_prefix_from_lengths(block_lengths), dtype=torch.int32)
     block_ptr_t = torch.tensor(_prefix_from_lengths(block_t_lengths), dtype=torch.int32)
     block_col = torch.tensor([col for row in block_rows for col in row], dtype=torch.int32)
@@ -224,4 +243,6 @@ def build_radius_block_sparse_layout(
         block_n=int(block_n),
         cutoff=float(cutoff),
         dense_pair_count=int(dense_pair_count),
+        radius_edge_count=int(radius_edge_count),
+        max_block_row_length=int(max_block_row_length),
     )

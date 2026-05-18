@@ -2417,7 +2417,11 @@ class HybridTransformerTrunk(nn.Module):
                     sort=str(radius_cfg["sort"]),
                     include_self=bool(radius_cfg["include_self"]),
                 )
-            if radius_layout.block_ptr.numel() > 1 and torch.any(radius_layout.block_ptr[1:] <= radius_layout.block_ptr[:-1]):
+            if (
+                bool(radius_cfg["include_self"])
+                and radius_layout.block_ptr.numel() > 1
+                and torch.any(radius_layout.block_ptr[1:] <= radius_layout.block_ptr[:-1])
+            ):
                 raise RuntimeError("radius-sparse layout produced an empty query block; include_self=True is recommended")
             perm = radius_layout.perm
             x = x.index_select(0, perm)
