@@ -2339,6 +2339,34 @@ class HybridTransformerTrunk(nn.Module):
                     )
         return expected
 
+    def compile_flat_tetra_layer_forwards(self, *, mode: str = "default") -> dict[str, int]:
+        """Compile flat tetra layer calls while leaving dynamic sparse layout plumbing eager.
+
+        A radius-sparse flat tetra trunk builds a Python/CPU block layout and carries a
+        RadiusBlockSparseLayout object through local attention layers. Compiling the
+        whole ``forward_flat_tetra`` method makes Dynamo own that dynamic control flow.
+        Compiling only the dense/global flat layer calls keeps the requested compiler
+        path active while letting the sparse local layers use their explicit Triton JIT.
+        """
+
+        if not self.supports_flat_tetra:
+            raise RuntimeError("compile_flat_tetra_layer_forwards requires a flat tetra-compatible trunk")
+        compiled = 0
+        skipped_radius_sparse = 0
+        for block in self.blocks:
+            for layer in block.sublayers:
+                if not isinstance(layer, TetraPlatonicGlobalLayer):
+                    continue
+                if layer.radius_sparse_layout_config() is not None:
+                    skipped_radius_sparse += 1
+                    continue
+                layer.forward_flat = torch.compile(layer.forward_flat, mode=mode)  # type: ignore[method-assign]
+                compiled += 1
+        return {
+            "compiled_layers": compiled,
+            "skipped_radius_sparse_layers": skipped_radius_sparse,
+        }
+
     def _local_moment_lift_features(self, geom: GeometryCache, *, dtype: torch.dtype) -> torch.Tensor:
         if self.local_moment_mlp is None or self.local_moment_proj is None or self.local_moment_scale is None:
             raise RuntimeError("local moment input lift is not configured")

@@ -830,11 +830,19 @@ def main(args: argparse.Namespace) -> None:
             model = torch.compile(model, mode=args.compile_mode)  # type: ignore[assignment]
         elif args.compile_scope == "trunk_flat":
             base_model = unwrap_model(model)
+            compile_message = f"compile: compiled Matterformer trunk only scope={args.compile_scope} mode={args.compile_mode}"
             if args.omol_runtime_mode == "internal_flat_tetra":
-                base_model.trunk.forward_flat_tetra = torch.compile(  # type: ignore[method-assign]
-                    base_model.trunk.forward_flat_tetra,
-                    mode=args.compile_mode,
-                )
+                if base_model.trunk._radius_sparse_layout_config() is not None:
+                    compile_stats = base_model.trunk.compile_flat_tetra_layer_forwards(mode=args.compile_mode)
+                    compile_message = (
+                        "compile: compiled Matterformer radius-sparse flat tetra layer scope "
+                        f"mode={args.compile_mode} stats={compile_stats}"
+                    )
+                else:
+                    base_model.trunk.forward_flat_tetra = torch.compile(  # type: ignore[method-assign]
+                        base_model.trunk.forward_flat_tetra,
+                        mode=args.compile_mode,
+                    )
             elif args.omol_runtime_mode == "internal_flat_hybrid":
                 base_model.trunk.forward_flat_hybrid = torch.compile(  # type: ignore[method-assign]
                     base_model.trunk.forward_flat_hybrid,
@@ -845,7 +853,7 @@ def main(args: argparse.Namespace) -> None:
                     base_model.trunk.forward,
                     mode=args.compile_mode,
                 )
-            print(f"compile: compiled Matterformer trunk only scope={args.compile_scope} mode={args.compile_mode}")
+            print(compile_message)
         elif args.compile_scope == "none":
             print("compile: disabled by --compile-scope none")
         else:
