@@ -190,7 +190,7 @@ def _layer_metas(model: MatterformerOMolForceField) -> list[LayerMeta]:
                 radius_cutoff=radius_cutoff,
                 group_order=int(layer.group_order),
                 dim_per_frame=int(layer.dim_per_frame),
-                heads=int(attn.nhead),
+                heads=int(attn.num_heads),
                 head_dim=int(attn.head_dim),
             )
         )
