@@ -192,6 +192,7 @@ def prepare_esen_fixed_k_local_attention_features(
     max_atomic_number: int | None = None,
     diag_zero: bool = True,
     envelope_in_score: bool = True,
+    feature_dtype: torch.dtype = torch.bfloat16,
 ) -> ESENFixedKLocalAttentionFeatures:
     """Precompute fixed-K eSEN bias features for the Triton fast path."""
 
@@ -225,19 +226,19 @@ def prepare_esen_fixed_k_local_attention_features(
     rho = torch.exp(-gamma_f * (dist_f[..., None] - centers_f.view(1, 1, -1)).square())
     rho_env = env_bias[..., None] * rho
 
-    type_base = torch.zeros_like(idx, dtype=torch.long)
+    type_base = torch.zeros_like(idx, dtype=torch.int32)
     if atom_types is not None:
         zmax = int(max_atomic_number) if max_atomic_number is not None else int(atom_types.max().item())
         zi = atom_types.to(device=device, dtype=torch.long).clamp(min=0, max=zmax)
         zj = zi.index_select(0, idx.reshape(-1)).reshape_as(idx)
         zdim = int(zmax) + 1
-        type_base = (zi[:, None] * zdim + zj) * int(heads_per_frame)
+        type_base = ((zi[:, None] * zdim + zj) * int(heads_per_frame)).to(torch.int32)
 
     return ESENFixedKLocalAttentionFeatures(
         local_mask=local_mask.contiguous(),
-        env_bias=env_bias.contiguous(),
-        log_env=log_env.contiguous(),
-        rho_env=rho_env.contiguous(),
+        env_bias=env_bias.to(feature_dtype).contiguous(),
+        log_env=log_env.to(feature_dtype).contiguous(),
+        rho_env=rho_env.to(feature_dtype).contiguous(),
         type_base=type_base.contiguous(),
     )
 

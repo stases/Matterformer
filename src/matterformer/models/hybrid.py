@@ -2414,14 +2414,20 @@ class HybridTransformerTrunk(nn.Module):
             esen_features=features,
         )
 
-    def compile_flat_tetra_layer_forwards(self, *, mode: str = "default") -> dict[str, int]:
+    def compile_flat_tetra_layer_forwards(
+        self,
+        *,
+        mode: str = "default",
+        compile_fixed_k: bool = True,
+    ) -> dict[str, int]:
         """Compile flat tetra layer calls while leaving dynamic sparse layout plumbing eager.
 
         A radius-sparse flat tetra trunk builds a Python/CPU block layout and carries a
         RadiusBlockSparseLayout object through local attention layers. Compiling the
         whole ``forward_flat_tetra`` method makes Dynamo own that dynamic control flow.
-        Compiling only the dense/global flat layer calls keeps the requested compiler
-        path active while letting the sparse local layers use their explicit Triton JIT.
+        Compiling individual flat layer calls keeps the requested compiler path active
+        while letting custom Triton attention calls graph-break at their prepared eager
+        entrypoints.
         """
 
         if not self.supports_flat_tetra:
@@ -2436,10 +2442,15 @@ class HybridTransformerTrunk(nn.Module):
                 if layer.radius_sparse_layout_config() is not None:
                     skipped_radius_sparse += 1
                     continue
-                if layer.fixed_k_local_config() is not None:
+                if layer.fixed_k_local_config() is not None and not compile_fixed_k:
                     skipped_fixed_k_local += 1
                     continue
-                layer.forward_flat = torch.compile(layer.forward_flat, mode=mode)  # type: ignore[method-assign]
+                layer.forward_flat = torch.compile(  # type: ignore[method-assign]
+                    layer.forward_flat,
+                    mode=mode,
+                    fullgraph=False,
+                    dynamic=False,
+                )
                 compiled += 1
         return {
             "compiled_layers": compiled,

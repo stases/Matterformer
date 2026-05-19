@@ -24,6 +24,11 @@ except ImportError:  # pragma: no cover - exercised on CUDA nodes with Triton in
     triton = None
     tl = None
 
+try:
+    import torch._dynamo as _dynamo
+except Exception:  # pragma: no cover - Dynamo is optional in some torch builds.
+    _dynamo = None
+
 
 TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE = triton is not None and tl is not None
 
@@ -34,6 +39,7 @@ _MAX_FULL_TILE_K = 64
 _MAX_FULL_TILE_HEAD_DIM = 128
 _MAX_CHUNKED_HEAD_DIM = 256
 _CHUNKED_D = 64
+_H_BLOCK_HEADS = 2
 
 
 def _next_power_of_2(value: int) -> int:
@@ -45,6 +51,10 @@ def _next_power_of_2(value: int) -> int:
 
 def _requires_grad(*values: torch.Tensor | None) -> bool:
     return any(value is not None and bool(value.requires_grad) for value in values)
+
+
+def _dynamo_disable(fn):
+    return _dynamo.disable(fn) if _dynamo is not None else fn
 
 
 def _fallback_or_raise(
@@ -113,7 +123,55 @@ def _fixed_k_local_attention_forward_cuda_prepared(
     out = torch.empty_like(q)
     lse = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
     block_k = _next_power_of_2(int(neighbor_idx.shape[-1]))
-    if int(q.shape[-1]) <= _MAX_FULL_TILE_HEAD_DIM:
+    use_hblock_forward = (
+        int(heads_per_frame) == 1
+        and int(q.shape[1]) >= _H_BLOCK_HEADS
+        and int(q.shape[-1]) <= _MAX_FULL_TILE_HEAD_DIM
+    )
+    if use_hblock_forward:
+        block_d = _next_power_of_2(int(q.shape[-1]))
+        block_h = _H_BLOCK_HEADS
+        grid = (q.shape[0], triton.cdiv(q.shape[1], block_h))
+        _fixed_k_local_attention_fwd_kernel_hblock[grid](
+            q,
+            k,
+            v,
+            neighbor_idx,
+            neighbor_mask,
+            dist,
+            atom_types,
+            rbf_weight,
+            type_bias,
+            centers,
+            gamma,
+            pre_local_mask,
+            pre_env_bias,
+            pre_log_env,
+            pre_rho_env,
+            pre_type_base,
+            out,
+            lse,
+            num_tokens=q.shape[0],
+            num_heads=q.shape[1],
+            head_dim=q.shape[2],
+            k_neighbors=neighbor_idx.shape[1],
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            bias_mode=int(bias_mode),
+            heads_per_frame=int(heads_per_frame),
+            num_rbf=int(num_rbf),
+            cutoff=float(cutoff),
+            max_atomic_number=int(max_atomic_number),
+            has_type_bias=bool(has_type_bias),
+            diag_zero=bool(diag_zero),
+            envelope_in_score=bool(envelope_in_score),
+            input_precision=input_precision,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=2,
+        )
+    elif int(q.shape[-1]) <= _MAX_FULL_TILE_HEAD_DIM:
         block_d = _next_power_of_2(int(q.shape[-1]))
         grid = (q.shape[0], q.shape[1])
         _fixed_k_local_attention_fwd_kernel[grid](
@@ -585,7 +643,7 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
             neigh_valid = local
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
-            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & k_mask
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & neigh_valid & k_mask
             env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             scores += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             subhead = head_idx % heads_per_frame
@@ -627,6 +685,157 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
         )
         lse = tl.where(has_any, row_max + tl.log(tl.maximum(denom, 1.0e-20)), -float("inf"))
         tl.store(lse_ptr + token_idx * num_heads + head_idx, lse)
+
+    @triton.jit
+    def _fixed_k_local_attention_fwd_kernel_hblock(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        neighbor_idx_ptr,
+        neighbor_mask_ptr,
+        dist_ptr,
+        atom_type_ptr,
+        rbf_weight_ptr,
+        type_bias_ptr,
+        centers_ptr,
+        gamma_ptr,
+        pre_local_mask_ptr,
+        pre_env_bias_ptr,
+        pre_log_env_ptr,
+        pre_rho_env_ptr,
+        pre_type_base_ptr,
+        out_ptr,
+        lse_ptr,
+        num_tokens: tl.constexpr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        k_neighbors: tl.constexpr,
+        scale: tl.constexpr,
+        bias_mode: tl.constexpr,
+        heads_per_frame: tl.constexpr,
+        num_rbf: tl.constexpr,
+        cutoff: tl.constexpr,
+        max_atomic_number: tl.constexpr,
+        has_type_bias: tl.constexpr,
+        diag_zero: tl.constexpr,
+        envelope_in_score: tl.constexpr,
+        input_precision: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        token_idx = tl.program_id(0)
+        head_block = tl.program_id(1) * BLOCK_H
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_d = tl.arange(0, BLOCK_D)
+        k_mask = offs_k < k_neighbors
+        d_mask = offs_d < head_dim
+
+        n_base = token_idx * k_neighbors + offs_k
+        neigh_idx = tl.load(neighbor_idx_ptr + n_base, mask=k_mask, other=0).to(tl.int64)
+        neigh_valid = (tl.load(neighbor_mask_ptr + n_base, mask=k_mask, other=0) > 0) & k_mask
+        neigh_idx = tl.where(neigh_valid, neigh_idx, 0)
+
+        shared_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        pair_valid = neigh_valid
+
+        if bias_mode == 1:
+            dist = tl.load(dist_ptr + n_base, mask=k_mask, other=0.0).to(tl.float32)
+            local = neigh_valid & (dist < cutoff)
+            same = neigh_idx == token_idx
+            local = local | (same & neigh_valid)
+
+            x = tl.minimum(tl.maximum(dist / cutoff, 0.0), 1.0)
+            x2 = x * x
+            x3 = x2 * x
+            env = 1.0 - 10.0 * x3 + 15.0 * x3 * x - 6.0 * x3 * x2
+            env = tl.where(dist < cutoff, env, 0.0)
+            env = tl.where(neigh_valid, env, 0.0)
+
+            env_bias = env
+            if diag_zero:
+                env_bias = tl.where(same, 0.0, env_bias)
+
+            gamma = tl.load(gamma_ptr).to(tl.float32)
+            raw_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
+            for rb in range(0, num_rbf):
+                center = tl.load(centers_ptr + rb).to(tl.float32)
+                weight = tl.load(rbf_weight_ptr + rb).to(tl.float32)
+                rho = tl.exp(-gamma * (dist - center) * (dist - center))
+                raw_bias += weight * rho
+
+            if has_type_bias:
+                zi = tl.load(atom_type_ptr + token_idx).to(tl.int64)
+                zj = tl.load(atom_type_ptr + neigh_idx, mask=neigh_valid, other=0).to(tl.int64)
+                zi = tl.minimum(tl.maximum(zi, 0), max_atomic_number)
+                zj = tl.minimum(tl.maximum(zj, 0), max_atomic_number)
+                zdim = max_atomic_number + 1
+                type_index = (zi * zdim + zj) * heads_per_frame
+                raw_bias += tl.load(type_bias_ptr + type_index, mask=neigh_valid, other=0.0).to(tl.float32)
+
+            shared_bias += env_bias * raw_bias
+            if envelope_in_score:
+                env_score = tl.where(same & neigh_valid, 1.0, env)
+                shared_bias += tl.log(tl.maximum(env_score, 1.0e-20))
+            pair_valid = local
+        if bias_mode == 2:
+            pre_base = token_idx * k_neighbors + offs_k
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & neigh_valid & k_mask
+            env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
+            shared_bias += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
+            raw_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
+            for rb in range(0, num_rbf):
+                rho_env = tl.load(
+                    pre_rho_env_ptr + (pre_base * num_rbf + rb),
+                    mask=k_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                weight = tl.load(rbf_weight_ptr + rb).to(tl.float32)
+                raw_bias += weight * rho_env
+            shared_bias += raw_bias
+            if has_type_bias:
+                type_base = tl.load(pre_type_base_ptr + pre_base, mask=k_mask, other=0).to(tl.int64)
+                shared_bias += env_bias * tl.load(type_bias_ptr + type_base, mask=k_mask, other=0.0).to(tl.float32)
+            pair_valid = local
+
+        for hh in range(0, BLOCK_H):
+            head_idx = head_block + hh
+            h_valid = head_idx < num_heads
+            q = tl.load(
+                q_ptr + ((token_idx * num_heads + head_idx) * head_dim + offs_d),
+                mask=h_valid & d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            k_tile = tl.load(
+                k_ptr + ((neigh_idx[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+                mask=h_valid & pair_valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            scores = tl.sum(k_tile.to(tl.float32) * q[None, :], axis=1) * scale
+            scores += shared_bias
+            scores = tl.where(pair_valid, scores, -float("inf"))
+
+            row_max = tl.max(scores, axis=0)
+            has_any = row_max > -float("inf")
+            row_max_safe = tl.where(has_any, row_max, 0.0)
+            probs = tl.exp(scores - row_max_safe)
+            probs = tl.where(pair_valid, probs, 0.0)
+            denom = tl.sum(probs, axis=0)
+            probs = probs / tl.maximum(denom, 1.0e-20)
+
+            v_tile = tl.load(
+                v_ptr + ((neigh_idx[:, None] * num_heads + head_idx) * head_dim + offs_d[None, :]),
+                mask=h_valid & pair_valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            out = tl.sum(probs[:, None] * v_tile.to(tl.float32), axis=0)
+            tl.store(
+                out_ptr + ((token_idx * num_heads + head_idx) * head_dim + offs_d),
+                out,
+                mask=h_valid & d_mask,
+            )
+            lse = tl.where(has_any, row_max + tl.log(tl.maximum(denom, 1.0e-20)), -float("inf"))
+            tl.store(lse_ptr + token_idx * num_heads + head_idx, lse, mask=h_valid)
 
     @triton.jit
     def _fixed_k_local_attention_fwd_kernel_chunked_d(
@@ -736,7 +945,7 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
             neigh_valid = local
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
-            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & k_mask
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & neigh_valid & k_mask
             env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             scores += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             subhead = head_idx % heads_per_frame
@@ -907,7 +1116,7 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
             pair_valid = local
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
-            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & k_mask
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & row_mask & k_mask
             env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             scores += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             raw_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
@@ -1135,7 +1344,7 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
             pair_valid = local
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
-            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & k_mask
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & row_mask & k_mask
             env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             scores += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             raw_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
@@ -1225,31 +1434,31 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
                             mask=pair_valid & row_valid,
                             sem="relaxed",
                         )
-        if bias_mode == 2:
-            pre_base = token_idx * k_neighbors + offs_k
-            if need_drbf:
-                for rb in range(0, num_rbf):
-                    rho_env = tl.load(
-                        pre_rho_env_ptr + (pre_base * num_rbf + rb),
-                        mask=k_mask,
-                        other=0.0,
-                    ).to(tl.float32)
-                    grad_w = tl.sum(ds * rho_env, axis=0)
-                    tl.atomic_add(
-                        d_rbf_weight_ptr + subhead * num_rbf + rb,
-                        grad_w,
-                        sem="relaxed",
-                    )
-            if need_dtype_bias:
-                if has_type_bias:
-                    type_base = tl.load(pre_type_base_ptr + pre_base, mask=k_mask, other=0).to(tl.int64)
-                    type_index = type_base + subhead
-                    tl.atomic_add(
-                        d_type_bias_ptr + type_index,
-                        ds * env_bias,
-                        mask=pair_valid & row_valid,
-                        sem="relaxed",
-                    )
+            if bias_mode == 2:
+                pre_base = token_idx * k_neighbors + offs_k
+                if need_drbf:
+                    for rb in range(0, num_rbf):
+                        rho_env = tl.load(
+                            pre_rho_env_ptr + (pre_base * num_rbf + rb),
+                            mask=k_mask,
+                            other=0.0,
+                        ).to(tl.float32)
+                        grad_w = tl.sum(ds * rho_env, axis=0)
+                        tl.atomic_add(
+                            d_rbf_weight_ptr + subhead * num_rbf + rb,
+                            grad_w,
+                            sem="relaxed",
+                        )
+                if need_dtype_bias:
+                    if has_type_bias:
+                        type_base = tl.load(pre_type_base_ptr + pre_base, mask=k_mask, other=0).to(tl.int64)
+                        type_index = type_base + subhead
+                        tl.atomic_add(
+                            d_type_bias_ptr + type_index,
+                            ds * env_bias,
+                            mask=pair_valid & row_valid,
+                            sem="relaxed",
+                        )
 
 
     @triton.jit
@@ -1383,7 +1592,7 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
             pair_valid = local
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
-            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & k_mask
+            local = (tl.load(pre_local_mask_ptr + pre_base, mask=k_mask, other=0) > 0) & row_mask & k_mask
             env_bias = tl.load(pre_env_bias_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             scores += tl.load(pre_log_env_ptr + pre_base, mask=k_mask, other=0.0).to(tl.float32)
             raw_bias = tl.zeros((BLOCK_K,), dtype=tl.float32)
@@ -1465,14 +1674,14 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
                         grad_w,
                         sem="relaxed",
                     )
-                if need_dtype_bias:
-                    if has_type_bias:
-                        tl.atomic_add(
-                            d_type_bias_ptr + type_index,
-                            ds * env_bias,
-                            mask=pair_valid & row_valid,
-                            sem="relaxed",
-                        )
+            if need_dtype_bias:
+                if has_type_bias:
+                    tl.atomic_add(
+                        d_type_bias_ptr + type_index,
+                        ds * env_bias,
+                        mask=pair_valid & row_valid,
+                        sem="relaxed",
+                    )
         if bias_mode == 2:
             pre_base = token_idx * k_neighbors + offs_k
             if need_drbf:
@@ -1498,6 +1707,108 @@ if TRITON_FIXED_K_LOCAL_ATTENTION_AVAILABLE:
                         mask=pair_valid & row_valid,
                         sem="relaxed",
                     )
+
+
+@_dynamo_disable
+def fixed_k_local_attention_triton_prepared_eager(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    neighbor_idx: torch.Tensor,
+    neighbor_mask: torch.Tensor,
+    dist: torch.Tensor,
+    atom_types: torch.Tensor,
+    rbf_weight: torch.Tensor,
+    type_bias: torch.Tensor,
+    centers: torch.Tensor,
+    gamma: torch.Tensor,
+    pre_local_mask: torch.Tensor,
+    pre_env_bias: torch.Tensor,
+    pre_log_env: torch.Tensor,
+    pre_rho_env: torch.Tensor,
+    pre_type_base: torch.Tensor,
+    bias_mode: int,
+    max_atomic_number: int,
+    heads_per_frame: int,
+    num_rbf: int,
+    cutoff: float,
+    has_type_bias: bool,
+    diag_zero: bool,
+    envelope_in_score: bool,
+    input_precision: str,
+    normalized_precision: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run prepared fixed-K Triton attention outside Dynamo graphs.
+
+    ``fixed_k_local_attention_triton`` remains the validation/preparation
+    wrapper. Compiled model layers can trace that ordinary tensor plumbing, then
+    graph-break here for the custom Triton/autograd call.
+    """
+
+    needs_autograd = torch.is_grad_enabled() and _requires_grad(
+        q,
+        k,
+        v,
+        rbf_weight if bias_mode in {_FIXED_K_BIAS_ESEN_RBF_TYPE, _FIXED_K_BIAS_ESEN_PRECOMPUTED} else None,
+        type_bias if has_type_bias else None,
+    )
+    if needs_autograd:
+        return _FixedKLocalAttentionFunction.apply(
+            q,
+            k,
+            v,
+            neighbor_idx,
+            neighbor_mask,
+            dist,
+            atom_types,
+            rbf_weight,
+            type_bias,
+            centers,
+            gamma,
+            pre_local_mask,
+            pre_env_bias,
+            pre_log_env,
+            pre_rho_env,
+            pre_type_base,
+            int(bias_mode),
+            int(max_atomic_number),
+            int(heads_per_frame),
+            int(num_rbf),
+            float(cutoff),
+            bool(has_type_bias),
+            bool(diag_zero),
+            bool(envelope_in_score),
+            input_precision,
+            normalized_precision,
+        )
+    return _fixed_k_local_attention_forward_cuda_prepared(
+        q,
+        k,
+        v,
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        dist=dist,
+        atom_types=atom_types,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        pre_local_mask=pre_local_mask,
+        pre_env_bias=pre_env_bias,
+        pre_log_env=pre_log_env,
+        pre_rho_env=pre_rho_env,
+        pre_type_base=pre_type_base,
+        bias_mode=int(bias_mode),
+        max_atomic_number=int(max_atomic_number),
+        heads_per_frame=int(heads_per_frame),
+        num_rbf=int(num_rbf),
+        cutoff=float(cutoff),
+        has_type_bias=bool(has_type_bias),
+        diag_zero=bool(diag_zero),
+        envelope_in_score=bool(envelope_in_score),
+        input_precision=input_precision,
+    )
 
 
 def fixed_k_local_attention_triton(
@@ -1589,7 +1900,7 @@ def fixed_k_local_attention_triton(
     pre_env_bias = torch.empty((1, 1), device=q.device, dtype=torch.float32)
     pre_log_env = torch.empty((1, 1), device=q.device, dtype=torch.float32)
     pre_rho_env = torch.empty((1, 1, 1), device=q.device, dtype=torch.float32)
-    pre_type_base = torch.empty((1, 1), device=q.device, dtype=torch.long)
+    pre_type_base = torch.empty((1, 1), device=q.device, dtype=torch.int32)
     heads_per_frame = 1
     num_rbf = 1
     cutoff = 1.0
@@ -1666,10 +1977,10 @@ def fixed_k_local_attention_triton(
             ) and torch.is_grad_enabled():
                 raise NotImplementedError("fixed-K local Triton attention does not implement gradients through esen_features")
             pre_local_mask = esen_features.local_mask.to(device=q.device, dtype=torch.bool).contiguous()
-            pre_env_bias = esen_features.env_bias.to(device=q.device, dtype=torch.float32).contiguous()
-            pre_log_env = esen_features.log_env.to(device=q.device, dtype=torch.float32).contiguous()
-            pre_rho_env = esen_features.rho_env.to(device=q.device, dtype=torch.float32).contiguous()
-            pre_type_base = esen_features.type_base.to(device=q.device, dtype=torch.long).contiguous()
+            pre_env_bias = esen_features.env_bias.to(device=q.device).contiguous()
+            pre_log_env = esen_features.log_env.to(device=q.device).contiguous()
+            pre_rho_env = esen_features.rho_env.to(device=q.device).contiguous()
+            pre_type_base = esen_features.type_base.to(device=q.device, dtype=torch.int32).contiguous()
     else:
         atom_types_apply = torch.empty((1,), device=q.device, dtype=torch.long)
 
@@ -1699,70 +2010,34 @@ def fixed_k_local_attention_triton(
         if dist is not None
         else torch.empty((1, 1), device=q.device, dtype=torch.float32)
     )
-    needs_autograd = torch.is_grad_enabled() and _requires_grad(
+    out, lse = fixed_k_local_attention_triton_prepared_eager(
         q_apply,
         k_apply,
         v_apply,
-        rbf_weight if bias_mode in {_FIXED_K_BIAS_ESEN_RBF_TYPE, _FIXED_K_BIAS_ESEN_PRECOMPUTED} else None,
-        type_bias if has_type_bias else None,
+        neighbor_idx=neighbor_idx_apply,
+        neighbor_mask=neighbor_mask_apply,
+        dist=dist_apply,
+        atom_types=atom_types_apply,
+        rbf_weight=rbf_weight,
+        type_bias=type_bias,
+        centers=centers,
+        gamma=gamma,
+        pre_local_mask=pre_local_mask,
+        pre_env_bias=pre_env_bias,
+        pre_log_env=pre_log_env,
+        pre_rho_env=pre_rho_env,
+        pre_type_base=pre_type_base,
+        bias_mode=int(bias_mode),
+        max_atomic_number=int(max_atomic_number),
+        heads_per_frame=int(heads_per_frame),
+        num_rbf=int(num_rbf),
+        cutoff=float(cutoff),
+        has_type_bias=bool(has_type_bias),
+        diag_zero=bool(diag_zero),
+        envelope_in_score=bool(envelope_in_score),
+        input_precision=input_precision,
+        normalized_precision=normalized_precision,
     )
-    if needs_autograd:
-        out, lse = _FixedKLocalAttentionFunction.apply(
-            q_apply,
-            k_apply,
-            v_apply,
-            neighbor_idx_apply,
-            neighbor_mask_apply,
-            dist_apply,
-            atom_types_apply,
-            rbf_weight,
-            type_bias,
-            centers,
-            gamma,
-            pre_local_mask,
-            pre_env_bias,
-            pre_log_env,
-            pre_rho_env,
-            pre_type_base,
-            int(bias_mode),
-            int(max_atomic_number),
-            int(heads_per_frame),
-            int(num_rbf),
-            float(cutoff),
-            bool(has_type_bias),
-            bool(diag_zero),
-            bool(envelope_in_score),
-            input_precision,
-            normalized_precision,
-        )
-    else:
-        out, lse = _fixed_k_local_attention_forward_cuda_prepared(
-            q_apply,
-            k_apply,
-            v_apply,
-            neighbor_idx=neighbor_idx_apply,
-            neighbor_mask=neighbor_mask_apply,
-            dist=dist_apply,
-            atom_types=atom_types_apply,
-            rbf_weight=rbf_weight,
-            type_bias=type_bias,
-            centers=centers,
-            gamma=gamma,
-            pre_local_mask=pre_local_mask,
-            pre_env_bias=pre_env_bias,
-            pre_log_env=pre_log_env,
-            pre_rho_env=pre_rho_env,
-            pre_type_base=pre_type_base,
-            bias_mode=int(bias_mode),
-            max_atomic_number=int(max_atomic_number),
-            heads_per_frame=int(heads_per_frame),
-            num_rbf=int(num_rbf),
-            cutoff=float(cutoff),
-            has_type_bias=bool(has_type_bias),
-            diag_zero=bool(diag_zero),
-            envelope_in_score=bool(envelope_in_score),
-            input_precision=input_precision,
-        )
     if flash_compat_bf16:
         out = out.to(orig_dtype)
     return (out, lse) if return_lse else out

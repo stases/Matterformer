@@ -259,16 +259,36 @@ def test_prepare_esen_fixed_k_features_reconstructs_bias_module_output():
         max_atomic_number=9,
         diag_zero=bias.diag_zero,
         envelope_in_score=bias.envelope_in_score,
+        feature_dtype=torch.float32,
     )
+    assert features.type_base.dtype == torch.int32
     subhead = torch.arange(q.shape[1]) % int(bias.heads_per_frame)
     rbf_term = torch.einsum("nkr,hr->nhk", features.rho_env, bias.rbf_weight[subhead])
-    type_index = features.type_base[:, None, :] + subhead.view(1, -1, 1)
+    type_index = features.type_base.long()[:, None, :] + subhead.view(1, -1, 1)
     type_term = features.env_bias[:, None, :] * bias.type_bias.reshape(-1)[type_index]
     reconstructed = features.log_env[:, None, :] + rbf_term + type_term
 
     assert torch.equal(features.local_mask, expected.mask)
     mask = expected.mask[:, None, :].expand_as(expected.bias)
     torch.testing.assert_close(reconstructed[mask], expected.bias[mask], atol=1e-6, rtol=1e-6)
+
+    default_features = prepare_esen_fixed_k_local_attention_features(
+        neighbor_idx=neighbor_idx,
+        neighbor_mask=neighbor_mask,
+        dist=dist,
+        centers=bias.centers,
+        gamma=bias.gamma,
+        cutoff=bias.cutoff,
+        heads_per_frame=bias.heads_per_frame,
+        atom_types=atom_types,
+        max_atomic_number=9,
+        diag_zero=bias.diag_zero,
+        envelope_in_score=bias.envelope_in_score,
+    )
+    assert default_features.env_bias.dtype == torch.bfloat16
+    assert default_features.log_env.dtype == torch.bfloat16
+    assert default_features.rho_env.dtype == torch.bfloat16
+    assert default_features.type_base.dtype == torch.int32
 
 
 def test_fixed_k_esen_type_bias_requires_square_atomic_dims():

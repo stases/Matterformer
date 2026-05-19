@@ -47,6 +47,7 @@ def _run_case(
     qkv_dtype: torch.dtype,
     precision: str,
     use_precomputed: bool = False,
+    heads_per_frame: int = 2,
 ) -> dict[str, float | int | str | bool]:
     seed = (
         1000
@@ -61,7 +62,6 @@ def _run_case(
     num_atoms = 9
     coords = torch.randn(1, num_atoms, 3, device=device, dtype=torch.float32) * 0.7
     num_heads = 4
-    heads_per_frame = 2
     cutoff = 3.0
     rbf_dim = 6
     q = torch.randn(num_atoms, num_heads, head_dim, device=device, dtype=torch.float32).to(qkv_dtype)
@@ -155,7 +155,10 @@ def _run_case(
         return_lse=True,
     )
     diff = (actual - expected).abs()
-    tol = 8.0e-3 if qkv_dtype is torch.bfloat16 or precision == "bf16_flash_compat" else 4.0e-5
+    # Default precomputed eSEN features are intentionally stored in bf16, so
+    # they should use the loose tolerance bucket even when q/k/v are fp32.
+    loose = qkv_dtype is torch.bfloat16 or precision == "bf16_flash_compat" or use_precomputed
+    tol = 8.0e-3 if loose else 4.0e-5
     torch.testing.assert_close(actual, expected, atol=tol, rtol=tol)
     if not torch.isfinite(lse).all():
         raise AssertionError("lse contains non-finite values")
@@ -169,6 +172,7 @@ def _run_case(
         "qkv_dtype": str(qkv_dtype).replace("torch.", ""),
         "precision": str(precision),
         "use_precomputed": bool(use_precomputed),
+        "heads_per_frame": int(heads_per_frame),
         "max_abs_diff": float(diff.max().item()),
         "mean_abs_diff": float(diff.mean().item()),
     }
@@ -295,7 +299,9 @@ def _run_backward_case(
     elif qkv_dtype is torch.bfloat16:
         out_ref = out_ref.to(torch.bfloat16)
 
-    loose = qkv_dtype is torch.bfloat16 or precision == "bf16_flash_compat"
+    # Precomputed eSEN features are bf16 by default; compare them as a reduced
+    # precision path rather than against exact fp32 feature reconstruction.
+    loose = qkv_dtype is torch.bfloat16 or precision == "bf16_flash_compat" or use_precomputed
     out_tol = 2.0e-2 if loose else 4.0e-5
     grad_tol = 5.0e-2 if loose else 3.0e-4
     param_tol = 5.0e-2 if loose else 5.0e-4
@@ -367,6 +373,7 @@ def main() -> None:
         qkv_dtype=torch.float32,
         precision="ieee",
         use_precomputed=True,
+        heads_per_frame=1,
     )
     print("precomputed case ok", precomputed_smoke)
 
