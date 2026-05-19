@@ -50,6 +50,7 @@ MAX_ATOMS_PER_BATCH_VAL="${MAX_ATOMS_PER_BATCH_VAL:-12000}"
 MAX_EDGES_PER_BATCH="${MAX_EDGES_PER_BATCH:-2000000}"
 MAX_EDGES_PER_BATCH_VAL="${MAX_EDGES_PER_BATCH_VAL:-2000000}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
+EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 PIN_MEMORY="${PIN_MEMORY:-1}"
 BATCHING_MODE="${BATCHING_MODE:-random}"
@@ -262,6 +263,7 @@ EXTRA_ARGS=()
 [ -n "$ALLSCAIP_FREQUENCY_LIST" ] && EXTRA_ARGS+=(--allscaip-frequency-list "$ALLSCAIP_FREQUENCY_LIST")
 [ -n "$TETRA_ATTENTION_BLOCK_M" ] && EXTRA_ARGS+=(--tetra-attention-block-m "$TETRA_ATTENTION_BLOCK_M")
 [ -n "$TETRA_ATTENTION_BLOCK_N" ] && EXTRA_ARGS+=(--tetra-attention-block-n "$TETRA_ATTENTION_BLOCK_N")
+[ -n "$EVAL_NUM_WORKERS" ] && EXTRA_ARGS+=(--eval-num-workers "$EVAL_NUM_WORKERS")
 [ "$MUON_HIDDEN_ONLY" = "1" ] && EXTRA_ARGS+=(--muon-hidden-only) || EXTRA_ARGS+=(--no-muon-hidden-only)
 [ -n "$MUON_ADAM_LR" ] && EXTRA_ARGS+=(--muon-adam-lr "$MUON_ADAM_LR")
 [ -n "$MUON_ADAM_WEIGHT_DECAY" ] && EXTRA_ARGS+=(--muon-adam-weight-decay "$MUON_ADAM_WEIGHT_DECAY")
@@ -290,6 +292,7 @@ echo "chgspin_mode:            $CHGSPIN_MODE"
 echo "chgspin_emb_dim:         ${CHGSPIN_EMB_DIM:-null}"
 echo "batch_size:              $BATCH_SIZE"
 echo "num_workers:             $NUM_WORKERS"
+echo "eval_num_workers:        ${EVAL_NUM_WORKERS:-same_as_train}"
 echo "prefetch_factor:         $PREFETCH_FACTOR"
 echo "pin_memory:              $PIN_MEMORY"
 echo "max_graphs_per_batch:    ${MAX_GRAPHS_PER_BATCH:-null}"

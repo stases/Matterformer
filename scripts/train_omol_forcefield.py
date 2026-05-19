@@ -926,7 +926,7 @@ def main(args: argparse.Namespace) -> None:
         batch_size=args.val_batch_size or args.batch_size,
         max_graphs_per_batch=args.max_graphs_per_batch_val or args.max_graphs_per_batch,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=args.eval_num_workers if args.eval_num_workers is not None else args.num_workers,
         pin_memory=args.pin_memory,
         max_atoms=args.max_atoms_per_batch_val or args.max_atoms_per_batch,
         max_edges=args.max_edges_per_batch_val or args.max_edges_per_batch,
@@ -943,7 +943,7 @@ def main(args: argparse.Namespace) -> None:
         batch_size=args.val_batch_size or args.batch_size,
         max_graphs_per_batch=args.max_graphs_per_batch_val or args.max_graphs_per_batch,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=args.eval_num_workers if args.eval_num_workers is not None else args.num_workers,
         pin_memory=args.pin_memory,
         max_atoms=args.max_atoms_per_batch_val or args.max_atoms_per_batch,
         max_edges=args.max_edges_per_batch_val or args.max_edges_per_batch,
@@ -1459,6 +1459,16 @@ if __name__ == "__main__":
     parser.add_argument("--bucket-window-size", type=int, default=4096)
     parser.add_argument("--bucket-shuffle-groups", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--eval-num-workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of DataLoader workers for validation/test loaders. "
+            "Defaults to --num-workers. Set to 0 to avoid multiprocessing "
+            "worker crashes in long DDP validation runs."
+        ),
+    )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=5e-4)
