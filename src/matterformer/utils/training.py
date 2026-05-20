@@ -61,18 +61,43 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 
 class EMA:
-    def __init__(self, model: torch.nn.Module, decay: float) -> None:
+    def __init__(self, model: torch.nn.Module, decay: float, *, warmup_steps: int = 0) -> None:
         self.decay = float(decay)
+        self.warmup_steps = int(warmup_steps)
+        self.num_updates = 0
         self.shadow: dict[str, torch.Tensor] = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.detach().clone()
 
-    def update(self, model: torch.nn.Module) -> None:
+    @property
+    def is_ready(self) -> bool:
+        return self.num_updates > 0 and bool(self.shadow)
+
+    def _effective_decay(self, global_step: int) -> float:
+        if self.warmup_steps > 0 and global_step < self.warmup_steps:
+            return min(self.decay, 1.0 - 1.0 / float(global_step + 1))
+        return self.decay
+
+    def update(self, model: torch.nn.Module, *, global_step: int | None = None) -> None:
+        step = self.num_updates if global_step is None else int(global_step)
+        decay = self._effective_decay(step)
         with torch.no_grad():
+            if not self.shadow:
+                self.shadow = {
+                    name: param.detach().float().clone()
+                    for name, param in model.named_parameters()
+                    if param.requires_grad
+                }
             for name, param in model.named_parameters():
-                if name in self.shadow:
-                    self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+                if not param.requires_grad:
+                    continue
+                ema_param = self.shadow.get(name)
+                if ema_param is None:
+                    self.shadow[name] = param.detach().float().clone()
+                    continue
+                if ema_param.device != param.device:
+                    ema_param = ema_param.to(param.device)
+                    self.shadow[name] = ema_param
+                ema_param.mul_(decay).add_(param.detach().float(), alpha=1.0 - decay)
+        self.num_updates += 1
 
     def apply(self, model: torch.nn.Module) -> dict[str, torch.Tensor]:
         backup: dict[str, torch.Tensor] = {}
@@ -80,7 +105,7 @@ class EMA:
             for name, param in model.named_parameters():
                 if name in self.shadow:
                     backup[name] = param.detach().clone()
-                    param.copy_(self.shadow[name])
+                    param.copy_(self.shadow[name].to(device=param.device, dtype=param.dtype))
         return backup
 
     def restore(self, model: torch.nn.Module, backup: dict[str, torch.Tensor]) -> None:
@@ -89,21 +114,36 @@ class EMA:
                 if name in backup:
                     param.copy_(backup[name])
 
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return {name: value.detach().cpu().clone() for name, value in self.shadow.items()}
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "decay": self.decay,
+            "warmup_steps": self.warmup_steps,
+            "num_updates": self.num_updates,
+            "shadow": {name: value.detach().cpu().clone() for name, value in self.shadow.items()},
+        }
 
-    def load_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
-        missing = sorted(name for name in self.shadow if name not in state_dict)
-        unexpected = sorted(name for name in state_dict if name not in self.shadow)
-        if missing or unexpected:
-            raise KeyError(
-                "EMA state_dict mismatch: "
-                f"missing={missing[:8]} unexpected={unexpected[:8]}"
-            )
+    def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
+        shadow_state = state_dict.get("shadow") if "shadow" in state_dict else state_dict
+        if not isinstance(shadow_state, Mapping):
+            raise TypeError("EMA state_dict must contain a mapping of shadow parameters")
+        if self.shadow:
+            missing = sorted(name for name in self.shadow if name not in shadow_state)
+            unexpected = sorted(name for name in shadow_state if name not in self.shadow)
+            if missing or unexpected:
+                raise KeyError(
+                    "EMA state_dict mismatch: "
+                    f"missing={missing[:8]} unexpected={unexpected[:8]}"
+                )
         loaded: dict[str, torch.Tensor] = {}
-        for name, shadow in self.shadow.items():
-            loaded[name] = state_dict[name].detach().to(device=shadow.device, dtype=shadow.dtype).clone()
+        reference = self.shadow
+        for name, value in shadow_state.items():
+            tensor = value.detach() if torch.is_tensor(value) else torch.as_tensor(value)
+            device = reference[name].device if name in reference else tensor.device
+            loaded[name] = tensor.to(device=device, dtype=torch.float32).clone()
         self.shadow = loaded
+        self.num_updates = int(state_dict.get("num_updates", self.num_updates)) if "shadow" in state_dict else self.num_updates
+        self.warmup_steps = int(state_dict.get("warmup_steps", self.warmup_steps)) if "shadow" in state_dict else self.warmup_steps
+        self.decay = float(state_dict.get("decay", self.decay)) if "shadow" in state_dict else self.decay
 
 
 def seed_everything(seed: int) -> None:

@@ -381,6 +381,12 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
         self.pad_distributed_batches = bool(pad_distributed_batches)
         self.epoch = 0
         self._atom_count_cache: dict[int, int] = {}
+        dataset_length = len(self.dataset)
+        if self.drop_last:
+            self.num_samples = math.floor(dataset_length / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(dataset_length / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -433,11 +439,31 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         if self.max_atoms is None:
-            batches = max(1, math.ceil(len(self.dataset) / self.max_batch_size))
-            return max(1, math.ceil(batches / self.num_replicas))
-        avg_atoms = max(1, min(self.max_atoms, 64))
-        batches = max(1, math.ceil(len(self.dataset) / max(1, self.max_atoms // avg_atoms)))
-        return max(1, math.ceil(batches / self.num_replicas))
+            return max(1, math.ceil(self.num_samples / self.max_batch_size))
+        avg_atoms_per_graph = 50
+        avg_graphs_per_batch = max(1, int(self.max_atoms / avg_atoms_per_graph))
+        return max(1, math.ceil(self.num_samples / avg_graphs_per_batch))
+
+    def _distributed_indices(self, indices: list[int]) -> list[int]:
+        if self.num_replicas <= 1:
+            return indices
+
+        if not indices:
+            return []
+
+        if not self.drop_last:
+            padding = self.total_size - len(indices)
+            if padding > 0:
+                repeats = (padding + len(indices) - 1) // len(indices)
+                indices = indices + (indices * repeats)[:padding]
+        else:
+            indices = indices[: self.total_size]
+
+        if len(indices) < self.total_size:
+            raise RuntimeError("Insufficient indices to cover replicas")
+
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        return indices[: self.num_samples]
 
     def _pack_batches(self, indices: list[int]) -> list[list[int]]:
         batches: list[list[int]] = []
@@ -476,17 +502,8 @@ class OMolDynamicBatchSampler(Sampler[list[int]]):
     def __iter__(self):
         size = len(self.dataset)
         indices = self._ordered_indices(size)
+        indices = self._distributed_indices(indices)
         batches = self._pack_batches(indices)
-
-        if self.num_replicas > 1:
-            if self.pad_distributed_batches:
-                padding = (-len(batches)) % self.num_replicas
-                if padding:
-                    if not batches:
-                        return
-                    repeats = (padding + len(batches) - 1) // len(batches)
-                    batches = batches + (batches * repeats)[:padding]
-            batches = batches[self.rank :: self.num_replicas]
 
         for batch in batches:
             yield batch

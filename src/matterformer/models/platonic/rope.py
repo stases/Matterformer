@@ -22,6 +22,7 @@ class PlatonicRoPE(nn.Module):
         freq_sigma: float = 1.0,
         learned_freqs: bool = True,
         freq_init: str = "spiral",
+        use_fp64_trig: bool = True,
     ) -> None:
         super().__init__()
         if spatial_dims != 3:
@@ -38,6 +39,7 @@ class PlatonicRoPE(nn.Module):
         if embed_dim % self.G != 0:
             raise ValueError("embed_dim must be divisible by group order")
         self.num_pairs = self.head_dim // 2
+        self.use_fp64_trig = bool(use_fp64_trig)
         self.register_buffer("group_elements", group.elements, persistent=False)
         freq_init = str(freq_init).lower()
         if freq_init == "spiral":
@@ -78,7 +80,18 @@ class PlatonicRoPE(nn.Module):
         """
         if pos.shape[-1] != 3:
             raise ValueError(f"pos trailing dimension must be 3, got {pos.shape[-1]}")
-        target_device = device if device is not None else pos.device
+        target_device = torch.device(device) if device is not None else pos.device
+        if self.use_fp64_trig:
+            with torch.amp.autocast(device_type=target_device.type, enabled=False):
+                freqs = self.freqs.to(device=target_device, dtype=torch.float64)
+                frames = self.group_elements.to(device=target_device, dtype=torch.float64)
+                rotated_freqs = torch.einsum("gde,hfe->ghfd", frames, freqs)
+                angles = torch.einsum(
+                    "...d,ghfd->...ghf",
+                    pos.to(device=target_device, dtype=torch.float64),
+                    rotated_freqs,
+                )
+                return torch.cos(angles).to(dtype=dtype), torch.sin(angles).to(dtype=dtype)
         freqs = self.freqs.to(device=target_device, dtype=torch.float32)
         frames = self.group_elements.to(device=target_device, dtype=torch.float32)
         rotated_freqs = torch.einsum("gde,hfe->ghfd", frames, freqs)

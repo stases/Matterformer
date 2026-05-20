@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -11,7 +12,7 @@ from matterformer.geometry import NonPeriodicGeometryAdapter
 from matterformer.geometry.cache import FlatGeometryCache, GeometryCache, flatten_padded_geometry_cache
 from matterformer.geometry.triton_nonperiodic_knn import build_triton_nonperiodic_knn_geometry_cache
 from matterformer.models.hybrid import HybridConfig, HybridFlatTrunkOutput, HybridTransformerTrunk, HybridTrunkOutput
-from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicLinear
+from matterformer.models.platonic import PLATONIC_GROUPS, PlatonicLinear, PlatonicRoPE
 from matterformer.models.platonic.linear import _tetra_fourier_data
 
 
@@ -68,6 +69,18 @@ def _gather_padded_nodes(values: torch.Tensor, neighbor_idx: torch.Tensor) -> to
     return torch.gather(expanded, dim=2, index=idx)
 
 
+class _DisableTf32:
+    def __enter__(self) -> None:
+        self.prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        self.prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        torch.backends.cuda.matmul.allow_tf32 = self.prev_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = self.prev_cudnn_tf32
+
+
 class ScalarFourierEmbedding(nn.Module):
     def __init__(self, embedding_size: int, *, zero_when_input_zero: bool = False, scale: float = 1.0) -> None:
         super().__init__()
@@ -94,6 +107,7 @@ class ChargeSpinConditioning(nn.Module):
         mode: str = "add",
         embedding_dim: int | None = None,
         film_dim: int | None = None,
+        share_film_with_mix: bool = False,
     ) -> None:
         super().__init__()
         mode = str(mode).lower().replace("-", "_")
@@ -105,6 +119,9 @@ class ChargeSpinConditioning(nn.Module):
         self.d_model = int(d_model)
         self.embedding_dim = int(embedding_dim or d_model)
         self.film_dim = int(film_dim) if film_dim is not None else None
+        self.share_film_with_mix = bool(share_film_with_mix)
+        if self.share_film_with_mix and self.film_dim is not None and self.film_dim != self.d_model:
+            raise ValueError("share_film_with_mix=True requires film_dim to equal d_model")
         if mode == "off" and self.film_dim is None:
             self.charge_embedding = None
             self.spin_embedding = None
@@ -114,11 +131,18 @@ class ChargeSpinConditioning(nn.Module):
             return
         self.charge_embedding = ScalarFourierEmbedding(self.embedding_dim)
         self.spin_embedding = ScalarFourierEmbedding(self.embedding_dim, zero_when_input_zero=True)
-        self.mix = nn.Linear(2 * self.embedding_dim, self.d_model) if mode != "off" else None
+        needs_mix = mode != "off" or (self.share_film_with_mix and self.film_dim is not None)
+        self.mix = nn.Linear(2 * self.embedding_dim, self.d_model) if needs_mix else None
         if self.mix is not None:
             nn.init.normal_(self.mix.weight, std=0.02)
             nn.init.zeros_(self.mix.bias)
-        self.film_mix = nn.Linear(2 * self.embedding_dim, self.film_dim) if self.film_dim is not None else None
+        self.film_mix = (
+            None
+            if self.share_film_with_mix
+            else nn.Linear(2 * self.embedding_dim, self.film_dim)
+            if self.film_dim is not None
+            else None
+        )
         if self.film_mix is not None:
             nn.init.normal_(self.film_mix.weight, std=0.02)
             nn.init.zeros_(self.film_mix.bias)
@@ -134,7 +158,7 @@ class ChargeSpinConditioning(nn.Module):
         dtype: torch.dtype,
         film: bool = False,
     ) -> torch.Tensor:
-        mix = self.film_mix if film else self.mix
+        mix = self.mix if film and self.share_film_with_mix else self.film_mix if film else self.mix
         if self.charge_embedding is None or self.spin_embedding is None or mix is None:
             raise RuntimeError("Charge/spin conditioning is not configured")
         if charge is None:
@@ -153,7 +177,7 @@ class ChargeSpinConditioning(nn.Module):
         pad_mask: torch.Tensor,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
-        if self.film_mix is None:
+        if self.film_dim is None:
             return None
         batch_size, num_atoms = pad_mask.shape[:2]
         mixed = self._mixed_graph_values(
@@ -175,7 +199,7 @@ class ChargeSpinConditioning(nn.Module):
         num_graphs: int,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
-        if self.film_mix is None:
+        if self.film_dim is None:
             return None
         mixed = self._mixed_graph_values(
             charge=charge,
@@ -244,7 +268,11 @@ class _Sin(nn.Module):
 
 
 def _readout_activation(name: str | None) -> nn.Module:
-    value = "gelu" if name is None else str(name).lower()
+    if name is None:
+        return nn.Identity()
+    value = str(name).strip().lower()
+    if value in {"", "none", "null", "identity", "linear"}:
+        return nn.Identity()
     if value == "gelu":
         return nn.GELU()
     if value == "silu":
@@ -255,7 +283,7 @@ def _readout_activation(name: str | None) -> nn.Module:
         return nn.Mish()
     if value == "sin":
         return _Sin()
-    raise ValueError("readout_activation must be one of {'gelu', 'silu', 'relu', 'mish', 'sin'}")
+    raise ValueError("readout_activation must be one of {'gelu', 'silu', 'relu', 'mish', 'sin', 'none'}")
 
 
 class MatterformerOMolForceField(nn.Module):
@@ -289,6 +317,10 @@ class MatterformerOMolForceField(nn.Module):
         tetra_irrep_scalar_input: str = "rho1",
         readout_activation: str | None = None,
         runtime_mode: str = "padded",
+        platonic_input_conditioning: bool = False,
+        force_zero_mean: bool = False,
+        rope_fp64: bool = True,
+        readout_disable_tf32: bool = True,
     ) -> None:
         super().__init__()
         self.max_atomic_number = int(max_atomic_number)
@@ -297,6 +329,9 @@ class MatterformerOMolForceField(nn.Module):
         self.pair_rbf_max = float(pair_rbf_max)
         self.hybrid_config = HybridConfig.from_input(hybrid_config, d_model=d_model, n_heads=n_heads, n_layers=n_layers)
         self.stream_type = self.hybrid_config.stream_type
+        self.platonic_input_conditioning = bool(platonic_input_conditioning)
+        if self.platonic_input_conditioning and self.stream_type != "tetra":
+            raise ValueError("platonic_input_conditioning=True requires stream_type='tetra'")
         requested_chgspin_film = bool(self.hybrid_config.tetra.get("chgspin_film", False))
         if requested_chgspin_film and self.stream_type != "tetra":
             raise ValueError("tetra.chgspin_film=True requires stream_type='tetra'")
@@ -304,6 +339,9 @@ class MatterformerOMolForceField(nn.Module):
         self.runtime_mode = str(runtime_mode).lower().replace("-", "_")
         if self.runtime_mode not in {"padded", "internal_flat_tetra", "internal_flat_hybrid"}:
             raise ValueError("runtime_mode must be one of {'padded', 'internal_flat_tetra', 'internal_flat_hybrid'}")
+        self.force_zero_mean = bool(force_zero_mean)
+        self.rope_fp64 = bool(rope_fp64)
+        self.readout_disable_tf32 = bool(readout_disable_tf32)
         force_head_mode = str(force_head_mode).lower().replace("-", "_")
         if force_head_mode == "auto":
             force_head_mode = "tetra_vector" if self.stream_type == "tetra" else "pairwise"
@@ -363,22 +401,31 @@ class MatterformerOMolForceField(nn.Module):
             raise ValueError("tetra_irrep_scalar_input must be one of {'rho1', 'invariants'}")
         self.tetra_irrep_scalar_input = tetra_irrep_scalar_input
 
-        self.atom_embedding = nn.Embedding(self.max_atomic_number + 1, d_model, padding_idx=0)
-        nn.init.normal_(self.atom_embedding.weight, std=1.0 / math.sqrt(d_model))
-        with torch.no_grad():
-            self.atom_embedding.weight[0].zero_()
+        self.input_feature_dim = (
+            int(self.hybrid_config.tetra_dim_per_frame) if self.platonic_input_conditioning else d_model
+        )
+        self.atom_embedding = nn.Embedding(
+            self.max_atomic_number + 1,
+            self.input_feature_dim,
+            padding_idx=None if self.platonic_input_conditioning else 0,
+        )
+        nn.init.normal_(self.atom_embedding.weight, std=1.0 / math.sqrt(self.input_feature_dim))
+        if not self.platonic_input_conditioning:
+            with torch.no_grad():
+                self.atom_embedding.weight[0].zero_()
         chgspin_film_dim = int(self.hybrid_config.tetra_dim_per_frame) if self.chgspin_film else None
         self.charge_spin = ChargeSpinConditioning(
-            d_model,
+            self.input_feature_dim,
             mode=chgspin_mode,
             embedding_dim=chgspin_emb_dim,
             film_dim=chgspin_film_dim,
+            share_film_with_mix=self.platonic_input_conditioning,
         )
         self.trunk = HybridTransformerTrunk(
             d_model=d_model,
             n_heads=n_heads,
             n_layers=n_layers,
-            input_dim=d_model,
+            input_dim=self.input_feature_dim,
             hybrid_config=self.hybrid_config,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
@@ -388,15 +435,18 @@ class MatterformerOMolForceField(nn.Module):
             norm_affine_when_no_adaln=True,
             use_final_norm=True,
         )
+        for module in self.trunk.modules():
+            if isinstance(module, PlatonicRoPE):
+                module.use_fp64_trig = self.rope_fp64
         if self.runtime_mode == "internal_flat_tetra" and not self.trunk.supports_flat_tetra:
             raise ValueError(
                 "runtime_mode='internal_flat_tetra' requires a pure tetra-global trunk "
-                "with input_lift.kind='scalar_copy'"
+                "with input_lift.kind in {'scalar_copy', 'platonic_linear'}"
             )
         if self.runtime_mode == "internal_flat_hybrid" and not self.trunk.supports_flat_hybrid:
             raise ValueError(
-                "runtime_mode='internal_flat_hybrid' requires a tetra trunk with input_lift.kind='scalar_copy' "
-                "and only tetra-global / group-framewise simplicial sublayers"
+                "runtime_mode='internal_flat_hybrid' requires a tetra trunk with input_lift.kind in "
+                "{'scalar_copy', 'platonic_linear'} and only tetra-global / group-framewise simplicial sublayers"
             )
         self._materialize_unused_distance_bias_lazy_modules()
         self.energy_head = (
@@ -470,14 +520,18 @@ class MatterformerOMolForceField(nn.Module):
             dim_per_frame = int(self.hybrid_config.tetra_dim_per_frame or 0)
             if self.readout_head_mode == "platonic":
                 readout_cfg = dict(self.hybrid_config.readout)
-                activation_name = (
-                    readout_activation
-                    or readout_cfg.get("activation")
-                    or readout_cfg.get("readout_activation")
-                    or self.hybrid_config.tetra.get("readout_activation")
-                    or self.hybrid_config.tetra.get("activation")
-                    or "gelu"
-                )
+                if readout_activation is not None and str(readout_activation).strip() != "":
+                    activation_name = readout_activation
+                elif "activation" in readout_cfg:
+                    activation_name = readout_cfg.get("activation")
+                elif "readout_activation" in readout_cfg:
+                    activation_name = readout_cfg.get("readout_activation")
+                elif "readout_activation" in self.hybrid_config.tetra:
+                    activation_name = self.hybrid_config.tetra.get("readout_activation")
+                elif "activation" in self.hybrid_config.tetra:
+                    activation_name = self.hybrid_config.tetra.get("activation")
+                else:
+                    activation_name = "gelu"
                 readout_ffn = bool(readout_cfg.get("ffn", True))
                 linear_backend = str(
                     readout_cfg.get(
@@ -561,6 +615,11 @@ class MatterformerOMolForceField(nn.Module):
         self.register_buffer("_rbf_centers", torch.linspace(0.0, self.pair_rbf_max, self.pair_n_rbf), persistent=False)
         delta = self.pair_rbf_max / max(self.pair_n_rbf - 1, 1)
         self.register_buffer("_rbf_gamma", torch.tensor(1.0 / max(delta * delta, 1e-8)), persistent=False)
+
+    def _readout_precision_context(self):
+        if not self.readout_disable_tf32 or not torch.cuda.is_available():
+            return nullcontext()
+        return _DisableTf32()
 
     def _materialize_unused_distance_bias_lazy_modules(self) -> None:
         for block in self.trunk.blocks:
@@ -744,7 +803,8 @@ class MatterformerOMolForceField(nn.Module):
             weights = weights - torch.diag_embed(torch.diagonal(weights, dim1=-2, dim2=-1))
             forces = (weights[..., None].to(dtype=geom.pair_delta.dtype) * geom.pair_delta).sum(dim=2)
             forces = forces.masked_fill(pad_mask[..., None], 0.0)
-            forces = forces - _masked_mean(forces, pad_mask)
+            if self.force_zero_mean:
+                forces = forces - _masked_mean(forces, pad_mask)
             return forces.masked_fill(pad_mask[..., None], 0.0)
 
     def _scalar_direct_forces(self, trunk_out: torch.Tensor, coords: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
@@ -754,7 +814,8 @@ class MatterformerOMolForceField(nn.Module):
             head_input = torch.cat([trunk_out, coords.to(dtype=trunk_out.dtype)], dim=-1)
             forces = self.scalar_direct_force_head(head_input)
             forces = forces.masked_fill(pad_mask[..., None], 0.0)
-            forces = forces - _masked_mean(forces, pad_mask)
+            if self.force_zero_mean:
+                forces = forces - _masked_mean(forces, pad_mask)
             return forces.masked_fill(pad_mask[..., None], 0.0)
 
     def _tetra_forces(self, group_out: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
@@ -765,7 +826,8 @@ class MatterformerOMolForceField(nn.Module):
             rotations = self._group_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
             vectors = torch.einsum("gij,bngi->bngj", rotations, local_vectors).mean(dim=2)
             vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
-            vectors = vectors - _masked_mean(vectors, pad_mask)
+            if self.force_zero_mean:
+                vectors = vectors - _masked_mean(vectors, pad_mask)
             return vectors.masked_fill(pad_mask[..., None], 0.0)
 
     def _tetra_forces_flat(
@@ -782,8 +844,9 @@ class MatterformerOMolForceField(nn.Module):
             local_vectors = self.group_force_head(group_out)
             rotations = self._group_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
             vectors = torch.einsum("gij,ngi->ngj", rotations, local_vectors).mean(dim=1)
-            centered = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
-            return centered
+            if self.force_zero_mean:
+                vectors = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
+            return vectors
 
     def _platonic_tetra_readout(
         self,
@@ -795,14 +858,16 @@ class MatterformerOMolForceField(nn.Module):
         with record_function("omol/platonic_scalar_vector_readout"):
             batch_size, num_atoms, group_order, channels = group_out.shape
             hidden = group_out.reshape(batch_size, num_atoms, group_order * channels)
-            scalar_raw = self.platonic_scalar_readout(hidden).view(batch_size, num_atoms, group_order, 1)
+            with self._readout_precision_context():
+                scalar_raw = self.platonic_scalar_readout(hidden).view(batch_size, num_atoms, group_order, 1)
+                local_vectors = self.platonic_vector_readout(hidden).view(batch_size, num_atoms, group_order, 3)
             per_atom_energy = scalar_raw.mean(dim=2).squeeze(-1).masked_fill(pad_mask, 0.0)
 
-            local_vectors = self.platonic_vector_readout(hidden).view(batch_size, num_atoms, group_order, 3)
             rotations = self._platonic_readout_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
             vectors = torch.einsum("gij,bngj->bni", rotations, local_vectors) / float(group_order)
             vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
-            vectors = vectors - _masked_mean(vectors, pad_mask)
+            if self.force_zero_mean:
+                vectors = vectors - _masked_mean(vectors, pad_mask)
             return per_atom_energy, vectors.masked_fill(pad_mask[..., None], 0.0)
 
     def _platonic_tetra_readout_flat(
@@ -818,14 +883,16 @@ class MatterformerOMolForceField(nn.Module):
         with record_function("omol/platonic_scalar_vector_readout_flat"):
             num_atoms, group_order, channels = group_out.shape
             hidden = group_out.reshape(num_atoms, group_order * channels)
-            scalar_raw = self.platonic_scalar_readout(hidden).view(num_atoms, group_order, 1)
+            with self._readout_precision_context():
+                scalar_raw = self.platonic_scalar_readout(hidden).view(num_atoms, group_order, 1)
+                local_vectors = self.platonic_vector_readout(hidden).view(num_atoms, group_order, 3)
             per_atom_energy = scalar_raw.mean(dim=1).squeeze(-1)
 
-            local_vectors = self.platonic_vector_readout(hidden).view(num_atoms, group_order, 3)
             rotations = self._platonic_readout_rotations.to(device=local_vectors.device, dtype=local_vectors.dtype)
             vectors = torch.einsum("gij,ngj->ni", rotations, local_vectors) / float(group_order)
-            centered = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
-            return per_atom_energy, centered
+            if self.force_zero_mean:
+                vectors = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
+            return per_atom_energy, vectors
 
     def _irrep_scalar_features(self, coeff: torch.Tensor) -> torch.Tensor:
         rho1 = coeff[..., 0, :]
@@ -862,7 +929,8 @@ class MatterformerOMolForceField(nn.Module):
             )
             vectors = vectors / math.sqrt(3.0 * float(group_order))
             vectors = vectors.masked_fill(pad_mask[..., None], 0.0)
-            vectors = vectors - _masked_mean(vectors, pad_mask)
+            if self.force_zero_mean:
+                vectors = vectors - _masked_mean(vectors, pad_mask)
             return per_atom_energy, vectors.masked_fill(pad_mask[..., None], 0.0)
 
     def _irrep_tetra_readout_flat(
@@ -892,8 +960,9 @@ class MatterformerOMolForceField(nn.Module):
                 self.irrep_vector_weight.to(device=group_out.device, dtype=group_out.dtype),
             )
             vectors = vectors / math.sqrt(3.0 * float(group_order))
-            centered = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
-            return per_atom_energy, centered
+            if self.force_zero_mean:
+                vectors = vectors - _segment_mean_flat(vectors, batch_index, num_graphs, counts=counts)[batch_index]
+            return per_atom_energy, vectors
 
     def _forward_flat_tetra_from_padded(
         self,

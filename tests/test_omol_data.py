@@ -9,6 +9,25 @@ from matterformer.data import (
 )
 
 
+class FixedAtomDataset:
+    def __init__(self, counts):
+        self.counts = list(counts)
+
+    def __len__(self):
+        return len(self.counts)
+
+    def get_num_atoms(self, idx):
+        return self.counts[int(idx)]
+
+
+class LengthOnlyDataset:
+    def __init__(self, length):
+        self.length = int(length)
+
+    def __len__(self):
+        return self.length
+
+
 def test_collate_omol_variable_atoms_and_masks():
     samples = [
         {
@@ -69,6 +88,52 @@ def test_dynamic_sampler_bucketed_mode_is_deterministic_and_valid():
     for batch in first:
         assert len(batch) <= 6
         assert sum(dataset.get_num_atoms(idx) for idx in batch) <= 18 or len(batch) == 1
+
+
+def test_dynamic_sampler_rank_slices_indices_before_packing():
+    dataset = FixedAtomDataset([6, 6, 6, 6, 4, 4, 4, 4])
+    samplers = [
+        OMolDynamicBatchSampler(
+            dataset,
+            max_batch_size=10,
+            max_atoms=10,
+            shuffle=False,
+            num_replicas=2,
+            rank=rank,
+        )
+        for rank in (0, 1)
+    ]
+
+    rank_batches = [list(sampler) for sampler in samplers]
+    assert [idx for batch in rank_batches[0] for idx in batch] == [0, 2, 4, 6]
+    assert [idx for batch in rank_batches[1] for idx in batch] == [1, 3, 5, 7]
+    for batches in rank_batches:
+        for batch in batches:
+            assert sum(dataset.get_num_atoms(idx) for idx in batch) <= 10 or len(batch) == 1
+
+
+def test_dynamic_sampler_pads_indices_before_ddp_rank_slice():
+    dataset = FixedAtomDataset([1, 1, 1, 1, 1])
+    samplers = [
+        OMolDynamicBatchSampler(
+            dataset,
+            max_batch_size=10,
+            max_atoms=10,
+            shuffle=False,
+            num_replicas=2,
+            rank=rank,
+            pad_distributed_batches=False,
+        )
+        for rank in (0, 1)
+    ]
+
+    assert [[idx for batch in sampler for idx in batch] for sampler in samplers] == [[0, 2, 4], [1, 3, 0]]
+
+
+def test_dynamic_sampler_len_matches_platonic_ddp_estimate():
+    dataset = LengthOnlyDataset(3_986_754)
+    sampler = OMolDynamicBatchSampler(dataset, max_batch_size=10_000, max_atoms=3000, num_replicas=4, rank=0)
+    assert len(sampler) == 16612
 
 
 def test_fairchem_dataset_does_not_require_fairchem(tmp_path):

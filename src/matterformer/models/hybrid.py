@@ -2310,7 +2310,7 @@ class HybridTransformerTrunk(nn.Module):
         self.requires_geometry_cache = self.needs_compact_geometry or self.needs_dense_geometry
         self.supports_flat_tetra = (
             self.stream_type == "tetra"
-            and self.input_lift_kind == "scalar_copy"
+            and self.input_lift_kind in {"scalar_copy", "platonic_linear"}
             and all(
                 isinstance(layer, TetraPlatonicGlobalLayer)
                 for block in self.blocks
@@ -2319,7 +2319,7 @@ class HybridTransformerTrunk(nn.Module):
         )
         self.supports_flat_hybrid = (
             self.stream_type == "tetra"
-            and self.input_lift_kind == "scalar_copy"
+            and self.input_lift_kind in {"scalar_copy", "platonic_linear"}
             and not self.local_moment_enabled
             and not self.needs_dense_geometry
             and all(
@@ -2458,6 +2458,17 @@ class HybridTransformerTrunk(nn.Module):
             "skipped_fixed_k_local_layers": skipped_fixed_k_local,
         }
 
+    def _lift_flat_tetra_input(self, x: torch.Tensor) -> torch.Tensor:
+        if self.group_input_proj is None:
+            raise RuntimeError("group_input_proj is not configured for tetra stream")
+        if self.input_lift_kind == "platonic_linear":
+            lifted = x.unsqueeze(1).expand(-1, self.group_order, -1).reshape(
+                x.shape[0],
+                self.group_order * self.input_dim,
+            )
+            return self.group_input_proj(lifted).view(x.shape[0], self.group_order, self.group_dim_per_frame)
+        return self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
+
     def _local_moment_lift_features(self, geom: GeometryCache, *, dtype: torch.dtype) -> torch.Tensor:
         if self.local_moment_mlp is None or self.local_moment_proj is None or self.local_moment_scale is None:
             raise RuntimeError("local moment input lift is not configured")
@@ -2512,7 +2523,7 @@ class HybridTransformerTrunk(nn.Module):
         if not self.supports_flat_tetra:
             raise RuntimeError(
                 "forward_flat_tetra is only available for pure tetra-global trunks "
-                "with input_lift.kind='scalar_copy'"
+                "with input_lift.kind in {'scalar_copy', 'platonic_linear'}"
             )
         if self.group_input_proj is None:
             raise RuntimeError("group_input_proj is not configured for tetra stream")
@@ -2556,7 +2567,7 @@ class HybridTransformerTrunk(nn.Module):
             if chgspin_film is not None:
                 chgspin_film = chgspin_film.index_select(0, perm)
         with record_function("hybrid_trunk_flat/lift_tetra_input"):
-            group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
+            group = self._lift_flat_tetra_input(x)
         with record_function("hybrid_trunk_flat/blocks"):
             for block in self.blocks:
                 for layer in block.sublayers:
@@ -2626,7 +2637,7 @@ class HybridTransformerTrunk(nn.Module):
             )
         cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
         with record_function("hybrid_trunk_flat_hybrid/lift_tetra_input"):
-            group = self.group_input_proj(x).unsqueeze(1).expand(-1, self.group_order, -1).contiguous()
+            group = self._lift_flat_tetra_input(x)
         with record_function("hybrid_trunk_flat_hybrid/blocks"):
             for block in self.blocks:
                 for layer in block.sublayers:

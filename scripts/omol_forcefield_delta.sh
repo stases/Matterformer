@@ -19,6 +19,7 @@ TETRA_ATTENTION_BLOCK_M="${TETRA_ATTENTION_BLOCK_M:-}"
 TETRA_ATTENTION_BLOCK_N="${TETRA_ATTENTION_BLOCK_N:-}"
 
 D_MODEL="${D_MODEL:-1920}"
+MAX_ATOMIC_NUMBER="${MAX_ATOMIC_NUMBER:-118}"
 N_HEADS="${N_HEADS:-60}"
 N_LAYERS="${N_LAYERS:-8}"
 MLP_RATIO="${MLP_RATIO:-2.0}"
@@ -40,6 +41,10 @@ READOUT_HEAD_MODE="${READOUT_HEAD_MODE:-dense}"
 TETRA_READOUT_MODE="${TETRA_READOUT_MODE:-platonic}"
 TETRA_IRREP_SCALAR_INPUT="${TETRA_IRREP_SCALAR_INPUT:-rho1}"
 READOUT_ACTIVATION="${READOUT_ACTIVATION:-}"
+FORCE_ZERO_MEAN="${FORCE_ZERO_MEAN:-0}"
+PLATONIC_INPUT_CONDITIONING="${PLATONIC_INPUT_CONDITIONING:-0}"
+ROPE_FP64="${ROPE_FP64:-1}"
+READOUT_DISABLE_TF32="${READOUT_DISABLE_TF32:-1}"
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
@@ -265,6 +270,10 @@ EXTRA_ARGS=()
 [ -n "$TETRA_ATTENTION_BLOCK_N" ] && EXTRA_ARGS+=(--tetra-attention-block-n "$TETRA_ATTENTION_BLOCK_N")
 [ -n "$EVAL_NUM_WORKERS" ] && EXTRA_ARGS+=(--eval-num-workers "$EVAL_NUM_WORKERS")
 [ "$MUON_HIDDEN_ONLY" = "1" ] && EXTRA_ARGS+=(--muon-hidden-only) || EXTRA_ARGS+=(--no-muon-hidden-only)
+[ "$PLATONIC_INPUT_CONDITIONING" = "1" ] && EXTRA_ARGS+=(--platonic-input-conditioning) || EXTRA_ARGS+=(--no-platonic-input-conditioning)
+[ "$FORCE_ZERO_MEAN" = "1" ] && EXTRA_ARGS+=(--force-zero-mean) || EXTRA_ARGS+=(--no-force-zero-mean)
+[ "$ROPE_FP64" = "1" ] && EXTRA_ARGS+=(--rope-fp64) || EXTRA_ARGS+=(--no-rope-fp64)
+[ "$READOUT_DISABLE_TF32" = "1" ] && EXTRA_ARGS+=(--readout-disable-tf32) || EXTRA_ARGS+=(--no-readout-disable-tf32)
 [ -n "$MUON_ADAM_LR" ] && EXTRA_ARGS+=(--muon-adam-lr "$MUON_ADAM_LR")
 [ -n "$MUON_ADAM_WEIGHT_DECAY" ] && EXTRA_ARGS+=(--muon-adam-weight-decay "$MUON_ADAM_WEIGHT_DECAY")
 [ -n "${RESUME_CHECKPOINT:-}" ] && EXTRA_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
@@ -285,6 +294,7 @@ echo "hybrid_config_json:      $HYBRID_CONFIG_JSON"
 echo "tetra_attn_block_m:      ${TETRA_ATTENTION_BLOCK_M:-config_default}"
 echo "tetra_attn_block_n:      ${TETRA_ATTENTION_BLOCK_N:-config_default}"
 echo "d_model:                 $D_MODEL"
+echo "max_atomic_number:       $MAX_ATOMIC_NUMBER"
 echo "n_heads:                 $N_HEADS"
 echo "n_layers:                $N_LAYERS"
 echo "mlp_ratio:               $MLP_RATIO"
@@ -327,6 +337,9 @@ echo "readout_head_mode:      $READOUT_HEAD_MODE"
 echo "tetra_readout_mode:     $TETRA_READOUT_MODE"
 echo "tetra_irrep_scalar_in:  $TETRA_IRREP_SCALAR_INPUT"
 echo "readout_activation:     ${READOUT_ACTIVATION:-auto}"
+echo "platonic_input_cond:    $PLATONIC_INPUT_CONDITIONING"
+echo "rope_fp64:              $ROPE_FP64"
+echo "readout_disable_tf32:   $READOUT_DISABLE_TF32"
 echo "tetra_pair_force_mode:  $TETRA_PAIR_FORCE_MODE"
 echo "tetra_pair_k_neighbors: $TETRA_PAIR_K_NEIGHBORS"
 echo "tetra_pair_feature_dim: $TETRA_PAIR_FEATURE_DIM"
@@ -381,6 +394,7 @@ fi
   --model-backend "$MODEL_BACKEND" \
   --hybrid-config-json "$HYBRID_CONFIG_JSON" \
   --d-model "$D_MODEL" \
+  --max-atomic-number "$MAX_ATOMIC_NUMBER" \
   --n-heads "$N_HEADS" \
   --n-layers "$N_LAYERS" \
   --mlp-ratio "$MLP_RATIO" \

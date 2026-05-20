@@ -1,0 +1,31 @@
+{
+  "num_blocks": 16,
+  "stream_type": "tetra",
+  "block_mix": [0, 1, 0],
+  "order_policy": "local_then_global",
+  "scalar_dim": 1920,
+  "tetra_dim_per_frame": 160,
+  "tetra": {
+    "group": "tetrahedron",
+    "group_order": 12,
+    "heads_per_frame": 1,
+    "rope_sigma": 2.0,
+    "learned_freqs": true,
+    "freq_init": "random",
+    "use_key": true,
+    "qk_norm": true,
+    "rope_on_values": true,
+    "attention_backend": "flash",
+    "activation": "sin",
+    "ffn_mult": 4,
+    "layer_scale_init_value": 0.0001,
+    "chgspin_film": true
+  },
+  "input_lift": {
+    "kind": "platonic_linear"
+  },
+  "readout": {
+    "kind": "platonic_ffn",
+    "activation": "gelu"
+  }
+}

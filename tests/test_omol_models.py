@@ -449,6 +449,71 @@ def test_omol_platonic_tetra_readout_flat_matches_padded_runtime():
     assert torch.allclose(padded_force_values, torch.zeros_like(padded_force_values))
 
 
+def test_omol_force_zero_mean_flag_controls_platonic_readout_projection():
+    torch.manual_seed(16)
+    batch = _batch()
+    model = MatterformerOMolForceField(
+        d_model=24,
+        n_heads=4,
+        n_layers=1,
+        hybrid_config=_tetra_config(),
+        chgspin_mode="add",
+        pair_hidden_dim=24,
+        pair_n_rbf=8,
+        readout_head_mode="platonic",
+        readout_activation="sin",
+        runtime_mode="padded",
+        force_zero_mean=False,
+    )
+    model.eval()
+
+    valid = ~batch.pad_mask
+    group_out = torch.randn(
+        batch.atomic_numbers.shape[0],
+        batch.atomic_numbers.shape[1],
+        12,
+        2,
+    )
+    _, raw_forces = model._platonic_tetra_readout(group_out, batch.pad_mask)
+    raw_mean = raw_forces.masked_fill(batch.pad_mask[..., None], 0.0).sum(dim=1)
+    raw_mean = raw_mean / valid.sum(dim=1).clamp_min(1).to(dtype=raw_forces.dtype)[:, None]
+    assert raw_mean.norm(dim=-1).max() > 1e-6
+
+    model.force_zero_mean = True
+    _, centered_forces = model._platonic_tetra_readout(group_out, batch.pad_mask)
+    centered_mean = centered_forces.masked_fill(batch.pad_mask[..., None], 0.0).sum(dim=1)
+    centered_mean = centered_mean / valid.sum(dim=1).clamp_min(1).to(dtype=centered_forces.dtype)[:, None]
+    torch.testing.assert_close(centered_mean, torch.zeros_like(centered_mean), atol=1e-6, rtol=0)
+
+    flat_group = group_out[valid]
+    flat_index = valid.nonzero(as_tuple=False)
+    batch_index = flat_index[:, 0]
+    counts = valid.sum(dim=1)
+    model.force_zero_mean = False
+    _, raw_flat_forces = model._platonic_tetra_readout_flat(
+        flat_group,
+        batch_index=batch_index,
+        num_graphs=batch.atomic_numbers.shape[0],
+        counts=counts,
+    )
+    raw_flat_mean = torch.zeros(batch.atomic_numbers.shape[0], 3)
+    raw_flat_mean.index_add_(0, batch_index, raw_flat_forces)
+    raw_flat_mean = raw_flat_mean / counts.clamp_min(1).to(dtype=raw_flat_forces.dtype)[:, None]
+    assert raw_flat_mean.norm(dim=-1).max() > 1e-6
+
+    model.force_zero_mean = True
+    _, centered_flat_forces = model._platonic_tetra_readout_flat(
+        flat_group,
+        batch_index=batch_index,
+        num_graphs=batch.atomic_numbers.shape[0],
+        counts=counts,
+    )
+    centered_flat_mean = torch.zeros(batch.atomic_numbers.shape[0], 3)
+    centered_flat_mean.index_add_(0, batch_index, centered_flat_forces)
+    centered_flat_mean = centered_flat_mean / counts.clamp_min(1).to(dtype=centered_flat_forces.dtype)[:, None]
+    torch.testing.assert_close(centered_flat_mean, torch.zeros_like(centered_flat_mean), atol=1e-6, rtol=0)
+
+
 def test_omol_irrep_tetra_readout_flat_matches_padded_runtime():
     batch = _batch()
     for scalar_input in ("rho1", "invariants"):
@@ -596,6 +661,7 @@ def test_omol_tetra_pair_force_residual_flat_matches_padded_runtime():
         tetra_pair_feature_dim=8,
         tetra_pair_element_dim=4,
         runtime_mode="padded",
+        force_zero_mean=True,
     )
     flat = MatterformerOMolForceField(
         d_model=24,
@@ -612,6 +678,7 @@ def test_omol_tetra_pair_force_residual_flat_matches_padded_runtime():
         tetra_pair_feature_dim=8,
         tetra_pair_element_dim=4,
         runtime_mode="internal_flat_tetra",
+        force_zero_mean=True,
     )
     with torch.no_grad():
         padded.tetra_pair_force_gate.fill_(1.0)

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Mapping
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from matterformer.data import OMolBatch
@@ -15,6 +16,7 @@ from matterformer.data import OMolBatch
 class OMolLossOutput:
     loss: torch.Tensor
     diagnostics: dict[str, torch.Tensor]
+    metric_sums: dict[str, tuple[torch.Tensor, torch.Tensor]]
 
 
 class OMolElementReferences(nn.Module):
@@ -50,6 +52,16 @@ def _masked_component_mae(error: torch.Tensor, mask: torch.Tensor) -> torch.Tens
     if not expanded_mask.any():
         return error.new_tensor(0.0)
     return error.abs().masked_select(expanded_mask).mean()
+
+
+def _ddp_corrected_mean(local_sum: torch.Tensor, local_count: torch.Tensor) -> torch.Tensor:
+    local_count = local_count.to(device=local_sum.device, dtype=local_sum.dtype)
+    if not (dist.is_available() and dist.is_initialized()):
+        return local_sum / local_count.clamp_min(1.0)
+
+    global_count = local_count.detach().clone()
+    dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+    return local_sum * float(dist.get_world_size()) / global_count.clamp_min(1.0)
 
 
 class OMolDirectForceLoss(nn.Module):
@@ -88,37 +100,58 @@ class OMolDirectForceLoss(nn.Module):
         target_forces_norm = batch.forces.to(dtype=pred_forces.dtype) / self.normalizer_rmsd
 
         energy_abs = (pred_energy - target_energy_norm).abs()
+        graph_count = torch.as_tensor(pred_energy.numel(), device=pred_energy.device, dtype=pred_energy.dtype)
         if self.energy_loss == "per_atom_mae":
-            energy_loss = (energy_abs / batch.num_atoms.to(device=energy_abs.device, dtype=energy_abs.dtype).clamp_min(1)).mean()
+            per_graph_energy_loss = energy_abs / batch.num_atoms.to(device=energy_abs.device, dtype=energy_abs.dtype).clamp_min(1)
+            energy_loss = _ddp_corrected_mean(per_graph_energy_loss.sum(), graph_count)
         else:
-            energy_loss = energy_abs.mean()
+            per_graph_energy_loss = energy_abs
+            energy_loss = _ddp_corrected_mean(per_graph_energy_loss.sum(), graph_count)
 
         force_mask = batch.free_atom_mask & ~batch.pad_mask
         force_error = pred_forces - target_forces_norm
         if self.force_loss == "l2norm":
             per_atom_norm = torch.linalg.norm(force_error, dim=-1)
-            per_structure = (per_atom_norm * force_mask.to(dtype=per_atom_norm.dtype)).sum(dim=1)
-            denom = force_mask.sum(dim=1).to(dtype=per_atom_norm.dtype).clamp_min(1.0)
-            force_loss = (per_structure / denom).mean()
+            force_mask_float = force_mask.to(dtype=per_atom_norm.dtype)
+            force_loss_sum = (per_atom_norm * force_mask_float).sum()
+            force_loss_count = force_mask_float.sum()
+            force_loss = _ddp_corrected_mean(
+                force_loss_sum,
+                force_loss_count,
+            )
         else:
-            force_loss = _masked_component_mae(force_error, force_mask)
+            expanded_force_mask = force_mask[..., None].expand_as(force_error)
+            force_loss_sum = force_error.abs().masked_select(expanded_force_mask).sum()
+            force_loss_count = expanded_force_mask.to(dtype=force_error.dtype).sum()
+            force_loss = _ddp_corrected_mean(force_loss_sum, force_loss_count)
 
         loss = self.energy_weight * energy_loss + self.force_weight * force_loss
         energy_error_ev = (pred_energy.detach() * self.normalizer_rmsd) - target_residual.to(dtype=pred_energy.dtype)
         force_error_ev = (pred_forces.detach() * self.normalizer_rmsd) - batch.forces.to(dtype=pred_forces.dtype)
+        num_atoms_float = batch.num_atoms.to(device=energy_error_ev.device, dtype=energy_error_ev.dtype).clamp_min(1)
+        expanded_force_mask_ev = force_mask[..., None].expand_as(force_error_ev)
+        f_mae_sum = force_error_ev.abs().masked_select(expanded_force_mask_ev).sum() * 1000.0
+        f_mae_count = expanded_force_mask_ev.to(dtype=force_error_ev.dtype).sum()
         diagnostics = {
             "loss": loss.detach(),
             "energy_loss": energy_loss.detach(),
             "force_loss": force_loss.detach(),
             "e_mae": energy_error_ev.abs().mean() * 1000.0,
             "e_mae_per_atom": (
-                energy_error_ev.abs() / batch.num_atoms.to(device=energy_error_ev.device, dtype=energy_error_ev.dtype).clamp_min(1)
+                energy_error_ev.abs() / num_atoms_float
             ).mean()
             * 1000.0,
-            "f_mae": _masked_component_mae(force_error_ev, force_mask) * 1000.0,
+            "f_mae": f_mae_sum / f_mae_count.clamp_min(1.0),
+        }
+        metric_sums = {
+            "energy_loss": (per_graph_energy_loss.detach().sum(), graph_count.detach()),
+            "force_loss": (force_loss_sum.detach(), force_loss_count.detach()),
+            "e_mae": (energy_error_ev.abs().detach().sum() * 1000.0, graph_count.detach()),
+            "e_mae_per_atom": ((energy_error_ev.abs() / num_atoms_float).detach().sum() * 1000.0, graph_count.detach()),
+            "f_mae": (f_mae_sum.detach(), f_mae_count.detach()),
         }
         extra_diagnostics = predictions.get("diagnostics")
         if isinstance(extra_diagnostics, dict):
             for key, value in extra_diagnostics.items():
                 diagnostics[str(key)] = torch.as_tensor(value, device=loss.device).detach()
-        return OMolLossOutput(loss=loss, diagnostics=diagnostics)
+        return OMolLossOutput(loss=loss, diagnostics=diagnostics, metric_sums=metric_sums)

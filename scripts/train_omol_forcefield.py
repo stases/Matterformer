@@ -390,6 +390,27 @@ def distributed_eval_average(totals: dict[str, float], graphs: int) -> dict[str,
     return {key: float(values[idx].item() / total_graphs) for idx, key in enumerate(keys)}
 
 
+def distributed_eval_means(sums: dict[str, float], counts: dict[str, float]) -> dict[str, float]:
+    keys = sorted(sums)
+    if not keys:
+        return {}
+    if not (dist.is_available() and dist.is_initialized()):
+        return {key: sums[key] / max(counts.get(key, 0.0), 1.0) for key in keys}
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    values = torch.tensor(
+        [sums[key] for key in keys] + [counts.get(key, 0.0) for key in keys],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    num_keys = len(keys)
+    return {
+        key: float(values[idx].item() / max(values[num_keys + idx].item(), 1.0))
+        for idx, key in enumerate(keys)
+    }
+
+
 def configure_compile_for_distributed(args: argparse.Namespace) -> None:
     if not bool(getattr(args, "compile", False)):
         return
@@ -647,6 +668,7 @@ def build_omol_model(args: argparse.Namespace, *, device: torch.device) -> torch
     backend = str(args.model_backend).lower().replace("-", "_")
     if backend == "matterformer":
         return MatterformerOMolForceField(
+            max_atomic_number=args.max_atomic_number,
             d_model=args.d_model,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
@@ -671,6 +693,10 @@ def build_omol_model(args: argparse.Namespace, *, device: torch.device) -> torch
             tetra_irrep_scalar_input=args.tetra_irrep_scalar_input,
             readout_activation=args.readout_activation,
             runtime_mode=args.omol_runtime_mode,
+            platonic_input_conditioning=args.platonic_input_conditioning,
+            force_zero_mean=args.force_zero_mean,
+            rope_fp64=args.rope_fp64,
+            readout_disable_tf32=args.readout_disable_tf32,
         ).to(device)
     if backend == "allscaip_direct":
         allscaip_config = load_allscaip_config(args.allscaip_config_json)
@@ -729,7 +755,6 @@ def evaluate_with_ema(
     *,
     model: torch.nn.Module,
     ema: EMA | None,
-    ema_ready: bool,
     criterion: OMolDirectForceLoss,
     loader: DataLoader,
     device: torch.device,
@@ -737,7 +762,7 @@ def evaluate_with_ema(
     bf16_enabled: bool,
 ) -> dict[str, float]:
     backup = None
-    if ema is not None and ema_ready:
+    if ema is not None and ema.is_ready:
         backup = ema.apply(unwrap_model(model))
     try:
         return evaluate(
@@ -820,7 +845,8 @@ def evaluate(
     bf16_enabled: bool,
 ) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {}
+    metric_sums: dict[str, float] = {}
+    metric_counts: dict[str, float] = {}
     graphs = 0
     for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
@@ -835,11 +861,15 @@ def evaluate(
             output = criterion(predictions, batch)
         batch_graphs = int(batch.energy.shape[0])
         graphs += batch_graphs
-        for key, value in output.diagnostics.items():
-            totals[key] = totals.get(key, 0.0) + float(value.detach().item()) * batch_graphs
+        for key, (value_sum, value_count) in output.metric_sums.items():
+            metric_sums[key] = metric_sums.get(key, 0.0) + float(value_sum.detach().item())
+            metric_counts[key] = metric_counts.get(key, 0.0) + float(value_count.detach().item())
         if max_batches is not None and (batch_idx + 1) >= max_batches:
             break
-    return distributed_eval_average(totals, graphs)
+    metrics = distributed_eval_means(metric_sums, metric_counts)
+    if "energy_loss" in metrics and "force_loss" in metrics:
+        metrics["loss"] = criterion.energy_weight * metrics["energy_loss"] + criterion.force_weight * metrics["force_loss"]
+    return metrics
 
 
 def log_metrics(run, metrics: dict[str, float], *, prefix: str, step: int, extra: dict[str, float] | None = None) -> None:
@@ -1043,7 +1073,7 @@ def main(args: argparse.Namespace) -> None:
             f"find_unused_parameters={args.ddp_find_unused_parameters}",
         )
 
-    ema = EMA(unwrap_model(model), args.ema_decay) if args.ema_decay > 0.0 else None
+    ema = EMA(unwrap_model(model), args.ema_decay, warmup_steps=args.ema_warmup_steps) if args.ema_decay > 0.0 else None
     optimizer = build_optimizer(model, args)
     scheduler_max_iters = resolve_scheduler_max_iters(args, train_loader)
     scheduler_min_lrs = resolve_scheduler_min_lrs(optimizer, args)
@@ -1108,6 +1138,11 @@ def main(args: argparse.Namespace) -> None:
         f"readout_head_mode={getattr(base_model, 'readout_head_mode', 'n/a')} "
         f"tetra_readout_mode={getattr(base_model, 'tetra_readout_mode', 'n/a')} "
         f"tetra_irrep_scalar_input={getattr(base_model, 'tetra_irrep_scalar_input', 'n/a')} "
+        f"input_feature_dim={getattr(base_model, 'input_feature_dim', 'n/a')} "
+        f"platonic_input_conditioning={getattr(base_model, 'platonic_input_conditioning', 'n/a')} "
+        f"rope_fp64={getattr(base_model, 'rope_fp64', 'n/a')} "
+        f"readout_disable_tf32={getattr(base_model, 'readout_disable_tf32', 'n/a')} "
+        f"max_atomic_number={getattr(base_model, 'max_atomic_number', 'n/a')} "
         f"parameters={num_parameters} trainable={trainable_parameters} non_trainable={non_trainable_parameters}"
     )
     print(
@@ -1237,8 +1272,8 @@ def main(args: argparse.Namespace) -> None:
                 scheduler.step()
             step_seconds = time.perf_counter() - step_start
             global_step += 1
-            if ema is not None and global_step >= args.ema_warmup_steps:
-                ema.update(unwrap_model(model))
+            if ema is not None:
+                ema.update(unwrap_model(model), global_step=global_step)
 
             if profile_this_step:
                 profile_metrics = {"profile/data_wait_ms": float(data_wait_ms)}
@@ -1288,7 +1323,6 @@ def main(args: argparse.Namespace) -> None:
                 val_estimate = evaluate_with_ema(
                     model=model,
                     ema=ema,
-                    ema_ready=global_step >= args.ema_warmup_steps,
                     criterion=criterion,
                     loader=val_loader,
                     device=device,
@@ -1301,7 +1335,6 @@ def main(args: argparse.Namespace) -> None:
                 val_metrics = evaluate_with_ema(
                     model=model,
                     ema=ema,
-                    ema_ready=global_step >= args.ema_warmup_steps,
                     criterion=criterion,
                     loader=val_loader,
                     device=device,
@@ -1317,6 +1350,7 @@ def main(args: argparse.Namespace) -> None:
                         best_state_in_memory = clone_model_state_to_cpu(model)
                         best_ema_state_in_memory = None if ema is None else ema.state_dict()
                 if args.save_checkpoint and is_main_process(args):
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                     payload = build_checkpoint_payload(
                         model=model,
                         ema=ema,
@@ -1344,7 +1378,6 @@ def main(args: argparse.Namespace) -> None:
     val_metrics = evaluate_with_ema(
         model=model,
         ema=ema,
-        ema_ready=global_step >= args.ema_warmup_steps,
         criterion=criterion,
         loader=val_loader,
         device=device,
@@ -1359,6 +1392,7 @@ def main(args: argparse.Namespace) -> None:
             best_state_in_memory = clone_model_state_to_cpu(model)
             best_ema_state_in_memory = None if ema is None else ema.state_dict()
     if args.save_checkpoint and is_main_process(args):
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         payload = build_checkpoint_payload(
             model=model,
             ema=ema,
@@ -1393,7 +1427,6 @@ def main(args: argparse.Namespace) -> None:
     test_metrics = evaluate_with_ema(
         model=model,
         ema=ema,
-        ema_ready=global_step >= args.ema_warmup_steps,
         criterion=criterion,
         loader=test_loader,
         device=device,
@@ -1540,6 +1573,7 @@ if __name__ == "__main__":
         help="Skip backward/optimizer/scheduler update when scalar train loss exceeds this value; <=0 disables.",
     )
     parser.add_argument("--d-model", type=int, default=768)
+    parser.add_argument("--max-atomic-number", type=int, default=118)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
@@ -1565,6 +1599,33 @@ if __name__ == "__main__":
     parser.add_argument("--tetra-readout-mode", type=str, default="platonic", choices=["platonic", "irrep"])
     parser.add_argument("--tetra-irrep-scalar-input", type=str, default="rho1", choices=["rho1", "invariants"])
     parser.add_argument("--readout-activation", type=str, default=None, choices=["gelu", "silu", "relu", "mish", "sin"])
+    parser.add_argument(
+        "--force-zero-mean",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Subtract each molecule's predicted mean force before the loss. "
+            "Default false to keep Matterformer output apples-to-apples with the Platonic OMOL repo."
+        ),
+    )
+    parser.add_argument(
+        "--rope-fp64",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute Platonic RoPE trig in fp64 before casting back, matching the Platonic OMOL path.",
+    )
+    parser.add_argument(
+        "--readout-disable-tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable TF32 around Platonic readout matmuls, matching the Platonic OMOL path.",
+    )
+    parser.add_argument(
+        "--platonic-input-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Platonic OMOL-style per-frame atom/charge/spin conditioning before the tetra input lift.",
+    )
     parser.add_argument(
         "--omol-runtime-mode",
         type=str,
